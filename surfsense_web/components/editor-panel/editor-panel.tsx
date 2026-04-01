@@ -10,28 +10,8 @@ import { MarkdownViewer } from "@/components/markdown-viewer";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Drawer, DrawerContent, DrawerHandle, DrawerTitle } from "@/components/ui/drawer";
-import { Skeleton } from "@/components/ui/skeleton";
 import { useMediaQuery } from "@/hooks/use-media-query";
 import { authenticatedFetch, getBearerToken, redirectToLogin } from "@/lib/auth-utils";
-
-const PlateEditor = dynamic(
-	() => import("@/components/editor/plate-editor").then((m) => ({ default: m.PlateEditor })),
-	{ ssr: false, loading: () => <Skeleton className="h-64 w-full" /> }
-);
-
-const LARGE_DOCUMENT_THRESHOLD = 2 * 1024 * 1024; // 2MB
-
-interface EditorContent {
-	document_id: number;
-	title: string;
-	document_type?: string;
-	source_markdown: string;
-	content_size_bytes?: number;
-	chunk_count?: number;
-	truncated?: boolean;
-}
-
-const EDITABLE_DOCUMENT_TYPES = new Set(["FILE", "NOTE"]);
 
 function EditorPanelSkeleton() {
 	return (
@@ -52,6 +32,20 @@ function EditorPanelSkeleton() {
 		</div>
 	);
 }
+
+const PlateEditor = dynamic(
+	() => import("@/components/editor/plate-editor").then((m) => ({ default: m.PlateEditor })),
+	{ ssr: false, loading: () => null }
+);
+
+interface EditorContent {
+	document_id: number;
+	title: string;
+	document_type?: string;
+	source_markdown: string;
+}
+
+const EDITABLE_DOCUMENT_TYPES = new Set(["FILE", "NOTE"]);
 
 export function EditorPanelContent({
 	documentId,
