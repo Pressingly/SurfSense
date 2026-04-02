@@ -960,73 +960,35 @@ async def get_document_by_chunk_id(
         ) from e
 
 
-@router.get(
-    "/documents/{document_id}/chunks",
-    response_model=PaginatedResponse[ChunkRead],
-)
-async def get_document_chunks_paginated(
-    document_id: int,
-    page: int = Query(0, ge=0),
-    page_size: int = Query(20, ge=1, le=100),
-    start_offset: int | None = Query(
-        None, ge=0, description="Direct offset; overrides page * page_size"
-    ),
+@router.get("/documents/watched-folders", response_model=list["FolderRead"])
+async def get_watched_folders(
+    search_space_id: int,
     session: AsyncSession = Depends(get_async_session),
     user: User = Depends(current_active_user),
 ):
-    """
-    Paginated chunk loading for a document.
-    Supports both page-based and offset-based access.
-    """
-    try:
-        from sqlalchemy import func
+    """Return root folders that are marked as watched (metadata->>'watched' = 'true')."""
+    from app.schemas import FolderRead  # noqa: F811
 
-        doc_result = await session.execute(
-            select(Document).filter(Document.id == document_id)
+    await check_permission(
+        session,
+        user,
+        search_space_id,
+        Permission.DOCUMENTS_READ.value,
+        "You don't have permission to read documents in this search space",
+    )
+
+    folders = (
+        await session.execute(
+            select(Folder).where(
+                Folder.search_space_id == search_space_id,
+                Folder.parent_id.is_(None),
+                Folder.folder_metadata.isnot(None),
+                Folder.folder_metadata["watched"].astext == "true",
+            )
         )
-        document = doc_result.scalars().first()
+    ).scalars().all()
 
-        if not document:
-            raise HTTPException(status_code=404, detail="Document not found")
-
-        await check_permission(
-            session,
-            user,
-            document.search_space_id,
-            Permission.DOCUMENTS_READ.value,
-            "You don't have permission to read documents in this search space",
-        )
-
-        total_result = await session.execute(
-            select(func.count())
-            .select_from(Chunk)
-            .filter(Chunk.document_id == document_id)
-        )
-        total = total_result.scalar() or 0
-
-        offset = start_offset if start_offset is not None else page * page_size
-        chunks_result = await session.execute(
-            select(Chunk)
-            .filter(Chunk.document_id == document_id)
-            .order_by(Chunk.created_at, Chunk.id)
-            .offset(offset)
-            .limit(page_size)
-        )
-        chunks = chunks_result.scalars().all()
-
-        return PaginatedResponse(
-            items=chunks,
-            total=total,
-            page=offset // page_size if page_size else page,
-            page_size=page_size,
-            has_more=(offset + len(chunks)) < total,
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to fetch chunks: {e!s}"
-        ) from e
+    return folders
 
 
 @router.get("/documents/{document_id}", response_model=DocumentRead)
@@ -1493,32 +1455,3 @@ async def folder_index_file(
     }
 
 
-@router.get("/documents/watched-folders", response_model=list["FolderRead"])
-async def get_watched_folders(
-    search_space_id: int,
-    session: AsyncSession = Depends(get_async_session),
-    user: User = Depends(current_active_user),
-):
-    """Return root folders that are marked as watched (metadata->>'watched' = 'true')."""
-    from app.schemas import FolderRead  # noqa: F811
-
-    await check_permission(
-        session,
-        user,
-        search_space_id,
-        Permission.DOCUMENTS_READ.value,
-        "You don't have permission to read documents in this search space",
-    )
-
-    folders = (
-        await session.execute(
-            select(Folder).where(
-                Folder.search_space_id == search_space_id,
-                Folder.parent_id.is_(None),
-                Folder.folder_metadata.isnot(None),
-                Folder.folder_metadata["watched"].astext == "true",
-            )
-        )
-    ).scalars().all()
-
-    return folders
