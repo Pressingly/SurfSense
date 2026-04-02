@@ -48,22 +48,12 @@ interface ElectronAPI {
 	setQuickAskMode: (mode: string) => Promise<void>;
 	getQuickAskMode: () => Promise<string>;
 	replaceText: (text: string) => Promise<void>;
-	// Folder sync
-	selectFolder: () => Promise<string | null>;
-	addWatchedFolder: (config: WatchedFolderConfig) => Promise<WatchedFolderConfig[]>;
-	removeWatchedFolder: (folderPath: string) => Promise<WatchedFolderConfig[]>;
-	getWatchedFolders: () => Promise<WatchedFolderConfig[]>;
-	getWatcherStatus: () => Promise<{ path: string; active: boolean; watching: boolean }[]>;
-	onFileChanged: (callback: (data: FolderSyncFileChangedEvent) => void) => () => void;
-	onWatcherReady: (callback: (data: FolderSyncWatcherReadyEvent) => void) => () => void;
-	pauseWatcher: () => Promise<void>;
-	resumeWatcher: () => Promise<void>;
-	signalRendererReady: () => Promise<void>;
-	getPendingFileEvents: () => Promise<FolderSyncFileChangedEvent[]>;
-	acknowledgeFileEvents: (eventIds: string[]) => Promise<{ acknowledged: number }>;
-	// Browse files/folders via native dialogs
-	browseFiles: () => Promise<string[] | null>;
-	readLocalFiles: (paths: string[]) => Promise<LocalFileData[]>;
+	onAutocompleteContext: (callback: (data: { text: string; cursorPosition: number; searchSpaceId?: string }) => void) => () => void;
+	acceptSuggestion: (text: string) => Promise<void>;
+	dismissSuggestion: () => Promise<void>;
+	updateSuggestionText: (text: string) => Promise<void>;
+	setAutocompleteEnabled: (enabled: boolean) => Promise<void>;
+	getAutocompleteEnabled: () => Promise<boolean>;
 }
 
 declare global {
