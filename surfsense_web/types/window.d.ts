@@ -60,7 +60,6 @@ interface ElectronAPI {
 	onAutocompleteContext: (callback: (data: { screenshot: string; searchSpaceId?: string }) => void) => () => void;
 	acceptSuggestion: (text: string) => Promise<void>;
 	dismissSuggestion: () => Promise<void>;
-	updateSuggestionText: (text: string) => Promise<void>;
 	setAutocompleteEnabled: (enabled: boolean) => Promise<void>;
 	getAutocompleteEnabled: () => Promise<boolean>;
 }
