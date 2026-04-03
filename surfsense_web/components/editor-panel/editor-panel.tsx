@@ -34,20 +34,6 @@ function EditorPanelSkeleton() {
 	);
 }
 
-const PlateEditor = dynamic(
-	() => import("@/components/editor/plate-editor").then((m) => ({ default: m.PlateEditor })),
-	{ ssr: false, loading: () => null }
-);
-
-interface EditorContent {
-	document_id: number;
-	title: string;
-	document_type?: string;
-	source_markdown: string;
-}
-
-const EDITABLE_DOCUMENT_TYPES = new Set(["FILE", "NOTE"]);
-
 export function EditorPanelContent({
 	documentId,
 	searchSpaceId,
@@ -187,24 +173,24 @@ export function EditorPanelContent({
 	return (
 		<>
 			<div className="flex items-center justify-between px-4 py-2 shrink-0 border-b">
-			<div className="flex-1 min-w-0">
-				<h2 className="text-sm font-semibold truncate">{displayTitle}</h2>
-				{isEditableType && editedMarkdown !== null && (
-					<p className="text-[10px] text-muted-foreground">Unsaved changes</p>
-				)}
+				<div className="flex-1 min-w-0">
+					<h2 className="text-sm font-semibold truncate">{displayTitle}</h2>
+					{isEditableType && editedMarkdown !== null && (
+						<p className="text-[10px] text-muted-foreground">Unsaved changes</p>
+					)}
+				</div>
+				<div className="flex items-center gap-1 shrink-0">
+					{editorDoc?.document_type && (
+						<VersionHistoryButton documentId={documentId} documentType={editorDoc.document_type} />
+					)}
+					{onClose && (
+						<Button variant="ghost" size="icon" onClick={onClose} className="size-7 shrink-0">
+							<XIcon className="size-4" />
+							<span className="sr-only">Close editor panel</span>
+						</Button>
+					)}
+				</div>
 			</div>
-			<div className="flex items-center gap-1 shrink-0">
-				{editorDoc?.document_type && (
-					<VersionHistoryButton documentId={documentId} documentType={editorDoc.document_type} />
-				)}
-				{onClose && (
-					<Button variant="ghost" size="icon" onClick={onClose} className="size-7 shrink-0">
-						<XIcon className="size-4" />
-						<span className="sr-only">Close editor panel</span>
-					</Button>
-				)}
-			</div>
-		</div>
 
 			<div className="flex-1 overflow-hidden">
 				{isLoading ? (
@@ -226,7 +212,9 @@ export function EditorPanelContent({
 									? "Document is processing"
 									: "Document unavailable"}
 							</p>
-							<p className="text-sm text-muted-foreground">{error || "An unknown error occurred"}</p>
+							<p className="text-sm text-muted-foreground">
+								{error || "An unknown error occurred"}
+							</p>
 						</div>
 					</div>
 				) : isLargeDocument ? (
