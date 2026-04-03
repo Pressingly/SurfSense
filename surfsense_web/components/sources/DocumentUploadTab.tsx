@@ -371,18 +371,24 @@ export function DocumentUploadTab({
 		}
 
 		return (
-			<Button
-				variant="secondary"
-				size="sm"
-				className={`text-xs ${sizeClass} ${widthClass}`}
-				onClick={(e) => {
-					e.stopPropagation();
-					e.preventDefault();
-					fileInputRef.current?.click();
-				}}
-			>
-				{t("browse_files")}
-			</Button>
+			<DropdownMenu>
+				<DropdownMenuTrigger asChild onClick={(e) => e.stopPropagation()}>
+					<Button variant="secondary" size="sm" className={`text-xs gap-1 ${sizeClass} ${widthClass}`}>
+						Browse
+						<ChevronDown className="h-3 w-3 opacity-60" />
+					</Button>
+				</DropdownMenuTrigger>
+				<DropdownMenuContent align="center" onClick={(e) => e.stopPropagation()}>
+					<DropdownMenuItem onClick={() => fileInputRef.current?.click()}>
+						<FileIcon className="h-4 w-4 mr-2" />
+						{t("browse_files")}
+					</DropdownMenuItem>
+					<DropdownMenuItem onClick={() => folderInputRef.current?.click()}>
+						<FolderOpen className="h-4 w-4 mr-2" />
+						{t("browse_folder")}
+					</DropdownMenuItem>
+				</DropdownMenuContent>
+			</DropdownMenu>
 		);
 	};
 
@@ -424,7 +430,7 @@ export function DocumentUploadTab({
 						<Upload className="h-10 w-10 text-muted-foreground" />
 						<div className="text-center space-y-1.5">
 							<p className="text-base font-medium">
-								{isElectron ? "Select files or folder" : "Tap to select files"}
+								{isElectron ? "Select files or folder" : "Tap to select files or folder"}
 							</p>
 							<p className="text-sm text-muted-foreground inline-flex items-center flex-wrap justify-center">
 								<span>{t("file_size_limit")}</span>
@@ -432,11 +438,9 @@ export function DocumentUploadTab({
 								<span>{t("upload_limits", { maxFiles: MAX_FILES, maxSizeMB: MAX_TOTAL_SIZE_MB })}</span>
 							</p>
 						</div>
-						{isElectron && (
-							<div className="w-full mt-1" onClick={(e) => e.stopPropagation()}>
-								{renderBrowseButton({ fullWidth: true })}
-							</div>
-						)}
+						<div className="w-full mt-1" onClick={(e) => e.stopPropagation()}>
+							{renderBrowseButton({ fullWidth: true })}
+						</div>
 					</div>
 				)}
 			</div>
@@ -489,8 +493,8 @@ export function DocumentUploadTab({
 				)}
 			</div>
 
-			{/* FOLDER SELECTED */}
-			{selectedFolder && (
+			{/* FOLDER SELECTED (Electron only — web flattens folder contents into file list) */}
+			{isElectron && selectedFolder && (
 				<div className="rounded-lg border border-border p-3 space-y-2">
 					<div className="flex items-center gap-2">
 						<FolderOpen className="h-4 w-4 text-primary shrink-0" />
