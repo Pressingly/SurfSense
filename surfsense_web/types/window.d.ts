@@ -51,8 +51,10 @@ interface ElectronAPI {
 	// Permissions
 	getPermissionsStatus: () => Promise<{
 		accessibility: 'authorized' | 'denied' | 'not determined' | 'restricted' | 'limited';
+		screenRecording: 'authorized' | 'denied' | 'not determined' | 'restricted' | 'limited';
 	}>;
 	requestAccessibility: () => Promise<void>;
+	requestScreenRecording: () => Promise<void>;
 	restartApp: () => Promise<void>;
 	// Autocomplete
 	onAutocompleteContext: (callback: (data: { screenshot: string; searchSpaceId?: string }) => void) => () => void;
