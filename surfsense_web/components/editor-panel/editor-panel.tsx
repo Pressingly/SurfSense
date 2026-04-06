@@ -14,6 +14,25 @@ import { Drawer, DrawerContent, DrawerHandle, DrawerTitle } from "@/components/u
 import { useMediaQuery } from "@/hooks/use-media-query";
 import { authenticatedFetch, getBearerToken, redirectToLogin } from "@/lib/auth-utils";
 
+const PlateEditor = dynamic(
+	() => import("@/components/editor/plate-editor").then((m) => ({ default: m.PlateEditor })),
+	{ ssr: false, loading: () => <EditorPanelSkeleton /> }
+);
+
+const LARGE_DOCUMENT_THRESHOLD = 2 * 1024 * 1024; // 2MB
+
+interface EditorContent {
+	document_id: number;
+	title: string;
+	document_type?: string;
+	source_markdown: string;
+	content_size_bytes?: number;
+	chunk_count?: number;
+	truncated?: boolean;
+}
+
+const EDITABLE_DOCUMENT_TYPES = new Set(["FILE", "NOTE"]);
+
 function EditorPanelSkeleton() {
 	return (
 		<div className="space-y-6 p-6">
