@@ -8,7 +8,7 @@ Optimized pipeline:
 """
 
 import logging
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
 
 from langchain_core.messages import HumanMessage
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,9 +32,83 @@ def _is_vision_unsupported_error(e: Exception) -> bool:
     return "content must be a string" in msg or "does not support image" in msg
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
+async def _extract_query_from_screenshot(
+    llm,
+    screenshot_data_url: str,
+    app_name: str = "",
+    window_title: str = "",
+) -> str | None:
+    """Ask the Vision LLM to describe what the user is working on.
+
+    Raises vision-unsupported errors so the caller can return a
+    friendly message immediately instead of retrying with astream.
+    """
+    if app_name:
+        prompt_text = EXTRACT_QUERY_PROMPT_WITH_APP.format(
+            app_name=app_name,
+            window_title=window_title,
+        )
+    else:
+        prompt_text = EXTRACT_QUERY_PROMPT
+
+    try:
+        response = await llm.ainvoke(
+            [
+                HumanMessage(
+                    content=[
+                        {"type": "text", "text": prompt_text},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": screenshot_data_url},
+                        },
+                    ]
+                ),
+            ]
+        )
+        query = response.content.strip() if hasattr(response, "content") else ""
+        return query if query else None
+    except Exception as e:
+        if _is_vision_unsupported_error(e):
+            raise
+        logger.warning(f"Failed to extract query from screenshot: {e}")
+        return None
+
+
+async def _search_knowledge_base(
+    session: AsyncSession, search_space_id: int, query: str
+) -> str:
+    """Search the KB and return formatted context string."""
+    try:
+        retriever = ChucksHybridSearchRetriever(session)
+        results = await retriever.hybrid_search(
+            query_text=query,
+            top_k=KB_TOP_K,
+            search_space_id=search_space_id,
+        )
+
+        if not results:
+            return ""
+
+        parts: list[str] = []
+        char_count = 0
+        for doc in results:
+            title = doc.get("document", {}).get("title", "Untitled")
+            for chunk in doc.get("chunks", []):
+                content = chunk.get("content", "").strip()
+                if not content:
+                    continue
+                entry = f"[{title}]\n{content}"
+                if char_count + len(entry) > KB_MAX_CHARS:
+                    break
+                parts.append(entry)
+                char_count += len(entry)
+            if char_count >= KB_MAX_CHARS:
+                break
+
+        return "\n\n---\n\n".join(parts)
+    except Exception as e:
+        logger.warning(f"KB search failed, proceeding without context: {e}")
+        return ""
 
 
 async def stream_vision_autocomplete(
@@ -73,21 +147,18 @@ async def stream_vision_autocomplete(
     )
 
     try:
-        agent, kb = await create_autocomplete_agent(
+        query = await _extract_query_from_screenshot(
             llm,
-            search_space_id=search_space_id,
-            kb_query=kb_query,
+            screenshot_data_url,
             app_name=app_name,
             window_title=window_title,
         )
     except Exception as e:
-        if _is_vision_unsupported_error(e):
-            logger.warning("Vision autocomplete: model does not support vision: %s", e)
-            yield streaming.format_error(vision_error_msg)
-            yield streaming.format_done()
-            return
-        logger.error("Failed to create autocomplete agent: %s", e, exc_info=True)
-        yield streaming.format_error("Autocomplete failed. Please try again.")
+        logger.warning(
+            f"Vision autocomplete: selected model does not support vision: {e}"
+        )
+        yield streaming.format_message_start()
+        yield streaming.format_error(vision_error_msg)
         yield streaming.format_done()
         return
 
@@ -101,20 +172,21 @@ async def stream_vision_autocomplete(
         items=[f"Found {doc_count} document{'s' if doc_count != 1 else ''}"] if kb_query else ["Skipped"],
     )
 
-    # Build agent input with pre-computed KB as initial state
-    if has_kb:
-        instruction = (
-            "Analyze this screenshot, then explore the knowledge base documents "
-            "listed above — read the chunk index of any document whose title "
-            "looks relevant and check matched chunks for useful facts. "
-            "Finally, generate a concise autocomplete for the active text area, "
-            "enhanced with any relevant KB information you found."
-        )
-    else:
-        instruction = (
-            "Analyze this screenshot and generate a concise autocomplete "
-            "for the active text area based on what you see."
-        )
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(
+            content=[
+                {
+                    "type": "text",
+                    "text": "Analyze this screenshot. Understand the full context of what the user is working on, then generate the text they most likely want to write in the active text area.",
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": screenshot_data_url},
+                },
+            ]
+        ),
+    ]
 
     user_message = HumanMessage(content=[
         {"type": "text", "text": instruction},
@@ -138,7 +210,9 @@ async def stream_vision_autocomplete(
             yield sse
     except Exception as e:
         if _is_vision_unsupported_error(e):
-            logger.warning("Vision autocomplete: model does not support vision: %s", e)
+            logger.warning(
+                f"Vision autocomplete: selected model does not support vision: {e}"
+            )
             yield streaming.format_error(vision_error_msg)
             yield streaming.format_done()
         else:
