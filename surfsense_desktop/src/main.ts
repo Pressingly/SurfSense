@@ -1,13 +1,16 @@
 import { app, BrowserWindow } from 'electron';
+
+let isQuitting = false;
 import { registerGlobalErrorHandlers, showErrorDialog } from './modules/errors';
 import { startNextServer } from './modules/server';
-import { createMainWindow } from './modules/window';
+import { createMainWindow, getMainWindow } from './modules/window';
 import { setupDeepLinks, handlePendingDeepLink } from './modules/deep-links';
 import { setupAutoUpdater } from './modules/auto-updater';
 import { setupMenu } from './modules/menu';
 import { registerQuickAsk, unregisterQuickAsk } from './modules/quick-ask';
 import { registerAutocomplete, unregisterAutocomplete } from './modules/autocomplete';
 import { registerIpcHandlers } from './ipc/handlers';
+import { createTray, destroyTray } from './modules/tray';
 
 registerGlobalErrorHandlers();
 
@@ -27,7 +30,18 @@ app.whenReady().then(async () => {
     return;
   }
 
-  createMainWindow('/dashboard');
+  await createTray();
+
+  const win = createMainWindow('/dashboard');
+
+  // Minimize to tray instead of closing the app
+  win.on('close', (e) => {
+    if (!isQuitting) {
+      e.preventDefault();
+      win.hide();
+    }
+  });
+
   await registerQuickAsk();
   await registerAutocomplete();
   registerFolderWatcher();
@@ -36,19 +50,28 @@ app.whenReady().then(async () => {
   handlePendingDeepLink();
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
+    const mw = getMainWindow();
+    if (!mw || mw.isDestroyed()) {
       createMainWindow('/dashboard');
+    } else {
+      mw.show();
+      mw.focus();
     }
   });
 });
 
+// Keep running in the background — the tray "Quit" calls app.exit()
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
+  // Do nothing: the app stays alive in the tray
+});
+
+app.on('before-quit', () => {
+  isQuitting = true;
 });
 
 app.on('will-quit', () => {
   unregisterQuickAsk();
   unregisterAutocomplete();
+  unregisterFolderWatcher();
+  destroyTray();
 });
