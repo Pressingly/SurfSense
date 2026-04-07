@@ -2,6 +2,7 @@
 
 import { BadgeCheck, LogOut } from "lucide-react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
@@ -27,6 +28,7 @@ export function UserDropdown({
 		avatar: string;
 	};
 }) {
+	const router = useRouter();
 	const [isLoggingOut, setIsLoggingOut] = useState(false);
 
 	const handleLogout = async () => {
@@ -38,15 +40,13 @@ export function UserDropdown({
 
 			await logout();
 
-			if (typeof window !== "undefined") {
-				window.location.href = getLoginPath();
-			}
+			router.push("/");
+			router.refresh();
 		} catch (error) {
 			console.error("Error during logout:", error);
 			await logout();
-			if (typeof window !== "undefined") {
-				window.location.href = getLoginPath();
-			}
+			router.push("/");
+			router.refresh();
 		}
 	};
 
