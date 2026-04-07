@@ -62,6 +62,25 @@ interface ElectronAPI {
 	dismissSuggestion: () => Promise<void>;
 	setAutocompleteEnabled: (enabled: boolean) => Promise<void>;
 	getAutocompleteEnabled: () => Promise<boolean>;
+	// Folder sync
+	selectFolder: () => Promise<string | null>;
+	addWatchedFolder: (config: WatchedFolderConfig) => Promise<WatchedFolderConfig[]>;
+	removeWatchedFolder: (folderPath: string) => Promise<WatchedFolderConfig[]>;
+	getWatchedFolders: () => Promise<WatchedFolderConfig[]>;
+	getWatcherStatus: () => Promise<{ path: string; active: boolean; watching: boolean }[]>;
+	onFileChanged: (callback: (data: FolderSyncFileChangedEvent) => void) => () => void;
+	onWatcherReady: (callback: (data: FolderSyncWatcherReadyEvent) => void) => () => void;
+	pauseWatcher: () => Promise<void>;
+	resumeWatcher: () => Promise<void>;
+	signalRendererReady: () => Promise<void>;
+	getPendingFileEvents: () => Promise<FolderSyncFileChangedEvent[]>;
+	acknowledgeFileEvents: (eventIds: string[]) => Promise<{ acknowledged: number }>;
+	// Browse files/folders via native dialogs
+	browseFiles: () => Promise<string[] | null>;
+	readLocalFiles: (paths: string[]) => Promise<LocalFileData[]>;
+	// Auth token sync across windows
+	getAuthTokens: () => Promise<{ bearer: string; refresh: string } | null>;
+	setAuthTokens: (bearer: string, refresh: string) => Promise<void>;
 }
 
 declare global {

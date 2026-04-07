@@ -7,6 +7,8 @@ import {
   restartApp,
 } from '../modules/permissions';
 
+let authTokens: { bearer: string; refresh: string } | null = null;
+
 export function registerIpcHandlers(): void {
   ipcMain.on(IPC_CHANNELS.OPEN_EXTERNAL, (_event, url: string) => {
     try {
@@ -37,5 +39,50 @@ export function registerIpcHandlers(): void {
 
   ipcMain.handle(IPC_CHANNELS.RESTART_APP, () => {
     restartApp();
+  });
+
+  // Folder sync handlers
+  ipcMain.handle(IPC_CHANNELS.FOLDER_SYNC_SELECT_FOLDER, () => selectFolder());
+
+  ipcMain.handle(IPC_CHANNELS.FOLDER_SYNC_ADD_FOLDER, (_event, config) =>
+    addWatchedFolder(config)
+  );
+
+  ipcMain.handle(IPC_CHANNELS.FOLDER_SYNC_REMOVE_FOLDER, (_event, folderPath: string) =>
+    removeWatchedFolder(folderPath)
+  );
+
+  ipcMain.handle(IPC_CHANNELS.FOLDER_SYNC_GET_FOLDERS, () => getWatchedFolders());
+
+  ipcMain.handle(IPC_CHANNELS.FOLDER_SYNC_GET_STATUS, () => getWatcherStatus());
+
+  ipcMain.handle(IPC_CHANNELS.FOLDER_SYNC_PAUSE, () => pauseWatcher());
+
+  ipcMain.handle(IPC_CHANNELS.FOLDER_SYNC_RESUME, () => resumeWatcher());
+
+  ipcMain.handle(IPC_CHANNELS.FOLDER_SYNC_RENDERER_READY, () => {
+    markRendererReady();
+  });
+
+  ipcMain.handle(IPC_CHANNELS.FOLDER_SYNC_GET_PENDING_EVENTS, () =>
+    getPendingFileEvents()
+  );
+
+  ipcMain.handle(IPC_CHANNELS.FOLDER_SYNC_ACK_EVENTS, (_event, eventIds: string[]) =>
+    acknowledgeFileEvents(eventIds)
+  );
+
+  ipcMain.handle(IPC_CHANNELS.BROWSE_FILES, () => browseFiles());
+
+  ipcMain.handle(IPC_CHANNELS.READ_LOCAL_FILES, (_event, paths: string[]) =>
+    readLocalFiles(paths)
+  );
+
+  ipcMain.handle(IPC_CHANNELS.SET_AUTH_TOKENS, (_event, tokens: { bearer: string; refresh: string }) => {
+    authTokens = tokens;
+  });
+
+  ipcMain.handle(IPC_CHANNELS.GET_AUTH_TOKENS, () => {
+    return authTokens;
   });
 }
