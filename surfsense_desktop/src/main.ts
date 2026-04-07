@@ -28,8 +28,9 @@ app.whenReady().then(async () => {
   }
 
   createMainWindow('/dashboard');
-  registerQuickAsk();
-  registerAutocomplete();
+  await registerQuickAsk();
+  await registerAutocomplete();
+  registerFolderWatcher();
   setupAutoUpdater();
 
   handlePendingDeepLink();
