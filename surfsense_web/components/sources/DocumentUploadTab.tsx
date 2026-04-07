@@ -97,6 +97,11 @@ const FILE_TYPE_CONFIG: Record<string, Record<string, string[]>> = {
 		"image/tiff": [".tiff", ".tif"],
 		...audioFileTypes,
 	},
+	AZURE_DI: {
+		...commonTypes,
+		"image/heic": [".heic"],
+		...audioFileTypes,
+	},
 	default: {
 		...commonTypes,
 		"application/msword": [".doc"],
