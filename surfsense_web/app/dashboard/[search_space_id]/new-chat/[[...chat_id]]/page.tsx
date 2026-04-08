@@ -40,41 +40,6 @@ import { ThinkingStepsDataUI } from "@/components/assistant-ui/thinking-steps";
 import { Thread } from "@/components/assistant-ui/thread";
 import { useChatSessionStateSync } from "@/hooks/use-chat-session-state";
 import { useMessagesSync } from "@/hooks/use-messages-sync";
-import { documentsApiService } from "@/lib/apis/documents-api.service";
-import { getBearerToken } from "@/lib/auth-utils";
-import { convertToThreadMessage } from "@/lib/chat/message-utils";
-import {
-	isPodcastGenerating,
-	looksLikePodcastRequest,
-	setActivePodcastTaskId,
-} from "@/lib/chat/podcast-state";
-import {
-	addToolCall,
-	appendText,
-	buildContentForPersistence,
-	buildContentForUI,
-	type ContentPartsState,
-	FrameBatchedUpdater,
-	readSSEStream,
-	type ThinkingStepData,
-	updateThinkingSteps,
-	updateToolCall,
-} from "@/lib/chat/streaming-state";
-import {
-	appendMessage,
-	createThread,
-	getRegenerateUrl,
-	getThreadFull,
-	getThreadMessages,
-	type ThreadRecord,
-} from "@/lib/chat/thread-persistence";
-import { NotFoundError } from "@/lib/error";
-import {
-	trackChatCreated,
-	trackChatError,
-	trackChatMessageSent,
-	trackChatResponseReceived,
-} from "@/lib/posthog/events";
 import Loading from "../loading";
 
 const MobileEditorPanel = dynamic(
