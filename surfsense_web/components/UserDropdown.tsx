@@ -40,12 +40,12 @@ export function UserDropdown({
 
 			await logout();
 
-			router.push("/");
+			router.push(getLoginPath());
 			router.refresh();
 		} catch (error) {
 			console.error("Error during logout:", error);
 			await logout();
-			router.push("/");
+			router.push(getLoginPath());
 			router.refresh();
 		}
 	};
