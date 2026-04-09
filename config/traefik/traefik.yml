@@ -1,0 +1,15 @@
+api:
+  dashboard: true
+  insecure: true  # dashboard at http://localhost:8930 — dev only
+
+entryPoints:
+  web:
+    address: ":8929"
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+log:
+  level: INFO

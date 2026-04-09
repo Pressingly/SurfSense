@@ -1,0 +1,13 @@
+services:
+  backend:
+    networks:
+      surfsense_local:
+      mpass-net:
+        aliases:
+          - surfsense-backend
+
+networks:
+  mpass-net:
+    external: true
+    name: mpass-net
+

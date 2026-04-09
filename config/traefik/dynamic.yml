@@ -1,0 +1,44 @@
+http:
+  middlewares:
+    oauth2-auth:
+      forwardAuth:
+        address: "http://oauth2-proxy:4180/oauth2/auth"
+        trustForwardHeader: true
+        authResponseHeaders:
+          - X-Auth-Request-Email
+          - X-Auth-Request-User
+
+  routers:
+    # oauth2-proxy handles its own auth flow — no ForwardAuth
+    oauth2-proxy:
+      entryPoints: [web]
+      rule: "PathPrefix(`/oauth2`)"
+      priority: 30
+      service: oauth2-proxy
+
+    # Health check — always unauthenticated
+    health:
+      entryPoints: [web]
+      rule: "Path(`/health`)"
+      priority: 20
+      service: backend
+
+    # All other routes — protected by ForwardAuth
+    backend:
+      entryPoints: [web]
+      rule: "PathPrefix(`/`)"
+      priority: 1
+      service: backend
+      middlewares:
+        - oauth2-auth
+
+  services:
+    backend:
+      loadBalancer:
+        servers:
+          - url: "http://backend:8000"
+
+    oauth2-proxy:
+      loadBalancer:
+        servers:
+          - url: "http://oauth2-proxy:4180"
