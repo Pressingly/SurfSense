@@ -51,7 +51,7 @@ export function handleUnauthorized(): void {
 	// Only redirect on protected routes; stay on public pages (e.g. /docs)
 	if (!isPublicRoute(pathname)) {
 		const currentPath = pathname + window.location.search + window.location.hash;
-		const excludedPaths = ["/auth", "/auth/callback", "/"];
+		const excludedPaths = ["/auth", "/"];
 		if (!excludedPaths.includes(pathname)) {
 			localStorage.setItem(REDIRECT_PATH_KEY, currentPath);
 		}
@@ -130,35 +130,78 @@ export function clearAllTokens(): void {
 }
 
 /**
- * Logout the current user by revoking the refresh token and clearing localStorage.
- * Returns true if logout was successful (or tokens were cleared), false otherwise.
+ * Reads the short-lived SSO handoff cookies set by /auth/jwt/proxy-login.
+ * Returns null for each if not present.
+ */
+export function getSSOCookieTokens(): { token: string | null; refreshToken: string | null } {
+	if (typeof document === "undefined") return { token: null, refreshToken: null };
+	const get = (name: string): string | null => {
+		const match = document.cookie.match(new RegExp(`(?:^|; )${name}=([^;]*)`));
+		return match ? decodeURIComponent(match[1]) : null;
+	};
+	return { token: get("surfsense_sso_token"), refreshToken: get("surfsense_sso_refresh_token") };
+}
+
+/**
+ * Clears the SSO handoff cookies after tokens have been transferred to localStorage.
+ */
+export function clearSSOCookies(): void {
+	if (typeof document === "undefined") return;
+	const expire = "expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/";
+	document.cookie = `surfsense_sso_token=; ${expire}`;
+	document.cookie = `surfsense_sso_refresh_token=; ${expire}`;
+}
+
+/**
+ * Logout the current user.
+ *
+ * Always performs 3-layer SSO logout (proxy auth is the only auth mode):
+ *   Layer 1 — revoke JWT refresh tokens server-side
+ *   Layer 2 — clear _oauth2_proxy cookie via /oauth2/sign_out
+ *   Layer 3 — clear Cognito session via rd= redirect
  */
 export async function logout(): Promise<boolean> {
 	const refreshToken = getRefreshToken();
 
-	// Call backend to revoke the refresh token
+	// Layer 1 — revoke the refresh token server-side
 	if (refreshToken) {
 		try {
 			const backendUrl = process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL || "http://localhost:8000";
 			const response = await fetch(`${backendUrl}/auth/jwt/revoke`, {
 				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-				},
+				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({ refresh_token: refreshToken }),
 			});
-
 			if (!response.ok) {
 				console.warn("Failed to revoke refresh token:", response.status, await response.text());
 			}
 		} catch (error) {
 			console.warn("Failed to revoke refresh token on server:", error);
-			// Continue to clear local tokens even if server call fails
 		}
 	}
 
-	// Clear all tokens from localStorage
 	clearAllTokens();
+
+	// Layers 2 + 3 — SSO logout via oauth2-proxy → Cognito
+	if (typeof window !== "undefined") {
+		const oidcLogoutUrl = process.env.NEXT_PUBLIC_OIDC_LOGOUT_URL;
+		const oidcClientId = process.env.NEXT_PUBLIC_OIDC_CLIENT_ID;
+
+		if (oidcLogoutUrl && oidcClientId) {
+			const cognitoUrl = new URL(oidcLogoutUrl);
+			cognitoUrl.searchParams.set("client_id", oidcClientId);
+			cognitoUrl.searchParams.set("logout_uri", window.location.origin);
+
+			// Full SSO logout: oauth2-proxy sign_out clears _oauth2_proxy cookie,
+			// then rd= redirects to Cognito to clear the Cognito session.
+			// Uses the dedicated auth domain (foss-auth.localhost) so the sign_out
+			// URL is consistent regardless of which app initiates the logout.
+			const oauthProxyUrl = process.env.NEXT_PUBLIC_OAUTH2_PROXY_URL || window.location.origin;
+			window.location.href = `${oauthProxyUrl}/oauth2/sign_out?rd=${encodeURIComponent(cognitoUrl.toString())}`;
+			return true; // browser is already navigating away
+		}
+	}
+
 	return true;
 }
 
@@ -181,7 +224,7 @@ export function redirectToLogin(): void {
 	const currentPath = window.location.pathname + window.location.search + window.location.hash;
 
 	// Don't save auth-related paths or home page
-	const excludedPaths = ["/auth", "/auth/callback", "/", "/login", "/register"];
+	const excludedPaths = ["/auth", "/", "/login", "/register"];
 	if (!excludedPaths.includes(window.location.pathname)) {
 		localStorage.setItem(REDIRECT_PATH_KEY, currentPath);
 	}
