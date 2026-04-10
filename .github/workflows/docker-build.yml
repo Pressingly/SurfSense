@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - dev
+      - foss-main
       - feat/mpass-proxy-auth
     paths:
       - 'surfsense_backend/**'
@@ -30,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     if: >
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch) ||
+      github.ref == 'refs/heads/foss-main' ||
       github.ref == 'refs/heads/feat/mpass-proxy-auth' ||
       github.event_name == 'workflow_dispatch'
     outputs:
