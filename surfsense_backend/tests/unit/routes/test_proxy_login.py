@@ -77,7 +77,64 @@ def _make_session_cm(session: AsyncMock) -> MagicMock:
     return cm
 
 
+def _make_execute_result(user):
+    """
+    Mock the SQLAlchemy result chain used by proxy_login:
+        result = await session.execute(...)
+        user = result.unique().scalar_one_or_none()
+
+    The intermediate `.unique()` call is easy to miss when mocking — without it,
+    the test gets a stray MagicMock back instead of `user` (or `None`), which
+    silently masks bugs in the new-user provisioning path.
+    """
+    result = MagicMock()
+    unique = MagicMock()
+    unique.scalar_one_or_none.return_value = user
+    result.unique.return_value = unique
+    return result
+
+
 # ── tests ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+class TestProxyLoginRouteRegistration:
+    """
+    Regression guard for the route being missing from the running image.
+
+    These tests don't exercise behaviour — they assert that the router exposes
+    the endpoint at the expected path/method. They would have failed loudly when
+    the baked Docker image lacked the proxy_login function entirely (the bug
+    that caused the cookie-handoff loop in the devstack on 2026-04-11).
+    """
+
+    def test_proxy_login_route_is_registered(self):
+        """GIVEN the auth router is imported THEN /auth/jwt/proxy-login is one of its routes."""
+        from app.routes.auth_routes import router
+
+        paths = [route.path for route in router.routes]
+        assert "/auth/jwt/proxy-login" in paths, (
+            f"proxy-login route missing from auth router. Registered paths: {paths}"
+        )
+
+    def test_proxy_login_route_uses_get_method(self):
+        """GIVEN the route is registered THEN it accepts GET (browser navigation)."""
+        from app.routes.auth_routes import router
+
+        matching = [r for r in router.routes if r.path == "/auth/jwt/proxy-login"]
+        assert len(matching) == 1, f"expected exactly one proxy-login route, found {len(matching)}"
+        assert "GET" in matching[0].methods, (
+            f"proxy-login must accept GET (302 cookie handoff). Methods: {matching[0].methods}"
+        )
+
+    def test_proxy_login_route_calls_proxy_login_function(self):
+        """GIVEN the route is registered THEN it dispatches to the proxy_login function."""
+        from app.routes.auth_routes import proxy_login, router
+
+        matching = [r for r in router.routes if r.path == "/auth/jwt/proxy-login"]
+        assert matching[0].endpoint is proxy_login, (
+            "route is registered but points to a different function"
+        )
 
 
 @pytest.mark.unit
@@ -105,9 +162,7 @@ class TestProxyLogin:
         user = _make_user(email=_EMAIL, is_active=True)
 
         session = AsyncMock()
-        found_result = MagicMock()
-        found_result.scalar_one_or_none.return_value = user
-        session.execute = AsyncMock(return_value=found_result)
+        session.execute = AsyncMock(return_value=_make_execute_result(user))
         session_cm = _make_session_cm(session)
 
         mock_strategy = AsyncMock()
@@ -144,9 +199,7 @@ class TestProxyLogin:
         new_user = _make_user(email=_EMAIL, is_active=True)
         session = AsyncMock()
         session.add = MagicMock()
-        no_result = MagicMock()
-        no_result.scalar_one_or_none.return_value = None
-        session.execute = AsyncMock(return_value=no_result)
+        session.execute = AsyncMock(return_value=_make_execute_result(None))
         session.refresh = AsyncMock(side_effect=lambda u: setattr(u, "id", new_user.id))
 
         session_cm = _make_session_cm(session)
@@ -178,9 +231,7 @@ class TestProxyLogin:
         inactive = _make_user(email=_EMAIL, is_active=False)
 
         session = AsyncMock()
-        found_result = MagicMock()
-        found_result.scalar_one_or_none.return_value = inactive
-        session.execute = AsyncMock(return_value=found_result)
+        session.execute = AsyncMock(return_value=_make_execute_result(inactive))
         session_cm = _make_session_cm(session)
 
         from fastapi import HTTPException
@@ -207,9 +258,7 @@ class TestProxyLogin:
 
         async def mock_execute(stmt):
             captured_queries.append(stmt)
-            result = MagicMock()
-            result.scalar_one_or_none.return_value = user
-            return result
+            return _make_execute_result(user)
 
         session = AsyncMock()
         session.execute = mock_execute
