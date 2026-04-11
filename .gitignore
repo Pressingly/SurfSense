@@ -10,3 +10,5 @@ deepagents/
 debug.log
 opencode/
 hermes-agent/
+.env.local
+.idea/

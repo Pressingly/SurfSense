@@ -5,6 +5,11 @@ import type { Context } from "@/types/zero";
 import { queries } from "@/zero/queries";
 import { schema } from "@/zero/schema";
 
+// This route runs server-side (Next.js API route, called by zero-cache).
+// Prefer an internal URL for server-to-server calls — `NEXT_PUBLIC_*` is the
+// browser-facing URL, which in reverse-proxy / ForwardAuth deployments goes
+// through an auth gateway that rejects server-side fetches without browser
+// cookies. Falls back to the public URL for single-host deployments.
 const backendURL =
 	process.env.FASTAPI_BACKEND_INTERNAL_URL ||
 	process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL ||

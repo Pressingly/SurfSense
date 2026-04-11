@@ -36,12 +36,19 @@ from app.config import (
 )
 from app.db import User, create_db_and_tables, get_async_session
 from app.exceptions import GENERIC_5XX_MESSAGE, ISSUES_URL, SurfSenseError
+from app.middleware.proxy_auth import ProxyAuthMiddleware
 from app.rate_limiter import get_real_client_ip, limiter
 from app.routes import router as crud_router
 from app.routes.auth_routes import router as auth_router
 from app.schemas import UserCreate, UserRead, UserUpdate
 from app.tasks.surfsense_docs_indexer import seed_surfsense_docs
-from app.users import SECRET, auth_backend, current_active_user, fastapi_users
+from app.users import (
+    SECRET,
+    auth_backend,
+    current_active_user,
+    fastapi_users,
+    get_user_manager,
+)
 from app.utils.perf import get_perf_logger, log_system_snapshot
 
 _error_logger = logging.getLogger("surfsense.errors")
@@ -709,14 +716,28 @@ class RequestPerfMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(RequestPerfMiddleware)
 
-# Add SlowAPI middleware for automatic rate limiting
+# Starlette executes middleware in reverse registration order (last added = first to
+# run on the request).  Request-path execution order:
+#
+#   CORSMiddleware → ProxyHeadersMiddleware → SlowAPIMiddleware
+#   → ProxyAuthMiddleware → RequestPerfMiddleware → route handler
+#
+# SlowAPIMiddleware wraps ProxyAuthMiddleware so rate limiting fires before any DB
+# lookup — abusive traffic is shed at the limiter before we touch the database.
+# ProxyAuthMiddleware runs after ProxyHeadersMiddleware so the client IP/scheme
+# are already normalised when we resolve the user.
+
+# Innermost: reads X-Auth-Request-Email, resolves/creates user, sets request.state.proxy_user.
+app.add_middleware(ProxyAuthMiddleware)
+
+# Wraps ProxyAuthMiddleware — rate limiting fires before the DB lookup.
 # Uses Starlette BaseHTTPMiddleware (not the raw ASGI variant) to avoid
 # corrupting StreamingResponse — SlowAPIASGIMiddleware re-sends
 # http.response.start on every body chunk, breaking SSE/streaming endpoints.
 app.add_middleware(SlowAPIMiddleware)
 
-# Add ProxyHeaders middleware FIRST to trust proxy headers (e.g., from Cloudflare)
-# This ensures FastAPI uses HTTPS in redirects when behind a proxy
+# Outermost of the inner three: trusts proxy headers (X-Forwarded-For etc.)
+# so FastAPI uses HTTPS in redirects when behind Traefik.
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 # Add CORS middleware
@@ -799,13 +820,32 @@ if config.AUTH_TYPE != "GOOGLE":
         tags=["auth"],
     )
 
-# /users/me (read/update profile) is needed in every auth mode, so it stays
-# mounted unconditionally.
+# Register /users/me BEFORE fastapi_users.get_users_router so our routes take
+# precedence (FastAPI first-match wins). fastapi-users' internal /users/me only
+# validates JWT — it does not check request.state.proxy_user set by the proxy
+# auth middleware, so proxy-auth users would always get 401 from that route.
+@app.get("/users/me", response_model=UserRead, tags=["users"])
+async def get_current_user_me(user: User = Depends(current_active_user)):
+    return user
+
+
+@app.patch("/users/me", response_model=UserRead, tags=["users"])
+async def update_current_user_me(
+    request: Request,
+    user_update: UserUpdate,
+    user: User = Depends(current_active_user),
+    user_manager=Depends(get_user_manager),
+):
+    return await user_manager.update(user_update, user, safe=True, request=request)
+
+
+
 app.include_router(
     fastapi_users.get_users_router(UserRead, UserUpdate),
     prefix="/users",
     tags=["users"],
 )
+
 
 # Include custom auth routes (refresh token, logout)
 app.include_router(auth_router)

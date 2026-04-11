@@ -1,6 +1,6 @@
 import { atomWithQuery } from "jotai-tanstack-query";
-import { userApiService } from "@/lib/apis/user-api.service";
 import { getBearerToken } from "@/lib/auth-utils";
+import { userApiService } from "@/lib/apis/user-api.service";
 
 export const USER_QUERY_KEY = ["user", "me"] as const;
 const userQueryFn = () => userApiService.getMe();
