@@ -138,6 +138,35 @@ class TestProxyLoginRouteRegistration:
 
 
 @pytest.mark.unit
+class TestLocalAuthRoutesAreNotRegistered:
+    """In SSO mode, the local login/register/forgot-password routes must not exist."""
+
+    def test_local_auth_routes_are_not_registered(self):
+        from app.app import app
+
+        registered = {
+            (method, route.path)
+            for route in app.routes
+            if hasattr(route, "methods") and hasattr(route, "path")
+            for method in (route.methods or ())
+        }
+
+        forbidden = {
+            ("POST", "/auth/jwt/login"),
+            ("POST", "/auth/register"),
+            ("POST", "/auth/forgot-password"),
+            ("POST", "/auth/reset-password"),
+            ("POST", "/auth/request-verify-token"),
+            ("POST", "/auth/verify"),
+        }
+
+        present = forbidden & registered
+        assert not present, (
+            f"SSO contract violated — these local-auth routes are registered: {sorted(present)}"
+        )
+
+
+@pytest.mark.unit
 class TestProxyLogin:
 
     @pytest.mark.asyncio
