@@ -121,10 +121,13 @@ function LoginContent() {
 	useGlobalLoadingEffect(isLoading);
 
 	// SSO mode: render splash while window.location.replace() takes effect.
+	// isSSOAuth() reads a build-time-inlined env var (NEXT_PUBLIC_*) so it
+	// works during SSR too — the splash renders on the server, the browser
+	// receives splash HTML directly, no form flash before hydration.
 	// All hooks above run unconditionally (rules-of-hooks); only the render
 	// branches here. In SSO deployments isSSOAuth() is true, so the form
 	// below is never reached at runtime.
-	if (typeof window !== "undefined" && isSSOAuth()) {
+	if (isSSOAuth()) {
 		return <div className="min-h-screen bg-gray-50 dark:bg-black" />;
 	}
 
