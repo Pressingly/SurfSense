@@ -35,9 +35,18 @@ export function isPublicRoute(pathname: string): boolean {
 }
 
 /**
- * Clears tokens and optionally redirects to login.
- * Call this when a 401 response is received.
- * Only redirects when the current route is protected; on public routes we just clear tokens.
+ * Clears tokens and redirects through oauth2-proxy on 401.
+ *
+ * This fork is SSO-only (mPass/Cognito via oauth2-proxy ForwardAuth), so the
+ * only valid recovery from a 401 is bouncing the user through the OIDC flow
+ * at the dedicated auth subdomain. The previous /login redirect was a dead
+ * page in SSO mode and resulted in a blank screen.
+ *
+ * Moving this responsibility to the frontend lets the devstack repo drop
+ * its SurfSense-specific Traefik `mpass-signin@file` middleware and
+ * `auth-redirect.yml` dynamic config — those exist purely to convert API
+ * 401s into redirects at the network layer. With this in place the app
+ * handles its own 401s before Traefik ever needs to.
  */
 export function handleUnauthorized(): void {
 	if (typeof window === "undefined") return;
@@ -48,15 +57,20 @@ export function handleUnauthorized(): void {
 	localStorage.removeItem(BEARER_TOKEN_KEY);
 	localStorage.removeItem(REFRESH_TOKEN_KEY);
 
-	// Only redirect on protected routes; stay on public pages (e.g. /docs)
-	if (!isPublicRoute(pathname)) {
-		const currentPath = pathname + window.location.search + window.location.hash;
-		const excludedPaths = ["/auth", "/"];
-		if (!excludedPaths.includes(pathname)) {
-			localStorage.setItem(REDIRECT_PATH_KEY, currentPath);
-		}
-		window.location.href = "/login";
+	// Public routes (e.g. /docs) don't need auth — don't redirect, just clear.
+	if (isPublicRoute(pathname)) return;
+
+	const currentPath = pathname + window.location.search + window.location.hash;
+	const excludedPaths = ["/auth", "/"];
+	if (!excludedPaths.includes(pathname)) {
+		localStorage.setItem(REDIRECT_PATH_KEY, currentPath);
 	}
+
+	// Redirect through oauth2-proxy /oauth2/sign_in. The dedicated auth subdomain
+	// handles the OIDC dance with Cognito and returns the user to `rd=` on success.
+	const oauthProxyUrl = process.env.NEXT_PUBLIC_OAUTH2_PROXY_URL || window.location.origin;
+	const rd = window.location.href;
+	window.location.href = `${oauthProxyUrl}/oauth2/sign_in?rd=${encodeURIComponent(rd)}`;
 }
 
 /**
