@@ -11,13 +11,17 @@
 
 import packageJson from "../package.json";
 
-// Auth type: "LOCAL" for email/password, "GOOGLE" for OAuth
+// Auth type:
+//   "LOCAL" — email/password login form
+//   "GOOGLE" — Google OAuth (native fastapi-users Google flow)
+//   "SSO"    — Cognito/oauth2-proxy ForwardAuth (our devstack pattern)
 // Placeholder: __NEXT_PUBLIC_FASTAPI_BACKEND_AUTH_TYPE__
-export const AUTH_TYPE = process.env.NEXT_PUBLIC_FASTAPI_BACKEND_AUTH_TYPE || "GOOGLE";
+export const AUTH_TYPE = process.env.NEXT_PUBLIC_FASTAPI_BACKEND_AUTH_TYPE || "SSO";
 
 // Backend API URL
 // Placeholder: __NEXT_PUBLIC_FASTAPI_BACKEND_URL__
 export const BACKEND_URL = process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL || "http://localhost:8000";
+
 
 // ETL Service: "DOCLING" or "UNSTRUCTURED"
 // Placeholder: __NEXT_PUBLIC_ETL_SERVICE__
@@ -39,6 +43,9 @@ export const isLocalAuth = () => AUTH_TYPE === "LOCAL";
 
 // Helper to check if Google auth is enabled
 export const isGoogleAuth = () => AUTH_TYPE === "GOOGLE";
+
+// Helper to check if SSO (Cognito/oauth2-proxy) auth is enabled
+export const isSSOAuth = () => AUTH_TYPE === "SSO";
 
 // Helper to check if running in self-hosted mode
 export const isSelfHosted = () => DEPLOYMENT_MODE === "self-hosted";

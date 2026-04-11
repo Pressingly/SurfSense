@@ -1,84 +1,64 @@
-"use client";
+// mPass SSO: This component is disabled because oauth2-proxy ForwardAuth
+// handles login via Cognito. The cookie-handoff pattern (proxy_login →
+// cookie → frontend reads cookie → JWT in localStorage) replaces the
+// native OAuth token extraction flow below.
+//
+// To restore native OAuth login, uncomment this file and re-register
+// the /auth/callback route.
 
-import { useEffect } from "react";
-import { useGlobalLoadingEffect } from "@/hooks/use-global-loading";
-import { getAndClearRedirectPath, setBearerToken, setRefreshToken } from "@/lib/auth-utils";
-import { trackLoginSuccess } from "@/lib/posthog/events";
-
-interface TokenHandlerProps {
-	redirectPath?: string; // Default path to redirect after storing token (if no saved path)
-	tokenParamName?: string; // Name of the URL parameter containing the token
-	storageKey?: string; // Key to use when storing in localStorage (kept for backwards compatibility)
-}
-
-/**
- * Client component that extracts a token from URL parameters and stores it in localStorage
- * After storing the token, it redirects the user back to the page they were on before
- * being redirected to login (if available), or to the default redirectPath.
- *
- * @param redirectPath - Default path to redirect after storing token (default: '/dashboard')
- * @param tokenParamName - Name of the URL parameter containing the token (default: 'token')
- * @param storageKey - Key to use when storing in localStorage (default: 'surfsense_bearer_token')
- */
-const TokenHandler = ({
-	redirectPath = "/dashboard",
-	tokenParamName = "token",
-	storageKey = "surfsense_bearer_token",
-}: TokenHandlerProps) => {
-	// Always show loading for this component - spinner animation won't reset
-	useGlobalLoadingEffect(true);
-
-	useEffect(() => {
-		// Only run on client-side
-		if (typeof window === "undefined") return;
-
-		// Read tokens from URL at mount time — no subscription needed.
-		// TokenHandler only runs once after an auth redirect, so a stale read
-		// is impossible and useSearchParams() would add a pointless subscription.
-		// (Vercel Best Practice: rerender-defer-reads 5.2)
-		const params = new URLSearchParams(window.location.search);
-		const token = params.get(tokenParamName);
-		const refreshToken = params.get("refresh_token");
-
-		if (token) {
-			try {
-				// Track login success for OAuth flows (e.g., Google)
-				// Local login already tracks success before redirecting here
-				const alreadyTracked = sessionStorage.getItem("login_success_tracked");
-				if (!alreadyTracked) {
-					// This is an OAuth flow (Google login) - track success
-					trackLoginSuccess("google");
-				}
-				// Clear the flag for future logins
-				sessionStorage.removeItem("login_success_tracked");
-
-				// Store access token in localStorage using both methods for compatibility
-				localStorage.setItem(storageKey, token);
-				setBearerToken(token);
-
-				// Store refresh token if provided
-				if (refreshToken) {
-					setRefreshToken(refreshToken);
-				}
-
-				// Check if there's a saved redirect path from before the auth flow
-				const savedRedirectPath = getAndClearRedirectPath();
-
-				// Use the saved path if available, otherwise use the default redirectPath
-				const finalRedirectPath = savedRedirectPath || redirectPath;
-
-				// Redirect to the appropriate path
-				window.location.href = finalRedirectPath;
-			} catch (error) {
-				console.error("Error storing token in localStorage:", error);
-				// Even if there's an error, try to redirect to the default path
-				window.location.href = redirectPath;
-			}
-		}
-	}, [tokenParamName, storageKey, redirectPath]);
-
-	// Return null - the global provider handles the loading UI
-	return null;
-};
-
-export default TokenHandler;
+// "use client";
+//
+// import { useEffect } from "react";
+// import { useGlobalLoadingEffect } from "@/hooks/use-global-loading";
+// import { getAndClearRedirectPath, setBearerToken, setRefreshToken } from "@/lib/auth-utils";
+// import { trackLoginSuccess } from "@/lib/posthog/events";
+//
+// interface TokenHandlerProps {
+// 	redirectPath?: string;
+// 	tokenParamName?: string;
+// 	storageKey?: string;
+// }
+//
+// const TokenHandler = ({
+// 	redirectPath = "/dashboard",
+// 	tokenParamName = "token",
+// 	storageKey = "surfsense_bearer_token",
+// }: TokenHandlerProps) => {
+// 	useGlobalLoadingEffect(true);
+//
+// 	useEffect(() => {
+// 		if (typeof window === "undefined") return;
+//
+// 		const params = new URLSearchParams(window.location.search);
+// 		const token = params.get(tokenParamName);
+// 		const refreshToken = params.get("refresh_token");
+//
+// 		if (token) {
+// 			try {
+// 				const alreadyTracked = sessionStorage.getItem("login_success_tracked");
+// 				if (!alreadyTracked) {
+// 					trackLoginSuccess("google");
+// 				}
+// 				sessionStorage.removeItem("login_success_tracked");
+//
+// 				localStorage.setItem(storageKey, token);
+// 				setBearerToken(token);
+//
+// 				if (refreshToken) {
+// 					setRefreshToken(refreshToken);
+// 				}
+//
+// 				const savedRedirectPath = getAndClearRedirectPath();
+// 				const finalRedirectPath = savedRedirectPath || redirectPath;
+// 				window.location.href = finalRedirectPath;
+// 			} catch (error) {
+// 				console.error("Error storing token in localStorage:", error);
+// 				window.location.href = redirectPath;
+// 			}
+// 		}
+// 	}, [tokenParamName, storageKey, redirectPath]);
+//
+// 	return null;
+// };
+//
+// export default TokenHandler;

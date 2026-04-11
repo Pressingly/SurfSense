@@ -5,7 +5,7 @@ import Link from "next/link";
 import type React from "react";
 import { useEffect, useRef, useState } from "react";
 import Balancer from "react-wrap-balancer";
-import { AUTH_TYPE, BACKEND_URL } from "@/lib/env-config";
+import { AUTH_TYPE, isSSOAuth } from "@/lib/env-config";
 import { trackLoginAttempt } from "@/lib/posthog/events";
 import { cn } from "@/lib/utils";
 
@@ -150,17 +150,21 @@ export function HeroSection() {
 
 function GetStartedButton() {
 	const isGoogleAuth = AUTH_TYPE === "GOOGLE";
+	const isSSOAuthMode = isSSOAuth();
+	const isProxyLogin = isGoogleAuth || isSSOAuthMode;
 
-	const handleGoogleLogin = () => {
-		trackLoginAttempt("google");
-		window.location.href = `${BACKEND_URL}/auth/google/authorize-redirect`;
+	const handleProxyLogin = () => {
+		trackLoginAttempt(isSSOAuthMode ? "sso" : "google");
+		// Redirect to proxy-login — Traefik ForwardAuth triggers Cognito if needed,
+		// then the endpoint issues a JWT and redirects to /auth/callback.
+		window.location.href = `${process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL}/auth/jwt/proxy-login`;
 	};
 
-	if (isGoogleAuth) {
+	if (isProxyLogin) {
 		return (
 			<motion.button
 				type="button"
-				onClick={handleGoogleLogin}
+				onClick={handleProxyLogin}
 				whileHover="hover"
 				whileTap={{ scale: 0.98 }}
 				initial="idle"
@@ -179,18 +183,20 @@ function GetStartedButton() {
 					}}
 					transition={{ duration: 0.3 }}
 				/>
-				{/* Google logo with subtle animation */}
-				<motion.div
-					className="relative"
-					variants={{
-						idle: { rotate: 0 },
-						hover: { rotate: [0, -8, 8, 0] },
-					}}
-					transition={{ duration: 0.4, ease: "easeInOut" }}
-				>
-					<GoogleLogo className="h-5 w-5" />
-				</motion.div>
-				<span className="relative">Continue with Google</span>
+				{/* Show Google logo only for native Google OAuth, not SSO */}
+				{isGoogleAuth && (
+					<motion.div
+						className="relative"
+						variants={{
+							idle: { rotate: 0 },
+							hover: { rotate: [0, -8, 8, 0] },
+						}}
+						transition={{ duration: 0.4, ease: "easeInOut" }}
+					>
+						<GoogleLogo className="h-5 w-5" />
+					</motion.div>
+				)}
+				<span className="relative">{isGoogleAuth ? "Continue with Google" : "Sign In"}</span>
 			</motion.button>
 		);
 	}
