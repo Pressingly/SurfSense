@@ -596,16 +596,17 @@ export function LayoutDataProvider({ searchSpaceId, children }: LayoutDataProvid
 			trackLogout();
 			resetUser();
 
-			// Revoke refresh token on server and clear all tokens from localStorage
-			await logout();
+			// Revoke refresh token on server and clear all tokens from localStorage.
+			// logout() returns true when SSO redirect is in progress — don't overwrite.
+			const ssoRedirected = await logout();
 
-			if (typeof window !== "undefined") {
+			if (!ssoRedirected && typeof window !== "undefined") {
 				router.push("/");
 			}
 		} catch (error) {
 			console.error("Error during logout:", error);
-			await logout();
-			router.push("/");
+			const ssoRedirected = await logout();
+			if (!ssoRedirected) router.push("/");
 		}
 	}, [router]);
 
