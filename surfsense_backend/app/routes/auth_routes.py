@@ -2,9 +2,11 @@
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 
+from app.config import config
 from app.db import User, async_session_maker
 from app.schemas.auth import (
     LogoutAllResponse,
@@ -15,6 +17,7 @@ from app.schemas.auth import (
 )
 from app.users import current_active_user, get_jwt_strategy
 from app.utils.refresh_tokens import (
+    create_refresh_token,
     revoke_all_user_tokens,
     revoke_refresh_token,
     rotate_refresh_token,
@@ -91,3 +94,43 @@ async def logout_all_devices(user: User = Depends(current_active_user)):
     await revoke_all_user_tokens(user.id)
     logger.info(f"User {user.id} logged out from all devices")
     return LogoutAllResponse()
+
+
+@router.get("/forward-auth/token", tags=["auth"])
+async def forward_auth_token(request: Request):
+    """
+    Exchange a ForwardAuth proxy session for a SurfSense JWT.
+
+    This endpoint is intended to be the redirect target for the `/login` path
+    when running behind a ForwardAuth reverse proxy (e.g. Traefik + oauth2-proxy).
+    The proxy authenticates the user and injects X-Auth-Request-Email /
+    X-Auth-Request-User headers; ForwardAuthMiddleware resolves the user from
+    those headers and stores it on request.state.forward_auth_user.
+
+    On success the browser is redirected to the frontend /auth/callback page
+    with fresh JWT tokens in the query string — identical to the Google OAuth flow.
+    """
+    if not config.FORWARD_AUTH_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="ForwardAuth is not enabled",
+        )
+
+    user = getattr(request.state, "forward_auth_user", None)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No ForwardAuth session found",
+        )
+
+    strategy = get_jwt_strategy()
+    access_token = await strategy.write_token(user)
+    refresh_token = await create_refresh_token(user.id)
+
+    logger.info("ForwardAuth: issued JWT for user id=%s email=%s", user.id, user.email)
+
+    redirect_url = (
+        f"{config.NEXT_FRONTEND_URL}/auth/callback"
+        f"?token={access_token}&refresh_token={refresh_token}"
+    )
+    return RedirectResponse(redirect_url, status_code=302)

@@ -3,7 +3,7 @@ import uuid
 from datetime import UTC, datetime
 
 import httpx
-from fastapi import Depends, Request, Response
+from fastapi import Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi_users import BaseUserManager, FastAPIUsers, UUIDIDMixin, models
 from fastapi_users.authentication import (
@@ -298,5 +298,38 @@ auth_backend = AuthenticationBackend(
 
 fastapi_users = FastAPIUsers[User, uuid.UUID](get_user_manager, [auth_backend])
 
-current_active_user = fastapi_users.current_user(active=True)
-current_optional_user = fastapi_users.current_user(active=True, optional=True)
+_jwt_current_active_user = fastapi_users.current_user(active=True, optional=True)
+_jwt_current_optional_user = fastapi_users.current_user(active=True, optional=True)
+
+
+async def current_active_user(
+    request: Request,
+    jwt_user: User | None = Depends(_jwt_current_active_user),
+) -> User:
+    """Return the authenticated user.
+
+    Checks ``request.state.forward_auth_user`` (set by
+    :class:`~app.middleware.forward_auth.ForwardAuthMiddleware`) first so that
+    ForwardAuth proxy sessions work without a Bearer token.  Falls back to the
+    standard JWT strategy.
+    """
+    fa_user = getattr(request.state, "forward_auth_user", None)
+    if fa_user is not None:
+        return fa_user
+    if jwt_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+        )
+    return jwt_user
+
+
+async def current_optional_user(
+    request: Request,
+    jwt_user: User | None = Depends(_jwt_current_optional_user),
+) -> User | None:
+    """Return the authenticated user, or ``None`` if not authenticated."""
+    fa_user = getattr(request.state, "forward_auth_user", None)
+    if fa_user is not None:
+        return fa_user
+    return jwt_user

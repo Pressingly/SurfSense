@@ -310,6 +310,9 @@ class Config:
     # Auth
     AUTH_TYPE = os.getenv("AUTH_TYPE")
     REGISTRATION_ENABLED = os.getenv("REGISTRATION_ENABLED", "TRUE").upper() == "TRUE"
+    # Trust X-Auth-Request-Email / X-Auth-Request-User headers from a ForwardAuth proxy.
+    # Only enable when the backend is behind a trusted reverse proxy.
+    FORWARD_AUTH_ENABLED = os.getenv("FORWARD_AUTH_ENABLED", "FALSE").upper() == "TRUE"
 
     # Google OAuth
     GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID")

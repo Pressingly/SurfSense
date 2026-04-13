@@ -8,7 +8,7 @@ import { toast } from "sonner";
 import { Logo } from "@/components/Logo";
 import { useGlobalLoadingEffect } from "@/hooks/use-global-loading";
 import { getAuthErrorDetails, shouldRetry } from "@/lib/auth-errors";
-import { AUTH_TYPE } from "@/lib/env-config";
+import { AUTH_TYPE, BACKEND_URL } from "@/lib/env-config";
 import { AmbientBackground } from "./AmbientBackground";
 import { GoogleLoginButton } from "./GoogleLoginButton";
 import { LocalLoginForm } from "./LocalLoginForm";
@@ -23,6 +23,13 @@ function LoginContent() {
 	const searchParams = useSearchParams();
 
 	useEffect(() => {
+		// ForwardAuth: proxy has already authenticated the user — exchange the proxy
+		// session for a SurfSense JWT transparently, no login form shown.
+		if (AUTH_TYPE === "FORWARD_AUTH") {
+			window.location.replace(`${BACKEND_URL}/auth/jwt/forward-auth/token`);
+			return;
+		}
+
 		// Check for various URL parameters that might indicate success or error states
 		const registered = searchParams.get("registered");
 		const error = searchParams.get("error");

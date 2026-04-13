@@ -315,6 +315,17 @@ class RequestPerfMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(RequestPerfMiddleware)
 
+# ---------------------------------------------------------------------------
+# ForwardAuth middleware (optional – enabled via FORWARD_AUTH_ENABLED=true)
+# ---------------------------------------------------------------------------
+# Trusts X-Auth-Request-Email / X-Auth-Request-User headers injected by a
+# ForwardAuth reverse proxy.  Must sit inside the ProxyHeadersMiddleware so
+# that proxy-forwarded headers are already normalised when we read them.
+if config.FORWARD_AUTH_ENABLED:
+    from app.middleware.forward_auth import ForwardAuthMiddleware
+
+    app.add_middleware(ForwardAuthMiddleware)
+
 # Add SlowAPI middleware for automatic rate limiting
 # Uses Starlette BaseHTTPMiddleware (not the raw ASGI variant) to avoid
 # corrupting StreamingResponse — SlowAPIASGIMiddleware re-sends

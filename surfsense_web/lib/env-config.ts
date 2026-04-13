@@ -40,6 +40,9 @@ export const isLocalAuth = () => AUTH_TYPE === "LOCAL";
 // Helper to check if Google auth is enabled
 export const isGoogleAuth = () => AUTH_TYPE === "GOOGLE";
 
+// Helper to check if ForwardAuth (SSO via reverse proxy) is enabled
+export const isForwardAuth = () => AUTH_TYPE === "FORWARD_AUTH";
+
 // Helper to check if running in self-hosted mode
 export const isSelfHosted = () => DEPLOYMENT_MODE === "self-hosted";
 
