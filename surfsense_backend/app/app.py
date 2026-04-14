@@ -40,7 +40,7 @@ from app.middleware.proxy_auth import ProxyAuthMiddleware
 from app.rate_limiter import get_real_client_ip, limiter
 from app.routes import router as crud_router
 from app.routes.auth_routes import router as auth_router
-from app.schemas import UserCreate, UserRead, UserUpdate
+from app.schemas import UserRead, UserUpdate
 from app.tasks.surfsense_docs_indexer import seed_surfsense_docs
 from app.users import (
     current_active_user,
