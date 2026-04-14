@@ -22,7 +22,6 @@ export const AUTH_TYPE = process.env.NEXT_PUBLIC_FASTAPI_BACKEND_AUTH_TYPE || "S
 // Placeholder: __NEXT_PUBLIC_FASTAPI_BACKEND_URL__
 export const BACKEND_URL = process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL || "http://localhost:8000";
 
-
 // ETL Service: "DOCLING" or "UNSTRUCTURED"
 // Placeholder: __NEXT_PUBLIC_ETL_SERVICE__
 export const ETL_SERVICE = process.env.NEXT_PUBLIC_ETL_SERVICE || "DOCLING";
