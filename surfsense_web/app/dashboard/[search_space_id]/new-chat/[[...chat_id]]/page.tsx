@@ -40,6 +40,41 @@ import { ThinkingStepsDataUI } from "@/components/assistant-ui/thinking-steps";
 import { Thread } from "@/components/assistant-ui/thread";
 import { useChatSessionStateSync } from "@/hooks/use-chat-session-state";
 import { useMessagesSync } from "@/hooks/use-messages-sync";
+import { documentsApiService } from "@/lib/apis/documents-api.service";
+import { authenticatedFetch, getBearerToken } from "@/lib/auth-utils";
+import { convertToThreadMessage } from "@/lib/chat/message-utils";
+import {
+	isPodcastGenerating,
+	looksLikePodcastRequest,
+	setActivePodcastTaskId,
+} from "@/lib/chat/podcast-state";
+import {
+	addToolCall,
+	appendText,
+	buildContentForPersistence,
+	buildContentForUI,
+	type ContentPartsState,
+	FrameBatchedUpdater,
+	readSSEStream,
+	type ThinkingStepData,
+	updateThinkingSteps,
+	updateToolCall,
+} from "@/lib/chat/streaming-state";
+import {
+	appendMessage,
+	createThread,
+	getRegenerateUrl,
+	getThreadFull,
+	getThreadMessages,
+	type ThreadRecord,
+} from "@/lib/chat/thread-persistence";
+import { NotFoundError } from "@/lib/error";
+import {
+	trackChatCreated,
+	trackChatError,
+	trackChatMessageSent,
+	trackChatResponseReceived,
+} from "@/lib/posthog/events";
 import Loading from "../loading";
 
 const MobileEditorPanel = dynamic(
@@ -628,11 +663,10 @@ export default function NewChatPage() {
 					setSidebarDocuments([]);
 				}
 
-				const response = await fetch(`${backendUrl}/api/v1/new_chat`, {
+				const response = await authenticatedFetch(`${backendUrl}/api/v1/new_chat`, {
 					method: "POST",
 					headers: {
 						"Content-Type": "application/json",
-						Authorization: `Bearer ${token}`,
 					},
 					body: JSON.stringify({
 						chat_id: currentThreadId,
@@ -993,11 +1027,10 @@ export default function NewChatPage() {
 
 			try {
 				const backendUrl = process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL || "http://localhost:8000";
-				const response = await fetch(`${backendUrl}/api/v1/threads/${resumeThreadId}/resume`, {
+				const response = await authenticatedFetch(`${backendUrl}/api/v1/threads/${resumeThreadId}/resume`, {
 					method: "POST",
 					headers: {
 						"Content-Type": "application/json",
-						Authorization: `Bearer ${token}`,
 					},
 					body: JSON.stringify({
 						search_space_id: searchSpaceId,
@@ -1310,11 +1343,10 @@ export default function NewChatPage() {
 			]);
 
 			try {
-				const response = await fetch(getRegenerateUrl(threadId), {
+				const response = await authenticatedFetch(getRegenerateUrl(threadId), {
 					method: "POST",
 					headers: {
 						"Content-Type": "application/json",
-						Authorization: `Bearer ${token}`,
 					},
 					body: JSON.stringify({
 						search_space_id: searchSpaceId,
