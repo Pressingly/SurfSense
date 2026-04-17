@@ -1027,17 +1027,20 @@ export default function NewChatPage() {
 
 			try {
 				const backendUrl = process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL || "http://localhost:8000";
-				const response = await authenticatedFetch(`${backendUrl}/api/v1/threads/${resumeThreadId}/resume`, {
-					method: "POST",
-					headers: {
-						"Content-Type": "application/json",
-					},
-					body: JSON.stringify({
-						search_space_id: searchSpaceId,
-						decisions,
-					}),
-					signal: controller.signal,
-				});
+				const response = await authenticatedFetch(
+					`${backendUrl}/api/v1/threads/${resumeThreadId}/resume`,
+					{
+						method: "POST",
+						headers: {
+							"Content-Type": "application/json",
+						},
+						body: JSON.stringify({
+							search_space_id: searchSpaceId,
+							decisions,
+						}),
+						signal: controller.signal,
+					}
+				);
 
 				if (!response.ok) {
 					throw new Error(`Backend error: ${response.status}`);
