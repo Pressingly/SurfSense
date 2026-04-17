@@ -6,7 +6,6 @@
 // To restore native OAuth login, uncomment this file and re-register
 // the /auth/callback route.
 
-
 // "use client";
 //
 // import { useEffect } from "react";

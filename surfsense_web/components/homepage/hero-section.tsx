@@ -183,7 +183,7 @@ function GetStartedButton() {
 
 	if (isProxyLogin) {
 		return (
-			<button
+			<motion.button
 				type="button"
 				onClick={handleProxyLogin}
 				whileHover="hover"

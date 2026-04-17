@@ -7,12 +7,12 @@ import { Suspense, useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Logo } from "@/components/Logo";
 import { useGlobalLoadingEffect } from "@/hooks/use-global-loading";
+import { getAuthErrorDetails, shouldRetry } from "@/lib/auth-errors";
 import {
 	ensureTokensFromElectron,
 	getAndClearRedirectPath,
 	getBearerToken,
 } from "@/lib/auth-utils";
-import { getAuthErrorDetails, shouldRetry } from "@/lib/auth-errors";
 import { AUTH_TYPE, isSSOAuth } from "@/lib/env-config";
 import { AmbientBackground } from "./AmbientBackground";
 import { GoogleLoginButton } from "./GoogleLoginButton";
