@@ -7,6 +7,11 @@ import { Suspense, useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Logo } from "@/components/Logo";
 import { useGlobalLoadingEffect } from "@/hooks/use-global-loading";
+import {
+	ensureTokensFromElectron,
+	getAndClearRedirectPath,
+	getBearerToken,
+} from "@/lib/auth-utils";
 import { getAuthErrorDetails, shouldRetry } from "@/lib/auth-errors";
 import { AUTH_TYPE, isSSOAuth } from "@/lib/env-config";
 import { AmbientBackground } from "./AmbientBackground";
@@ -38,82 +43,100 @@ function LoginContent() {
 	}, []);
 
 	useEffect(() => {
-		// Check for various URL parameters that might indicate success or error states
-		const registered = searchParams.get("registered");
-		const error = searchParams.get("error");
-		const message = searchParams.get("message");
-		const logout = searchParams.get("logout");
-		const returnUrl = searchParams.get("returnUrl");
-
-		// Save returnUrl to localStorage so it persists through OAuth flows (e.g., Google)
-		// This is read by TokenHandler after successful authentication
-		if (returnUrl) {
-			localStorage.setItem("surfsense_redirect_path", decodeURIComponent(returnUrl));
-		}
-
-		// Show registration success message
-		if (registered === "true") {
-			toast.success(t("register_success"), {
-				description: t("login_subtitle"),
-				duration: 5000,
-			});
-		}
-
-		// Show logout confirmation
-		if (logout === "true") {
-			toast.success(tCommon("success"), {
-				description: "You have been securely logged out",
-				duration: 3000,
-			});
-		}
-
-		// Show error messages from OAuth or other flows using auth-errors utility
-		if (error) {
-			// Use the auth-errors utility to get proper error details
-			const errorDetails = getAuthErrorDetails(error);
-
-			// If we have a custom message from URL params, use it as description
-			const errorDescription = message ? decodeURIComponent(message) : errorDetails.description;
-
-			// Set persistent error display
-			setUrlError({
-				title: errorDetails.title,
-				message: errorDescription,
-			});
-
-			// Show toast with conditional retry action
-			const toastOptions: {
-				description: string;
-				duration: number;
-				action?: { label: string; onClick: () => void };
-			} = {
-				description: errorDescription,
-				duration: 6000,
-			};
-
-			// Add retry action if the error is retryable
-			if (shouldRetry(error)) {
-				toastOptions.action = {
-					label: "Retry",
-					onClick: () => router.refresh(),
-				};
+		const maybeRedirectAuthenticatedUser = async () => {
+			let token = getBearerToken();
+			if (!token) {
+				const synced = await ensureTokensFromElectron();
+				if (synced) token = getBearerToken();
 			}
 
-			toast.error(errorDetails.title, toastOptions);
-		}
+			if (token) {
+				const returnUrl = searchParams.get("returnUrl");
+				const decodedReturnUrl = returnUrl ? decodeURIComponent(returnUrl) : null;
+				const fallbackPath = getAndClearRedirectPath() || "/dashboard";
+				router.replace(decodedReturnUrl || fallbackPath);
+				return;
+			}
 
-		// Show general messages
-		if (message && !error && !registered && !logout) {
-			toast.info("Notice", {
-				description: decodeURIComponent(message),
-				duration: 4000,
-			});
-		}
+			// Check for various URL parameters that might indicate success or error states
+			const registered = searchParams.get("registered");
+			const error = searchParams.get("error");
+			const message = searchParams.get("message");
+			const logout = searchParams.get("logout");
+			const returnUrl = searchParams.get("returnUrl");
 
-		// Get the auth type from centralized config
-		setAuthType(AUTH_TYPE);
-		setIsLoading(false);
-	}, [searchParams, t, tCommon]);
+			// Save returnUrl to localStorage so it persists through OAuth flows (e.g., Google)
+			// This is read by TokenHandler after successful authentication
+			if (returnUrl) {
+				localStorage.setItem("surfsense_redirect_path", decodeURIComponent(returnUrl));
+			}
+
+			// Show registration success message
+			if (registered === "true") {
+				toast.success(t("register_success"), {
+					description: t("login_subtitle"),
+					duration: 5000,
+				});
+			}
+
+			// Show logout confirmation
+			if (logout === "true") {
+				toast.success(tCommon("success"), {
+					description: "You have been securely logged out",
+					duration: 3000,
+				});
+			}
+
+			// Show error messages from OAuth or other flows using auth-errors utility
+			if (error) {
+				// Use the auth-errors utility to get proper error details
+				const errorDetails = getAuthErrorDetails(error);
+
+				// If we have a custom message from URL params, use it as description
+				const errorDescription = message ? decodeURIComponent(message) : errorDetails.description;
+
+				// Set persistent error display
+				setUrlError({
+					title: errorDetails.title,
+					message: errorDescription,
+				});
+
+				// Show toast with conditional retry action
+				const toastOptions: {
+					description: string;
+					duration: number;
+					action?: { label: string; onClick: () => void };
+				} = {
+					description: errorDescription,
+					duration: 6000,
+				};
+
+				// Add retry action if the error is retryable
+				if (shouldRetry(error)) {
+					toastOptions.action = {
+						label: "Retry",
+						onClick: () => router.refresh(),
+					};
+				}
+
+				toast.error(errorDetails.title, toastOptions);
+			}
+
+			// Show general messages
+			if (message && !error && !registered && !logout) {
+				toast.info("Notice", {
+					description: decodeURIComponent(message),
+					duration: 4000,
+				});
+			}
+
+			// Get the auth type from centralized config
+			setAuthType(AUTH_TYPE);
+			setIsLoading(false);
+		};
+
+		void maybeRedirectAuthenticatedUser();
+	}, [router, searchParams, t, tCommon]);
 
 	// Use global loading screen for auth type determination - spinner animation won't reset
 	useGlobalLoadingEffect(isLoading);
