@@ -127,7 +127,7 @@ async def get_editor_content(
     )
     chunk_contents = chunk_contents_result.scalars().all()
 
-    if not chunks:
+    if not chunk_contents:
         doc_status = document.status or {}
         state = (
             doc_status.get("state", "ready")

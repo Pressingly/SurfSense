@@ -1,7 +1,7 @@
 # Force asyncio to use standard event loop before unstructured imports
 import asyncio
 
-from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel as PydanticBaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -992,6 +992,75 @@ async def get_watched_folders(
     )
 
     return folders
+
+
+@router.get(
+    "/documents/{document_id}/chunks",
+    response_model=PaginatedResponse[ChunkRead],
+)
+async def get_document_chunks_paginated(
+    document_id: int,
+    page: int = Query(0, ge=0),
+    page_size: int = Query(20, ge=1, le=100),
+    start_offset: int | None = Query(
+        None, ge=0, description="Direct offset; overrides page * page_size"
+    ),
+    session: AsyncSession = Depends(get_async_session),
+    user: User = Depends(current_active_user),
+):
+    """
+    Paginated chunk loading for a document.
+    Supports both page-based and offset-based access.
+    """
+    try:
+        from sqlalchemy import func
+
+        doc_result = await session.execute(
+            select(Document).filter(Document.id == document_id)
+        )
+        document = doc_result.scalars().first()
+
+        if not document:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        await check_permission(
+            session,
+            user,
+            document.search_space_id,
+            Permission.DOCUMENTS_READ.value,
+            "You don't have permission to read documents in this search space",
+        )
+
+        total_result = await session.execute(
+            select(func.count())
+            .select_from(Chunk)
+            .filter(Chunk.document_id == document_id)
+        )
+        total = total_result.scalar() or 0
+
+        offset = start_offset if start_offset is not None else page * page_size
+        chunks_result = await session.execute(
+            select(Chunk)
+            .filter(Chunk.document_id == document_id)
+            .order_by(Chunk.created_at, Chunk.id)
+            .offset(offset)
+            .limit(page_size)
+        )
+        chunks = chunks_result.scalars().all()
+
+        return PaginatedResponse(
+            items=chunks,
+            total=total,
+            page=offset // page_size if page_size else page,
+            page_size=page_size,
+            has_more=(offset + len(chunks)) < total,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch chunks: {e!s}"
+        ) from e
 
 
 @router.get("/documents/{document_id}", response_model=DocumentRead)
