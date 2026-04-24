@@ -315,14 +315,9 @@ class Config:
     # Comma-separated path prefixes that bypass proxy auth (default: /health).
     MPASS_BYPASS_PATHS = os.getenv("MPASS_BYPASS_PATHS", None)
 
-    # SMB tenant name — used for landing page, subdomain, logout URLs.
-    SMB_NAME = os.getenv("SMB_NAME", "")
-
-    # Domain used to synthesize {username}@{DEFAULT_EMAIL_DOMAIN} email
-    # addresses when the OIDC provider sends a bare username (e.g. Cognito
-    # cognito:username claim) instead of an email. Matches the Plane
-    # authentication middleware so users are identified consistently across
-    # both apps under the same mPass tenant.
+    # Email domain used to synthesize {username}@{DEFAULT_EMAIL_DOMAIN} when
+    # the OIDC provider sends a bare username (e.g. Cognito cognito:username
+    # claim) instead of a full email address.
     DEFAULT_EMAIL_DOMAIN = os.getenv("DEFAULT_EMAIL_DOMAIN", "askii.ai")
 
     # Google OAuth
@@ -456,13 +451,13 @@ class Config:
     # OAuth JWT
     SECRET_KEY = os.getenv("SECRET_KEY")
 
-    # JWT Token Lifetimes
+    # JWT Token Lifetimes (defaults match FOSS devstack SESSION_* unified envs when unset)
     ACCESS_TOKEN_LIFETIME_SECONDS = int(
-        os.getenv("ACCESS_TOKEN_LIFETIME_SECONDS", str(24 * 60 * 60))  # 1 day
-    )
+        os.getenv("ACCESS_TOKEN_LIFETIME_SECONDS", str(7 * 24 * 60 * 60))
+    )  # 604800s = 7d
     REFRESH_TOKEN_LIFETIME_SECONDS = int(
-        os.getenv("REFRESH_TOKEN_LIFETIME_SECONDS", str(14 * 24 * 60 * 60))  # 2 weeks
-    )
+        os.getenv("REFRESH_TOKEN_LIFETIME_SECONDS", str(14 * 24 * 60 * 60))
+    )  # 1209600s = 14d
 
     # ETL Service
     ETL_SERVICE = os.getenv("ETL_SERVICE")

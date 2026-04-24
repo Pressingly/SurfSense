@@ -84,22 +84,15 @@ class ProxyAuthMiddleware(BaseHTTPMiddleware):
         if _is_bypass_path(request.url.path, self.bypass_paths):
             return await call_next(request)
 
-        # Resolve the email-synthesis domain once. Prefer DEFAULT_EMAIL_DOMAIN
-        # (aligned with Plane's middleware); fall back to the legacy
-        # {SMB_NAME}.com shape only when DEFAULT_EMAIL_DOMAIN is unset.
-        domain = getattr(config, "DEFAULT_EMAIL_DOMAIN", "") or (
-            f"{getattr(config, 'SMB_NAME', '')}.com"
-            if getattr(config, "SMB_NAME", "")
-            else ""
-        )
-
         raw_email = (request.headers.get("x-auth-request-email") or "").strip()
         if raw_email and "@" not in raw_email:
             # Header holds a bare username (user_id_claim=cognito:username).
-            raw_email = f"{raw_email}@{domain}" if domain else ""
+            domain = getattr(config, "DEFAULT_EMAIL_DOMAIN", "askii.ai")
+            raw_email = f"{raw_email}@{domain}"
         if not raw_email:
             raw_username = (request.headers.get("x-auth-request-user") or "").strip()
-            if raw_username and domain:
+            domain = getattr(config, "DEFAULT_EMAIL_DOMAIN", "askii.ai")
+            if raw_username:
                 raw_email = f"{raw_username}@{domain}"
         if not raw_email:
             logger.debug(
