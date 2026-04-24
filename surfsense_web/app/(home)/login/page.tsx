@@ -14,6 +14,7 @@ import {
 	getBearerToken,
 } from "@/lib/auth-utils";
 import { AUTH_TYPE, isSSOAuth } from "@/lib/env-config";
+import { resolveLoginRedirect } from "@/lib/login-redirect";
 import { AmbientBackground } from "./AmbientBackground";
 import { GoogleLoginButton } from "./GoogleLoginButton";
 import { LocalLoginForm } from "./LocalLoginForm";
@@ -35,12 +36,25 @@ function LoginContent() {
 	// Hook is unconditional (rules-of-hooks); the early-return that skips
 	// rendering the form lives below, after every other hook has run.
 	useEffect(() => {
-		if (typeof window !== "undefined" && isSSOAuth()) {
-			const oauthProxyUrl = process.env.NEXT_PUBLIC_OAUTH2_PROXY_URL || window.location.origin;
-			const rd = `${window.location.origin}/`;
-			window.location.replace(`${oauthProxyUrl}/oauth2/sign_in?rd=${encodeURIComponent(rd)}`);
+		if (typeof window === "undefined" || !isSSOAuth()) return;
+
+		// Already authenticated in this browser — skip the oauth2-proxy bounce and
+		// send the user straight to dashboard (or their returnUrl).
+		if (getBearerToken()) {
+			const returnUrl = searchParams.get("returnUrl");
+			const target = resolveLoginRedirect({
+				hasToken: true,
+				returnUrl,
+				storedRedirect: getAndClearRedirectPath(),
+			});
+			if (target) router.replace(target);
+			return;
 		}
-	}, []);
+
+		const oauthProxyUrl = process.env.NEXT_PUBLIC_OAUTH2_PROXY_URL || window.location.origin;
+		const rd = `${window.location.origin}/`;
+		window.location.replace(`${oauthProxyUrl}/oauth2/sign_in?rd=${encodeURIComponent(rd)}`);
+	}, [router, searchParams]);
 
 	useEffect(() => {
 		const maybeRedirectAuthenticatedUser = async () => {
@@ -51,10 +65,12 @@ function LoginContent() {
 			}
 
 			if (token) {
-				const returnUrl = searchParams.get("returnUrl");
-				const decodedReturnUrl = returnUrl ? decodeURIComponent(returnUrl) : null;
-				const fallbackPath = getAndClearRedirectPath() || "/dashboard";
-				router.replace(decodedReturnUrl || fallbackPath);
+				const target = resolveLoginRedirect({
+					hasToken: true,
+					returnUrl: searchParams.get("returnUrl"),
+					storedRedirect: getAndClearRedirectPath(),
+				});
+				if (target) router.replace(target);
 				return;
 			}
 
