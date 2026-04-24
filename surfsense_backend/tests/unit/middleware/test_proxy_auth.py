@@ -441,13 +441,36 @@ class TestProxyAuthMiddlewareDispatch:
 
     # ── SPEC 10: bare username → email synthesis ──────────────────────────────
 
-    async def test_bare_username_synthesizes_email_via_smb_name(self):
+    async def test_bare_username_synthesizes_email_via_default_domain(self):
         """
         GIVEN  X-Auth-Request-Email contains a bare username (no @)
+               AND config.DEFAULT_EMAIL_DOMAIN is set
+        WHEN   request arrives
+        THEN   middleware synthesizes {username}@{DEFAULT_EMAIL_DOMAIN}
+               AND passes it to _resolve_user
+        """
+        mw = _make_middleware()
+        resolved = _make_user(email="testuser@askii.ai")
+        mw._resolve_user = AsyncMock(return_value=resolved)
+        request = _make_request(headers={"x-auth-request-email": "testuser"})
+
+        with patch("app.middleware.proxy_auth.config") as mock_cfg:
+            mock_cfg.DEFAULT_EMAIL_DOMAIN = "askii.ai"
+            mock_cfg.SMB_NAME = ""
+            await mw.dispatch(request, _ok_call_next)
+
+        mw._resolve_user.assert_called_once()
+        called_email = mw._resolve_user.call_args.args[0]
+        assert called_email == "testuser@askii.ai"
+        assert request.state.proxy_user is resolved
+
+    async def test_bare_username_falls_back_to_smb_name_when_default_domain_unset(self):
+        """
+        GIVEN  X-Auth-Request-Email contains a bare username
+               AND config.DEFAULT_EMAIL_DOMAIN is empty
                AND config.SMB_NAME is set
         WHEN   request arrives
-        THEN   middleware synthesizes {username}@{SMB_NAME}.com
-               AND passes it to _resolve_user
+        THEN   middleware synthesizes {username}@{SMB_NAME}.com (legacy path)
         """
         mw = _make_middleware()
         resolved = _make_user(email="testuser@foss.com")
@@ -455,6 +478,7 @@ class TestProxyAuthMiddlewareDispatch:
         request = _make_request(headers={"x-auth-request-email": "testuser"})
 
         with patch("app.middleware.proxy_auth.config") as mock_cfg:
+            mock_cfg.DEFAULT_EMAIL_DOMAIN = ""
             mock_cfg.SMB_NAME = "foss"
             await mw.dispatch(request, _ok_call_next)
 
