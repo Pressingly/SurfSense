@@ -14,7 +14,6 @@ import {
 	getBearerToken,
 } from "@/lib/auth-utils";
 import { AUTH_TYPE, isSSOAuth } from "@/lib/env-config";
-import { resolveLoginRedirect } from "@/lib/login-redirect";
 import { AmbientBackground } from "./AmbientBackground";
 import { GoogleLoginButton } from "./GoogleLoginButton";
 import { LocalLoginForm } from "./LocalLoginForm";
@@ -52,12 +51,10 @@ function LoginContent() {
 			}
 
 			if (token) {
-				const target = resolveLoginRedirect({
-					hasToken: true,
-					returnUrl: searchParams.get("returnUrl"),
-					storedRedirect: getAndClearRedirectPath(),
-				});
-				if (target) router.replace(target);
+				const returnUrl = searchParams.get("returnUrl");
+				const decodedReturnUrl = returnUrl ? decodeURIComponent(returnUrl) : null;
+				const fallbackPath = getAndClearRedirectPath() || "/dashboard";
+				router.replace(decodedReturnUrl || fallbackPath);
 				return;
 			}
 

@@ -10,8 +10,6 @@
 		"start": "next start",
 		"lint": "next lint",
 		"format": "biome check --write ./ --max-diagnostics 500",
-		"test": "vitest run",
-		"test:watch": "vitest",
 		"debug": "cross-env NODE_OPTIONS=--inspect next dev --turbopack",
 		"debug:browser": "cross-env NODE_OPTIONS=--inspect next dev --turbopack",
 		"debug:server": "cross-env NODE_OPTIONS=--inspect=0.0.0.0:9229 next dev --turbopack",
@@ -164,7 +162,6 @@
 		"tailwindcss": "^4.1.11",
 		"tsx": "^4.20.6",
 		"typescript": "^5.8.3",
-		"vite": "^7.3.1",
-		"vitest": "^3.2.4"
+		"vite": "^7.3.1"
 	}
 }
