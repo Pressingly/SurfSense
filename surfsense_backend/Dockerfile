@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -20,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender1 \
     dos2unix \
     git \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Pandoc 3.x from GitHub as a fallback for Linux where pypandoc_binary
@@ -30,24 +32,27 @@ RUN ARCH=$(dpkg --print-architecture) && \
     dpkg -i /tmp/pandoc.deb && \
     rm /tmp/pandoc.deb
 
-# Update certificates and install SSL tools
-RUN update-ca-certificates
-RUN pip install --upgrade certifi pip-system-certs
+# Install SSL tools
+RUN --mount=type=cache,id=surfsense-pip,target=/root/.cache/pip \
+    pip install --upgrade certifi pip-system-certs
 
 # Copy requirements
 COPY pyproject.toml .
 COPY uv.lock .
 
 # Install PyTorch based on architecture
-RUN if [ "$(uname -m)" = "x86_64" ]; then \
-        pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121; \
+RUN --mount=type=cache,id=surfsense-pip,target=/root/.cache/pip \
+    if [ "$(uname -m)" = "x86_64" ]; then \
+        pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121; \
     else \
-        pip install --no-cache-dir torch torchvision torchaudio; \
+        pip install torch torchvision torchaudio; \
     fi
 
 # Install python dependencies
-RUN pip install --no-cache-dir uv && \
-    uv pip install --system --no-cache-dir -e .
+RUN --mount=type=cache,id=surfsense-pip,target=/root/.cache/pip \
+    --mount=type=cache,id=surfsense-uv,target=/root/.cache/uv \
+    pip install uv && \
+    uv pip install --system -e .
 
 # Set SSL environment variables dynamically
 RUN CERTIFI_PATH=$(python -c "import certifi; print(certifi.where())") && \
@@ -67,8 +72,12 @@ RUN cd /root/.EasyOCR/model && (unzip -o english_g2.zip || true) && (unzip -o cr
 RUN python -c "try:\n    from docling.document_converter import DocumentConverter\n    conv = DocumentConverter()\nexcept:\n    pass" || true
 
 # Install Playwright browsers for web scraping if needed
-RUN pip install playwright && \
-    playwright install chromium --with-deps
+ARG INSTALL_PLAYWRIGHT=false
+RUN --mount=type=cache,id=surfsense-pip,target=/root/.cache/pip \
+    if [ "$INSTALL_PLAYWRIGHT" = "true" ]; then \
+        pip install playwright && \
+        playwright install chromium --with-deps; \
+    fi
 
 # Copy source code
 COPY . .

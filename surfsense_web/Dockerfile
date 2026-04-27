@@ -1,4 +1,4 @@
-# syntax=docker.io/docker/dockerfile:1
+# syntax=docker/dockerfile:1
 
 FROM node:20-alpine AS base
 
@@ -19,7 +19,8 @@ COPY source.config.ts ./
 COPY content ./content
 
 # Install dependencies with frozen lockfile
-RUN pnpm i --frozen-lockfile
+RUN --mount=type=cache,id=surfsense-pnpm,target=/root/.local/share/pnpm/store \
+    pnpm i --frozen-lockfile
 
 
 # Rebuild the source code only when needed
