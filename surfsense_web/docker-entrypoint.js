@@ -12,6 +12,18 @@
 const fs = require("fs");
 const path = require("path");
 
+// SMB_NAME is required when AUTH_TYPE=SSO. No default — fail loudly at
+// startup so the SPA never silently rewrites the logout host to the wrong
+// domain. Same env name across every devstack app — see sso-rules
+// RULES.md §1 Logout.
+if (!process.env.SMB_NAME && process.env.NEXT_PUBLIC_FASTAPI_BACKEND_AUTH_TYPE === "SSO") {
+	console.error(
+		"[entrypoint] ERROR: SMB_NAME env is required when NEXT_PUBLIC_FASTAPI_BACKEND_AUTH_TYPE=SSO."
+	);
+	console.error("[entrypoint]        Set it to the portal hostname prefix (e.g. 'moneta').");
+	process.exit(1);
+}
+
 const replacements = [
 	[
 		"__NEXT_PUBLIC_FASTAPI_BACKEND_URL__",
@@ -28,10 +40,7 @@ const replacements = [
 	],
 	["__NEXT_PUBLIC_DEPLOYMENT_MODE__", process.env.NEXT_PUBLIC_DEPLOYMENT_MODE || "self-hosted"],
 	["__NEXT_PUBLIC_OAUTH2_PROXY_URL__", process.env.NEXT_PUBLIC_OAUTH2_PROXY_URL || ""],
-	[
-		"__NEXT_PUBLIC_SMB_NAME__",
-		(process.env.SMB_NAME || process.env.NEXT_PUBLIC_SMB_NAME || "moneta").trim() || "moneta",
-	],
+	["__NEXT_PUBLIC_SMB_NAME__", process.env.SMB_NAME || ""],
 ];
 
 let filesProcessed = 0;
