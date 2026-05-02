@@ -239,10 +239,9 @@ export async function logout(): Promise<boolean> {
 	clearAllTokens();
 
 	if (typeof window !== "undefined") {
-		// Rewrite "<SMB_NAME>-<app>.<domain>" → "<SMB_NAME>.<domain>" so we land on the
+		// Rewrite "<prefix>-<app>.<domain>" → "<prefix>.<domain>" so we land on the
 		// portal (outside ForwardAuth) instead of SurfSense's own root, which would silently re-auth.
-		const smbName = process.env.NEXT_PUBLIC_SMB_NAME!.trim();
-		const portalHost = window.location.hostname.replace(/^[^.]*\./, `${smbName}.`);
+		const portalHost = window.location.hostname.replace(/^([^-]+)-[^.]+\.(.+)/, "$1.$2");
 		window.location.href = `${window.location.protocol}//${portalHost}`;
 		return true;
 	}
