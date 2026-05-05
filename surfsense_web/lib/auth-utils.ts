@@ -241,7 +241,7 @@ export async function logout(): Promise<boolean> {
 	if (typeof window !== "undefined") {
 		// Strip the first subdomain so we land on the portal (outside ForwardAuth)
 		// instead of SurfSense's own root, which would silently re-auth.
-		const portalHost = window.location.hostname.replace(/^[^.]*\./, "");
+		const portalHost = window.location.hostname.replace(/^[^.]+\.(?=[^.]*\.[^.]*\.)/, "");
 		window.location.href = `${window.location.protocol}//${portalHost}`;
 		return true;
 	}
