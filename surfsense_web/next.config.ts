@@ -7,7 +7,7 @@ import createNextIntlPlugin from "next-intl/plugin";
 const withNextIntl = createNextIntlPlugin("./i18n/request.ts");
 
 // Compulsory build-time env vars
-const REQUIRED_ENV_VARS = ["NEXT_PUBLIC_SMB_DASHBOARD_URL"] as const;
+const REQUIRED_ENV_VARS = ["NEXT_PUBLIC_SIGNOUT_URL"] as const;
 for (const key of REQUIRED_ENV_VARS) {
 	if (!process.env[key]) {
 		throw new Error(`Missing required environment variable: ${key}`);

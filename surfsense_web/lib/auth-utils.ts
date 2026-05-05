@@ -239,7 +239,7 @@ export async function logout(): Promise<boolean> {
 	clearAllTokens();
 
 	if (typeof window !== "undefined") {
-		window.location.href = process.env.NEXT_PUBLIC_SMB_DASHBOARD_URL!;
+		window.location.href = process.env.NEXT_PUBLIC_SIGNOUT_URL!;
 		return true;
 	}
 
