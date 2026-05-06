@@ -239,10 +239,19 @@ export async function logout(): Promise<boolean> {
 	clearAllTokens();
 
 	if (typeof window !== "undefined") {
-		// Strip the first subdomain so we land on the portal (outside ForwardAuth)
-		// instead of SurfSense's own root, which would silently re-auth.
-		const portalHost = window.location.hostname.replace(/^[^.]+\.(?=[^.]*\.[^.]*\.)/, "");
-		window.location.href = `${window.location.protocol}//${portalHost}`;
+		// Land on the portal (outside ForwardAuth) instead of SurfSense's own
+		// root, which would silently re-auth. The portal URL is provided by
+		// the build/deploy pipeline (NEXT_PUBLIC_LOGOUT_REDIRECT_URL), so the
+		// same image works across hostname shapes — `<app>-<smb>.<domain>`,
+		// `<app>.<smb>.<domain>`, etc. — without regex acrobatics.
+		const redirectUrl = process.env.NEXT_PUBLIC_LOGOUT_REDIRECT_URL;
+		if (!redirectUrl) {
+			console.error(
+				"NEXT_PUBLIC_LOGOUT_REDIRECT_URL is not set; cannot redirect to portal after logout"
+			);
+			return false;
+		}
+		window.location.href = redirectUrl;
 		return true;
 	}
 
