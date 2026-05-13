@@ -1,5 +1,4 @@
 import { atomWithQuery } from "jotai-tanstack-query";
-import { getBearerToken } from "@/lib/auth-utils";
 import { userApiService } from "@/lib/apis/user-api.service";
 
 export const USER_QUERY_KEY = ["user", "me"] as const;
@@ -12,7 +11,7 @@ export const currentUserAtom = atomWithQuery(() => {
 		// are now pushed via Zero (queries.user.me()), so /users/me only
 		// needs to fire once per session for the static profile fields.
 		staleTime: Infinity,
-		enabled: !!getBearerToken(),
+		enabled: true,
 		queryFn: userQueryFn,
 	};
 });
