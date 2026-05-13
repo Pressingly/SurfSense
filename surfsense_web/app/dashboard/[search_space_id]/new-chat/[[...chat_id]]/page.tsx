@@ -60,7 +60,7 @@ import { useChatSessionStateSync } from "@/hooks/use-chat-session-state";
 import { useMessagesSync } from "@/hooks/use-messages-sync";
 import { getAgentFilesystemSelection } from "@/lib/agent-filesystem";
 import { documentsApiService } from "@/lib/apis/documents-api.service";
-import { getBearerToken } from "@/lib/auth-utils";
+import { authenticatedFetch, getBearerToken } from "@/lib/auth-utils";
 import { type ChatFlow, classifyChatError } from "@/lib/chat/chat-error-classifier";
 import { tagPreAcceptSendFailure, toHttpResponseError } from "@/lib/chat/chat-request-errors";
 import { convertToThreadMessage } from "@/lib/chat/message-utils";
@@ -988,11 +988,10 @@ export default function NewChatPage() {
 				}
 
 				const response = await fetchWithTurnCancellingRetry(() =>
-					fetch(`${backendUrl}/api/v1/new_chat`, {
+					authenticatedFetch(`${backendUrl}/api/v1/new_chat`, {
 						method: "POST",
 						headers: {
 							"Content-Type": "application/json",
-							Authorization: `Bearer ${token}`,
 						},
 						body: JSON.stringify({
 							chat_id: currentThreadId,
@@ -1466,11 +1465,10 @@ export default function NewChatPage() {
 					localFilesystemEnabled,
 				});
 				const response = await fetchWithTurnCancellingRetry(() =>
-					fetch(`${backendUrl}/api/v1/threads/${resumeThreadId}/resume`, {
+					authenticatedFetch(`${backendUrl}/api/v1/threads/${resumeThreadId}/resume`, {
 						method: "POST",
 						headers: {
 							"Content-Type": "application/json",
-							Authorization: `Bearer ${token}`,
 						},
 						body: JSON.stringify({
 							search_space_id: searchSpaceId,
@@ -1929,11 +1927,10 @@ export default function NewChatPage() {
 					}
 				}
 				const response = await fetchWithTurnCancellingRetry(() =>
-					fetch(getRegenerateUrl(threadId), {
+					authenticatedFetch(getRegenerateUrl(threadId), {
 						method: "POST",
 						headers: {
 							"Content-Type": "application/json",
-							Authorization: `Bearer ${token}`,
 						},
 						body: JSON.stringify(requestBody),
 						signal: controller.signal,
