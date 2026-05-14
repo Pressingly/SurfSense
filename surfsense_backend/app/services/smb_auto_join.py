@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 async def auto_join_smb_search_space(user_id: uuid.UUID) -> None:
     """
-    Same resolution as Plane ``_auto_join_workspace``: match the search space whose
+    ``_auto_join_workspace``: match the search space whose
     name equals ``SMB_DEFAULT_WORKSPACE_NAME`` or ``SMB_NAME``. If none exists,
     do nothing (no fallback to another space).
 

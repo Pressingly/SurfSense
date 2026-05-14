@@ -314,7 +314,7 @@ async def current_active_user(
     so existing email/password and Google OAuth flows continue to work when
     proxy auth is disabled.
 
-    SMB shared SearchSpace membership (Plane parity) is enforced here — not only in
+    SMB shared SearchSpace membership is enforced here — not only in
     ProxyAuthMiddleware — because after proxy-login the browser usually sends Bearer
     JWT without X-Auth-Request-Email, so middleware alone would never run auto-join.
     """
