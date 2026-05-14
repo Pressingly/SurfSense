@@ -320,6 +320,13 @@ class Config:
     # claim) instead of a full email address.
     DEFAULT_EMAIL_DOMAIN = os.getenv("DEFAULT_EMAIL_DOMAIN", "askii.ai")
 
+    # Portal hostname prefix (e.g. fossil for fossil.local...).
+    SMB_NAME = (os.getenv("SMB_NAME") or "").strip()
+    # Default shared search space name (SSO auto-join). Defaults to SMB_NAME.
+    SMB_DEFAULT_WORKSPACE_NAME = (
+        os.getenv("SMB_DEFAULT_WORKSPACE_NAME") or os.getenv("SMB_NAME") or ""
+    ).strip()
+
     # Google OAuth
     GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
     GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")

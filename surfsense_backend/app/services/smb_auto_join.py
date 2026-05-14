@@ -1,4 +1,4 @@
-"""Ensure SSO users are members of the shared SMB SearchSpace (SMB_NAME)."""
+"""Ensure SSO users are members of the shared SMB SearchSpace (SMB_DEFAULT_WORKSPACE_NAME)."""
 
 from __future__ import annotations
 
@@ -21,22 +21,28 @@ logger = logging.getLogger(__name__)
 
 async def auto_join_smb_search_space(user_id: uuid.UUID) -> None:
     """
-    If ``SMB_NAME`` is set and a matching SearchSpace exists, insert membership
-    for ``user_id`` using the default invite role (Editor) when absent.
+    Same resolution as Plane ``_auto_join_workspace``: match the search space whose
+    name equals ``SMB_DEFAULT_WORKSPACE_NAME`` or ``SMB_NAME``. If none exists,
+    do nothing (no fallback to another space).
 
-    Idempotent. Safe when auth uses Bearer JWT only (no ForwardAuth headers):
-    ``ProxyAuthMiddleware`` skips resolution for those requests, so this runs
-    from ``current_active_user`` as well.
+    Uses the default invite role (Editor) when absent. Idempotent.
+    Safe when auth uses Bearer JWT only: runs from ``current_active_user`` as well.
     """
-    smb = (getattr(config, "SMB_NAME", None) or "").strip()
-    if not smb:
+    smb_slug = (
+        getattr(config, "SMB_DEFAULT_WORKSPACE_NAME", None)
+        or getattr(config, "SMB_NAME", "")
+        or ""
+    )
+    if isinstance(smb_slug, str):
+        smb_slug = smb_slug.strip()
+    if not smb_slug:
         return
 
     async with async_session_maker() as session:
         not_deleting = ~SearchSpace.name.startswith("[DELETING] ")
         space_result = await session.execute(
             select(SearchSpace)
-            .where(SearchSpace.name == smb, not_deleting)
+            .where(SearchSpace.name == smb_slug, not_deleting)
             .order_by(SearchSpace.id.asc())
             .limit(1)
         )
@@ -44,7 +50,7 @@ async def auto_join_smb_search_space(user_id: uuid.UUID) -> None:
         if space is None:
             logger.debug(
                 "SMB auto-join: no search space named %r — skipping",
-                smb,
+                smb_slug,
             )
             return
 

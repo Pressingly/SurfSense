@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from sqlalchemy import update
 
 from app.config import config
+from app.services.smb_auto_join import auto_join_smb_search_space
 from app.db import (
     Prompt,
     SearchSpace,
@@ -312,11 +313,27 @@ async def current_active_user(
     mPass proxy auth is active). Falls back to JWT Bearer token validation
     so existing email/password and Google OAuth flows continue to work when
     proxy auth is disabled.
+
+    SMB shared SearchSpace membership (Plane parity) is enforced here — not only in
+    ProxyAuthMiddleware — because after proxy-login the browser usually sends Bearer
+    JWT without X-Auth-Request-Email, so middleware alone would never run auto-join.
     """
     proxy_user = getattr(request.state, "proxy_user", None)
     if proxy_user is not None:
+        try:
+            await auto_join_smb_search_space(proxy_user.id)
+        except Exception:
+            logger.exception(
+                "SMB auto-join failed for proxy session user %s", proxy_user.id
+            )
         return proxy_user
     if jwt_user is not None:
+        try:
+            await auto_join_smb_search_space(jwt_user.id)
+        except Exception:
+            logger.exception(
+                "SMB auto-join failed for JWT user %s", jwt_user.id
+            )
         return jwt_user
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,

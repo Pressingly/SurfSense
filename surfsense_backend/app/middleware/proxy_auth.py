@@ -209,6 +209,9 @@ class ProxyAuthMiddleware(BaseHTTPMiddleware):
                             email,
                         )
 
+                # SMB shared-space join runs in users.current_active_user so Bearer JWT
+                # requests (no X-Auth-Request-Email on upstream) still enroll like Plane.
+
                 return user
 
         except Exception:
