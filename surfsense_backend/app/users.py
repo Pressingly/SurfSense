@@ -16,7 +16,6 @@ from pydantic import BaseModel
 from sqlalchemy import update
 
 from app.config import config
-from app.services.smb_auto_join import auto_join_smb_search_space
 from app.db import (
     Prompt,
     SearchSpace,
@@ -28,6 +27,7 @@ from app.db import (
     get_user_db,
 )
 from app.prompts.system_defaults import SYSTEM_PROMPT_DEFAULTS
+from app.services.smb_auto_join import auto_join_smb_search_space
 from app.utils.refresh_tokens import create_refresh_token
 
 logger = logging.getLogger(__name__)
