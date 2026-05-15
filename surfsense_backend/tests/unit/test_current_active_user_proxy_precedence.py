@@ -36,6 +36,8 @@ from starlette.requests import Request as StarletteRequest
 
 from app.users import current_active_user, current_optional_user
 
+pytestmark = pytest.mark.unit
+
 
 def _make_request(proxy_user=None) -> Request:
     """Build a minimal Request whose .state.proxy_user is settable."""
