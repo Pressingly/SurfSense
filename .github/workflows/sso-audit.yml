@@ -25,14 +25,18 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   sso-fork-audit:
     runs-on: ubuntu-latest
+    # Grant `pull-requests: write` only to the sticky-comment step,
+    # not to the whole workflow. The audit step needs only `contents: read`.
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Run fork audit
         id: audit
