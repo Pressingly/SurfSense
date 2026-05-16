@@ -1,0 +1,66 @@
+name: SSO fork audit
+
+# Runs scripts/sso-audit.sh against this fork's auth code to verify
+# satisfaction of the cross-app SSO contract at
+# awais786/sso-rules-moneta:openspec/specs/proxy-auth-middleware/spec.md.
+#
+# Covers fork-side rows 14, 20, 21 from SKILL.md §5. Exits 1 on security-
+# critical violations (row 20 — architectural immunity pinned by the
+# precedence regression-guard test).
+
+on:
+  pull_request:
+    paths:
+      - 'surfsense_backend/app/middleware/proxy_auth.py'
+      - 'surfsense_backend/app/users.py'
+      - 'surfsense_backend/tests/unit/test_current_active_user_proxy_precedence.py'
+      - 'surfsense_web/lib/auth-utils.ts'
+      - 'scripts/sso-audit.sh'
+      - '.github/workflows/sso-audit.yml'
+  push:
+    branches: [foss-main]
+  schedule:
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  sso-fork-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run fork audit
+        id: audit
+        run: |
+          set -o pipefail
+          if bash scripts/sso-audit.sh | tee audit-output.md; then
+            echo "audit_exit=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "audit_exit=$?" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to job summary
+        if: always()
+        run: cat audit-output.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post sticky PR comment
+        if: |
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          always()
+        continue-on-error: true
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: sso-fork-audit
+          path: audit-output.md
+
+      - name: Fail on security-critical violations
+        if: steps.audit.outputs.audit_exit != '0'
+        run: |
+          echo "::error::Security-critical SSO contract violation in fork audit. See table for the failing row and fix."
+          exit 1
