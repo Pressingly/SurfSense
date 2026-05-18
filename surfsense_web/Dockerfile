@@ -9,7 +9,7 @@ RUN apk add --no-cache libc6-compat
 WORKDIR /app
 
 # Install pnpm
-RUN corepack enable pnpm
+RUN corepack enable pnpm@10.24.0
 
 # Copy package files
 COPY package.json pnpm-lock.yaml* .npmrc* ./
@@ -27,7 +27,7 @@ FROM base AS builder
 WORKDIR /app
 
 # Enable pnpm
-RUN corepack enable pnpm
+RUN corepack enable pnpm@10.24.0
 
 # Build with placeholder values for NEXT_PUBLIC_* variables.
 # These are replaced at container startup by docker-entrypoint.js
