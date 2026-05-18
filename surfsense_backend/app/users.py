@@ -16,7 +16,6 @@ from pydantic import BaseModel
 from sqlalchemy import update
 
 from app.config import config
-from app.services.smb_auto_join import auto_join_smb_search_space
 from app.db import (
     Prompt,
     SearchSpace,
@@ -28,6 +27,7 @@ from app.db import (
     get_user_db,
 )
 from app.prompts.system_defaults import SYSTEM_PROMPT_DEFAULTS
+from app.services.smb_auto_join import auto_join_smb_search_space
 from app.utils.refresh_tokens import create_refresh_token
 
 logger = logging.getLogger(__name__)
@@ -212,6 +212,23 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
                 f"Failed to create default search space for user {user.id}: {e}"
             )
 
+        # SMB auto-join — runs once at user creation, NOT on every request.
+        # Per-request auto-join silently re-grants membership to users an
+        # operator has explicitly removed (the DELETE /searchspaces/{id}/
+        # members/{membership_id} endpoint hard-deletes the row, leaving no
+        # tombstone for the auto-join function to consult). Doing it here
+        # keeps removed users removed.
+        #
+        # Trade-off: users who registered BEFORE the SMB workspace existed
+        # are not retroactively auto-joined — operators can backfill those
+        # with a one-time SQL INSERT against `search_space_memberships`.
+        try:
+            await auto_join_smb_search_space(user.id)
+        except Exception:
+            logger.exception(
+                "SMB auto-join failed for newly registered user %s", user.id
+            )
+
     async def on_after_forgot_password(
         self, user: User, token: str, request: Request | None = None
     ):
@@ -314,26 +331,15 @@ async def current_active_user(
     so existing email/password and Google OAuth flows continue to work when
     proxy auth is disabled.
 
-    SMB shared SearchSpace membership is enforced here — not only in
-    ProxyAuthMiddleware — because after proxy-login the browser usually sends Bearer
-    JWT without X-Auth-Request-Email, so middleware alone would never run auto-join.
+    SMB shared SearchSpace auto-join runs in `on_after_register` (one-shot
+    at user creation), NOT here on every request. Per-request auto-join
+    silently re-grants membership to users that operators have explicitly
+    removed via DELETE /searchspaces/{id}/members/{membership_id}.
     """
     proxy_user = getattr(request.state, "proxy_user", None)
     if proxy_user is not None:
-        try:
-            await auto_join_smb_search_space(proxy_user.id)
-        except Exception:
-            logger.exception(
-                "SMB auto-join failed for proxy session user %s", proxy_user.id
-            )
         return proxy_user
     if jwt_user is not None:
-        try:
-            await auto_join_smb_search_space(jwt_user.id)
-        except Exception:
-            logger.exception(
-                "SMB auto-join failed for JWT user %s", jwt_user.id
-            )
         return jwt_user
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
