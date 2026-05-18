@@ -292,6 +292,8 @@ class Config:
     # Backend URL to override the http to https in the OAuth redirect URI
     BACKEND_URL = os.getenv("BACKEND_URL")
 
+    PLATFORM_DOMAIN = os.getenv("PLATFORM_DOMAIN", "")
+
     # Stripe checkout for pay-as-you-go page packs
     STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
     STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
