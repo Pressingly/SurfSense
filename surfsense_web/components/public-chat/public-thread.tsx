@@ -13,11 +13,13 @@ import Image from "next/image";
 import { type FC, type ReactNode, useState } from "react";
 import { CitationMetadataProvider } from "@/components/assistant-ui/citation-metadata-context";
 import { MarkdownText } from "@/components/assistant-ui/markdown-text";
+import { ReasoningMessagePart } from "@/components/assistant-ui/reasoning-message-part";
 import { ToolFallback } from "@/components/assistant-ui/tool-fallback";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import { GenerateImageToolUI } from "@/components/tool-ui/generate-image";
 import { GeneratePodcastToolUI } from "@/components/tool-ui/generate-podcast";
 import { GenerateReportToolUI } from "@/components/tool-ui/generate-report";
+import { GenerateResumeToolUI } from "@/components/tool-ui/generate-resume";
 
 const GenerateVideoPresentationToolUI = dynamic(
 	() =>
@@ -43,20 +45,21 @@ export const PublicThread: FC<PublicThreadProps> = ({ footer }) => {
 				["--thread-max-width" as string]: "44rem",
 			}}
 		>
-			<ThreadPrimitive.Viewport className="aui-thread-viewport relative flex flex-1 min-h-0 flex-col overflow-y-auto px-4 pt-4">
+			<ThreadPrimitive.Viewport
+				scrollToBottomOnInitialize
+				scrollToBottomOnThreadSwitch
+				className="aui-thread-viewport relative flex flex-1 min-h-0 flex-col overflow-y-auto px-4 pt-4 pb-6"
+			>
 				<ThreadPrimitive.Messages
 					components={{
 						UserMessage: PublicUserMessage,
 						AssistantMessage: PublicAssistantMessage,
 					}}
 				/>
-
-				{/* Spacer to ensure footer doesn't overlap last message */}
-				<div className="h-24" />
 			</ThreadPrimitive.Viewport>
 
 			{footer && (
-				<div className="sticky bottom-0 z-20 border-t bg-main-panel/95 backdrop-blur supports-backdrop-filter:bg-main-panel/60">
+				<div className="border-t bg-main-panel/95 backdrop-blur supports-backdrop-filter:bg-main-panel/60">
 					{footer}
 				</div>
 			)}
@@ -156,10 +159,12 @@ const PublicAssistantMessage: FC = () => {
 					<MessagePrimitive.Parts
 						components={{
 							Text: MarkdownText,
+							Reasoning: ReasoningMessagePart,
 							tools: {
 								by_name: {
 									generate_podcast: GeneratePodcastToolUI,
 									generate_report: GenerateReportToolUI,
+									generate_resume: GenerateResumeToolUI,
 									generate_video_presentation: GenerateVideoPresentationToolUI,
 									display_image: GenerateImageToolUI,
 									generate_image: GenerateImageToolUI,

@@ -3,7 +3,7 @@
 import { Check, Copy, Info } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { useCallback, useRef, useState } from "react";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useApiKey } from "@/hooks/use-api-key";
@@ -27,10 +27,9 @@ export function ApiKeyContent() {
 
 	return (
 		<div className="space-y-6 min-w-0 overflow-hidden">
-			<Alert className="border-border/60 bg-muted/30 text-muted-foreground">
-				<Info className="h-4 w-4 text-muted-foreground" />
-				<AlertTitle className="text-muted-foreground">{t("api_key_warning_title")}</AlertTitle>
-				<AlertDescription className="text-muted-foreground/60">
+			<Alert className="bg-muted/50 py-3 md:py-4">
+				<Info className="h-3 w-3 md:h-4 md:w-4 shrink-0" />
+				<AlertDescription className="text-xs md:text-sm">
 					{t("api_key_warning_description")}
 				</AlertDescription>
 			</Alert>

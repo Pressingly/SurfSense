@@ -1,9 +1,7 @@
 "use client";
 
-import { BrainCog, Rocket, Zap } from "lucide-react";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
-import { DEFAULT_SHORTCUTS, ShortcutRecorder } from "@/components/desktop/shortcut-recorder";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import {
@@ -22,42 +20,44 @@ import { searchSpacesApiService } from "@/lib/apis/search-spaces-api.service";
 export function DesktopContent() {
 	const api = useElectronAPI();
 	const [loading, setLoading] = useState(true);
-	const [enabled, setEnabled] = useState(true);
-
-	const [shortcuts, setShortcuts] = useState(DEFAULT_SHORTCUTS);
-	const [shortcutsLoaded, setShortcutsLoaded] = useState(false);
 
 	const [searchSpaces, setSearchSpaces] = useState<SearchSpace[]>([]);
 	const [activeSpaceId, setActiveSpaceId] = useState<string | null>(null);
 
+	const [autoLaunchEnabled, setAutoLaunchEnabled] = useState(false);
+	const [autoLaunchHidden, setAutoLaunchHidden] = useState(true);
+	const [autoLaunchSupported, setAutoLaunchSupported] = useState(false);
+
 	useEffect(() => {
 		if (!api) {
 			setLoading(false);
-			setShortcutsLoaded(true);
 			return;
 		}
 
 		let mounted = true;
+		const hasAutoLaunchApi =
+			typeof api.getAutoLaunch === "function" && typeof api.setAutoLaunch === "function";
+		setAutoLaunchSupported(hasAutoLaunchApi);
 
 		Promise.all([
-			api.getAutocompleteEnabled(),
-			api.getShortcuts?.() ?? Promise.resolve(null),
 			api.getActiveSearchSpace?.() ?? Promise.resolve(null),
 			searchSpacesApiService.getSearchSpaces(),
+			hasAutoLaunchApi ? api.getAutoLaunch() : Promise.resolve(null),
 		])
-			.then(([autoEnabled, config, spaceId, spaces]) => {
+			.then(([spaceId, spaces, autoLaunch]) => {
 				if (!mounted) return;
-				setEnabled(autoEnabled);
-				if (config) setShortcuts(config);
 				setActiveSpaceId(spaceId);
 				if (spaces) setSearchSpaces(spaces);
+				if (autoLaunch) {
+					setAutoLaunchEnabled(autoLaunch.enabled);
+					setAutoLaunchHidden(autoLaunch.openAsHidden);
+					setAutoLaunchSupported(autoLaunch.supported);
+				}
 				setLoading(false);
-				setShortcutsLoaded(true);
 			})
 			.catch(() => {
 				if (!mounted) return;
 				setLoading(false);
-				setShortcutsLoaded(true);
 			});
 
 		return () => {
@@ -69,7 +69,7 @@ export function DesktopContent() {
 		return (
 			<div className="flex flex-col items-center justify-center py-12 text-center">
 				<p className="text-sm text-muted-foreground">
-					Desktop settings are only available in the SurfSense desktop app.
+					App preferences are only available in the SurfSense desktop app.
 				</p>
 			</div>
 		);
@@ -83,27 +83,38 @@ export function DesktopContent() {
 		);
 	}
 
-	const handleToggle = async (checked: boolean) => {
-		setEnabled(checked);
-		await api.setAutocompleteEnabled(checked);
+	const handleAutoLaunchToggle = async (checked: boolean) => {
+		if (!autoLaunchSupported || !api.setAutoLaunch) {
+			toast.error("Please update the desktop app to configure launch on startup");
+			return;
+		}
+		setAutoLaunchEnabled(checked);
+		try {
+			const next = await api.setAutoLaunch(checked, autoLaunchHidden);
+			if (next) {
+				setAutoLaunchEnabled(next.enabled);
+				setAutoLaunchHidden(next.openAsHidden);
+				setAutoLaunchSupported(next.supported);
+			}
+			toast.success(checked ? "SurfSense will launch on startup" : "Launch on startup disabled");
+		} catch {
+			setAutoLaunchEnabled(!checked);
+			toast.error("Failed to update launch on startup");
+		}
 	};
 
-	const updateShortcut = (
-		key: "generalAssist" | "quickAsk" | "autocomplete",
-		accelerator: string
-	) => {
-		setShortcuts((prev) => {
-			const updated = { ...prev, [key]: accelerator };
-			api.setShortcuts?.({ [key]: accelerator }).catch(() => {
-				toast.error("Failed to update shortcut");
-			});
-			return updated;
-		});
-		toast.success("Shortcut updated");
-	};
-
-	const resetShortcut = (key: "generalAssist" | "quickAsk" | "autocomplete") => {
-		updateShortcut(key, DEFAULT_SHORTCUTS[key]);
+	const handleAutoLaunchHiddenToggle = async (checked: boolean) => {
+		if (!autoLaunchSupported || !api.setAutoLaunch) {
+			toast.error("Please update the desktop app to configure startup behavior");
+			return;
+		}
+		setAutoLaunchHidden(checked);
+		try {
+			await api.setAutoLaunch(autoLaunchEnabled, checked);
+		} catch {
+			setAutoLaunchHidden(!checked);
+			toast.error("Failed to update startup behavior");
+		}
 	};
 
 	const handleSearchSpaceChange = (value: string) => {
@@ -114,13 +125,12 @@ export function DesktopContent() {
 
 	return (
 		<div className="space-y-4 md:space-y-6">
-			{/* Default Search Space */}
 			<Card>
 				<CardHeader className="px-3 md:px-6 pt-3 md:pt-6 pb-2 md:pb-3">
 					<CardTitle className="text-base md:text-lg">Default Search Space</CardTitle>
 					<CardDescription className="text-xs md:text-sm">
-						Choose which search space General Assist, Quick Assist, and Extreme Assist operate
-						against.
+						Choose which search space General Assist, Screenshot Assist, and Quick Assist use by
+						default.
 					</CardDescription>
 				</CardHeader>
 				<CardContent className="px-3 md:px-6 pb-3 md:pb-6">
@@ -145,75 +155,53 @@ export function DesktopContent() {
 				</CardContent>
 			</Card>
 
-			{/* Keyboard Shortcuts */}
 			<Card>
 				<CardHeader className="px-3 md:px-6 pt-3 md:pt-6 pb-2 md:pb-3">
-					<CardTitle className="text-base md:text-lg">Keyboard Shortcuts</CardTitle>
+					<CardTitle className="text-base md:text-lg flex items-center gap-2">
+						Launch on Startup
+					</CardTitle>
 					<CardDescription className="text-xs md:text-sm">
-						Customize the global keyboard shortcuts for desktop features.
+						Automatically start SurfSense when you sign in to your computer so global shortcuts and
+						folder sync are always available.
 					</CardDescription>
 				</CardHeader>
-				<CardContent className="px-3 md:px-6 pb-3 md:pb-6">
-					{shortcutsLoaded ? (
-						<div className="flex flex-col gap-3">
-							<ShortcutRecorder
-								value={shortcuts.generalAssist}
-								onChange={(accel) => updateShortcut("generalAssist", accel)}
-								onReset={() => resetShortcut("generalAssist")}
-								defaultValue={DEFAULT_SHORTCUTS.generalAssist}
-								label="General Assist"
-								description="Launch SurfSense instantly from any application"
-								icon={Rocket}
-							/>
-							<ShortcutRecorder
-								value={shortcuts.quickAsk}
-								onChange={(accel) => updateShortcut("quickAsk", accel)}
-								onReset={() => resetShortcut("quickAsk")}
-								defaultValue={DEFAULT_SHORTCUTS.quickAsk}
-								label="Quick Assist"
-								description="Select text anywhere, then ask AI to explain, rewrite, or act on it"
-								icon={Zap}
-							/>
-							<ShortcutRecorder
-								value={shortcuts.autocomplete}
-								onChange={(accel) => updateShortcut("autocomplete", accel)}
-								onReset={() => resetShortcut("autocomplete")}
-								defaultValue={DEFAULT_SHORTCUTS.autocomplete}
-								label="Extreme Assist"
-								description="AI drafts text using your screen context and knowledge base"
-								icon={BrainCog}
-							/>
-							<p className="text-[11px] text-muted-foreground">
-								Click a shortcut and press a new key combination to change it.
-							</p>
-						</div>
-					) : (
-						<div className="flex justify-center py-4">
-							<Spinner size="sm" />
-						</div>
-					)}
-				</CardContent>
-			</Card>
-
-			{/* Extreme Assist Toggle */}
-			<Card>
-				<CardHeader className="px-3 md:px-6 pt-3 md:pt-6 pb-2 md:pb-3">
-					<CardTitle className="text-base md:text-lg">Extreme Assist</CardTitle>
-					<CardDescription className="text-xs md:text-sm">
-						Get inline writing suggestions powered by your knowledge base as you type in any app.
-					</CardDescription>
-				</CardHeader>
-				<CardContent className="px-3 md:px-6 pb-3 md:pb-6">
+				<CardContent className="px-3 md:px-6 pb-3 md:pb-6 space-y-3">
 					<div className="flex items-center justify-between rounded-lg border p-4">
 						<div className="space-y-0.5">
-							<Label htmlFor="autocomplete-toggle" className="text-sm font-medium cursor-pointer">
-								Enable Extreme Assist
+							<Label htmlFor="auto-launch-toggle" className="text-sm font-medium cursor-pointer">
+								Open SurfSense at login
 							</Label>
 							<p className="text-xs text-muted-foreground">
-								Show suggestions while typing in other applications.
+								{autoLaunchSupported
+									? "Adds SurfSense to your system's login items."
+									: "Only available in the packaged desktop app."}
 							</p>
 						</div>
-						<Switch id="autocomplete-toggle" checked={enabled} onCheckedChange={handleToggle} />
+						<Switch
+							id="auto-launch-toggle"
+							checked={autoLaunchEnabled}
+							onCheckedChange={handleAutoLaunchToggle}
+							disabled={!autoLaunchSupported}
+						/>
+					</div>
+					<div className="flex items-center justify-between rounded-lg border p-4">
+						<div className="space-y-0.5">
+							<Label
+								htmlFor="auto-launch-hidden-toggle"
+								className="text-sm font-medium cursor-pointer"
+							>
+								Start minimized to tray
+							</Label>
+							<p className="text-xs text-muted-foreground">
+								Skip the main window on boot — SurfSense lives in the system tray until you need it.
+							</p>
+						</div>
+						<Switch
+							id="auto-launch-hidden-toggle"
+							checked={autoLaunchHidden}
+							onCheckedChange={handleAutoLaunchHiddenToggle}
+							disabled={!autoLaunchSupported || !autoLaunchEnabled}
+						/>
 					</div>
 				</CardContent>
 			</Card>

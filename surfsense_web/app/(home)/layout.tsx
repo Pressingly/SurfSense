@@ -7,6 +7,12 @@ import { Navbar } from "@/components/homepage/navbar";
 export default function HomePageLayout({ children }: { children: React.ReactNode }) {
 	const pathname = usePathname();
 	const isAuthPage = pathname === "/login" || pathname === "/register";
+	const isFreeModelChat = /^\/free\/[^/]+$/.test(pathname);
+
+	if (isFreeModelChat) {
+		return <>{children}</>;
+	}
+
 	// The home route ("/") is the SSO splash — it only renders during the
 	// cookie-handoff redirect dance and should not flash any chrome.
 	const isSplashPage = pathname === "/";

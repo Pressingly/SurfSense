@@ -15,6 +15,9 @@ from app.etl_pipeline.parsers.plaintext import read_plaintext
 class EtlPipelineService:
     """Single pipeline for extracting markdown from files. All callers use this."""
 
+    def __init__(self, *, vision_llm=None):
+        self._vision_llm = vision_llm
+
     async def extract(self, request: EtlRequest) -> EtlResult:
         category = classify_file(request.filename)
 
@@ -47,7 +50,57 @@ class EtlPipelineService:
                 content_type="audio",
             )
 
+        if category == FileCategory.IMAGE:
+            return await self._extract_image(request)
+
         return await self._extract_document(request)
+
+    async def _extract_image(self, request: EtlRequest) -> EtlResult:
+        if self._vision_llm:
+            try:
+                from app.etl_pipeline.parsers.vision_llm import parse_with_vision_llm
+
+                content = await parse_with_vision_llm(
+                    request.file_path, request.filename, self._vision_llm
+                )
+                return EtlResult(
+                    markdown_content=content,
+                    etl_service="VISION_LLM",
+                    content_type="image",
+                )
+            except Exception as exc:
+                # Special-case quota exhaustion so we log a clearer message
+                # — the vision LLM didn't "fail", the user just ran out of
+                # premium credit. Falling through to the document parser
+                # is a graceful degradation: OCR/Unstructured still
+                # extracts text from the image without burning credit.
+                from app.services.billable_calls import QuotaInsufficientError
+
+                if isinstance(exc, QuotaInsufficientError):
+                    logging.info(
+                        "Vision LLM quota exhausted for %s; falling back to document parser",
+                        request.filename,
+                    )
+                else:
+                    logging.warning(
+                        "Vision LLM failed for %s, falling back to document parser",
+                        request.filename,
+                        exc_info=True,
+                    )
+        else:
+            logging.info(
+                "No vision LLM provided, falling back to document parser for %s",
+                request.filename,
+            )
+
+        try:
+            return await self._extract_document(request)
+        except (EtlUnsupportedFileError, EtlServiceUnavailableError):
+            raise EtlUnsupportedFileError(
+                f"Cannot process image {request.filename}: vision LLM "
+                f"{'failed' if self._vision_llm else 'not configured'} and "
+                f"document parser does not support this format"
+            ) from None
 
     async def _extract_document(self, request: EtlRequest) -> EtlResult:
         from pathlib import PurePosixPath
@@ -105,13 +158,17 @@ class EtlPipelineService:
             and getattr(app_config, "AZURE_DI_KEY", None)
         )
 
+        mode_value = request.processing_mode.value
+
         if azure_configured and ext in AZURE_DI_DOCUMENT_EXTENSIONS:
             try:
                 from app.etl_pipeline.parsers.azure_doc_intelligence import (
                     parse_with_azure_doc_intelligence,
                 )
 
-                return await parse_with_azure_doc_intelligence(request.file_path)
+                return await parse_with_azure_doc_intelligence(
+                    request.file_path, processing_mode=mode_value
+                )
             except Exception:
                 logging.warning(
                     "Azure Document Intelligence failed for %s, "
@@ -122,4 +179,6 @@ class EtlPipelineService:
 
         from app.etl_pipeline.parsers.llamacloud import parse_with_llamacloud
 
-        return await parse_with_llamacloud(request.file_path, request.estimated_pages)
+        return await parse_with_llamacloud(
+            request.file_path, request.estimated_pages, processing_mode=mode_value
+        )

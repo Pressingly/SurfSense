@@ -14,7 +14,7 @@ import {
 	Inbox,
 	LayoutGrid,
 	ListFilter,
-	MessageSquare,
+	MessageCircleReply,
 	Search,
 	X,
 } from "lucide-react";
@@ -22,8 +22,6 @@ import { useParams, useRouter } from "next/navigation";
 import { useTranslations } from "next-intl";
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { setTargetCommentIdAtom } from "@/atoms/chat/current-thread.atom";
-import { convertRenderedToDisplay } from "@/components/chat-comments/comment-item/comment-item";
-import { getDocumentTypeLabel } from "@/components/documents/DocumentTypeIcon";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/animated-tabs";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
@@ -57,6 +55,8 @@ import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import type { InboxItem } from "@/hooks/use-inbox";
 import { useMediaQuery } from "@/hooks/use-media-query";
 import { notificationsApiService } from "@/lib/apis/notifications-api.service";
+import { convertRenderedToDisplay } from "@/lib/comments/utils";
+import { getDocumentTypeLabel } from "@/lib/documents/document-type-labels";
 import { cacheKeys } from "@/lib/query-client/cache-keys";
 import { cn } from "@/lib/utils";
 import { SidebarSlideOutPanel } from "./SidebarSlideOutPanel";
@@ -847,7 +847,7 @@ export function InboxSidebarContent({
 				<TabsList stretch showBottomBorder size="sm">
 					<TabsTrigger value="comments">
 						<span className="inline-flex items-center gap-1.5">
-							<MessageSquare className="h-4 w-4" />
+							<MessageCircleReply className="h-4 w-4" />
 							<span>{t("comments") || "Comments"}</span>
 							<span className="inline-flex items-center justify-center min-w-5 h-5 px-1.5 rounded-full bg-primary/20 text-muted-foreground text-xs font-medium">
 								{formatInboxCount(comments.unreadCount)}
@@ -1032,7 +1032,7 @@ export function InboxSidebarContent({
 				) : (
 					<div className="text-center py-8">
 						{activeTab === "comments" ? (
-							<MessageSquare className="h-12 w-12 mx-auto text-muted-foreground mb-3" />
+							<MessageCircleReply className="h-12 w-12 mx-auto text-muted-foreground mb-3" />
 						) : (
 							<History className="h-12 w-12 mx-auto text-muted-foreground mb-3" />
 						)}

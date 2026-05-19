@@ -1,10 +1,24 @@
-"""Knowledge-base pre-search middleware for the SurfSense new chat agent.
+"""Hybrid-search priority middleware for the SurfSense new chat agent.
 
-This middleware runs before the main agent loop and seeds a virtual filesystem
-(`files` state) with relevant documents retrieved via hybrid search.  On each
-turn the filesystem is *expanded* — new results merge with documents loaded
-during prior turns — and a synthetic ``ls`` result is injected into the message
-history so the LLM is immediately aware of the current filesystem structure.
+This middleware runs ``before_agent`` on every turn and writes:
+
+* ``state["kb_priority"]`` — the top-K most relevant documents for the
+  current user message, used to render a ``<priority_documents>`` system
+  message immediately before the user turn.
+* ``state["kb_matched_chunk_ids"]`` — internal hand-off mapping
+  (``Document.id`` → matched chunk IDs) consumed by
+  :class:`KBPostgresBackend._load_file_data` when the agent first reads each
+  document, so the XML wrapper can flag matched sections in
+  ``<chunk_index>``.
+
+The previous "scoped filesystem" behaviour (synthetic ``ls`` + state
+``files`` seeding) is intentionally removed: documents are now lazy-loaded
+from Postgres on demand, with the full workspace tree rendered separately
+by :class:`KnowledgeTreeMiddleware`.
+
+In anonymous mode the middleware skips hybrid search entirely and emits a
+single-entry priority list pointing at the Redis-loaded document
+(``state["kb_anon_doc"]``).
 """
 
 from __future__ import annotations
@@ -13,26 +27,33 @@ import asyncio
 import json
 import logging
 import re
-import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
+from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware, AgentState
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import Runnable
 from langgraph.runtime import Runtime
 from litellm import token_counter
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.new_chat.feature_flags import get_flags
+from app.agents.new_chat.filesystem_selection import FilesystemMode
+from app.agents.new_chat.filesystem_state import SurfSenseFilesystemState
+from app.agents.new_chat.path_resolver import (
+    PathIndex,
+    build_path_index,
+    doc_to_virtual_path,
+)
 from app.agents.new_chat.utils import parse_date_or_datetime, resolve_date_range
 from app.db import (
     NATIVE_TO_LEGACY_DOCTYPE,
     Chunk,
     Document,
-    Folder,
     shielded_async_session,
 )
 from app.retriever.chunks_hybrid_search import ChucksHybridSearchRetriever
@@ -58,10 +79,17 @@ class KBSearchPlan(BaseModel):
         default=None,
         description="Optional ISO end date or datetime for KB search filtering.",
     )
+    is_recency_query: bool = Field(
+        default=False,
+        description=(
+            "True when the user's intent is primarily about recency or temporal "
+            "ordering (e.g. 'latest', 'newest', 'most recent', 'last uploaded') "
+            "rather than topical relevance."
+        ),
+    )
 
 
 def _extract_text_from_message(message: BaseMessage) -> str:
-    """Extract plain text from a message content."""
     content = getattr(message, "content", "")
     if isinstance(content, str):
         return content
@@ -76,19 +104,6 @@ def _extract_text_from_message(message: BaseMessage) -> str:
     return str(content)
 
 
-def _safe_filename(value: str, *, fallback: str = "untitled.xml") -> str:
-    """Convert arbitrary text into a filesystem-safe filename."""
-    name = re.sub(r"[\\/:*?\"<>|]+", "_", value).strip()
-    name = re.sub(r"\s+", " ", name)
-    if not name:
-        name = fallback
-    if len(name) > 180:
-        name = name[:180].rstrip()
-    if not name.lower().endswith(".xml"):
-        name = f"{name}.xml"
-    return name
-
-
 def _render_recent_conversation(
     messages: Sequence[BaseMessage],
     *,
@@ -98,10 +113,9 @@ def _render_recent_conversation(
 ) -> str:
     """Render recent dialogue for internal planning under a token budget.
 
-    Prefers the latest messages and uses the project's existing model-aware
-    token budgeting hooks when available on the LLM (`_count_tokens`,
-    `_get_max_input_tokens`). Falls back to the prior fixed-message heuristic
-    if token counting is unavailable.
+    Filters to ``HumanMessage`` and ``AIMessage`` (without tool_calls) so that
+    injected ``SystemMessage`` artefacts (priority list, workspace tree,
+    file-write contract) don't pollute the planner prompt.
     """
     rendered: list[tuple[str, str]] = []
     for message in messages:
@@ -124,8 +138,6 @@ def _render_recent_conversation(
     if not rendered:
         return ""
 
-    # Exclude the latest user message from "recent conversation" because it is
-    # already passed separately as "Latest user message" in the planner prompt.
     if rendered and rendered[-1][0] == "user" and rendered[-1][1] == user_text.strip():
         rendered = rendered[:-1]
 
@@ -207,8 +219,6 @@ def _render_recent_conversation(
             selected_lines = candidate_lines
             continue
 
-        # If the full message does not fit, keep as much of this most-recent
-        # older message as possible via binary search.
         lo, hi = 1, len(text)
         best_line: str | None = None
         while lo <= hi:
@@ -240,12 +250,11 @@ def _build_kb_planner_prompt(
     recent_conversation: str,
     user_text: str,
 ) -> str:
-    """Build a compact internal prompt for KB query rewriting and date scoping."""
     today = datetime.now(UTC).date().isoformat()
     return (
         "You optimize internal knowledge-base search inputs for document retrieval.\n"
         "Return JSON only with this exact shape:\n"
-        '{"optimized_query":"string","start_date":"ISO string or null","end_date":"ISO string or null"}\n\n'
+        '{"optimized_query":"string","start_date":"ISO string or null","end_date":"ISO string or null","is_recency_query":bool}\n\n'
         "Rules:\n"
         "- Preserve the user's intent.\n"
         "- Rewrite the query to improve retrieval using concrete entities, acronyms, projects, tools, people, and document-specific terms when helpful.\n"
@@ -253,6 +262,11 @@ def _build_kb_planner_prompt(
         "- Only use date filters when the latest user request or recent dialogue clearly implies a time range.\n"
         "- If you use date filters, prefer returning both bounds.\n"
         "- If no date filter is useful, return null for both dates.\n"
+        '- Set "is_recency_query" to true ONLY when the user\'s primary intent is about '
+        "recency or temporal ordering rather than topical relevance. Examples: "
+        '"latest file", "newest upload", "most recent document", "what did I save last", '
+        '"show me files from today", "last thing I added". '
+        "When true, results will be sorted by date instead of relevance.\n"
         "- Do not include markdown, prose, or explanations.\n\n"
         f"Today's UTC date: {today}\n\n"
         f"Recent conversation:\n{recent_conversation or '(none)'}\n\n"
@@ -261,12 +275,10 @@ def _build_kb_planner_prompt(
 
 
 def _extract_json_payload(text: str) -> str:
-    """Extract a JSON object from a raw LLM response."""
     stripped = text.strip()
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.DOTALL)
     if fenced:
         return fenced.group(1)
-
     start = stripped.find("{")
     end = stripped.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -275,7 +287,6 @@ def _extract_json_payload(text: str) -> str:
 
 
 def _parse_kb_search_plan_response(response_text: str) -> KBSearchPlan:
-    """Parse and validate the planner's JSON response."""
     payload = json.loads(_extract_json_payload(response_text))
     return KBSearchPlan.model_validate(payload)
 
@@ -284,212 +295,19 @@ def _normalize_optional_date_range(
     start_date: str | None,
     end_date: str | None,
 ) -> tuple[datetime | None, datetime | None]:
-    """Normalize optional planner dates into a UTC datetime range."""
     parsed_start = parse_date_or_datetime(start_date) if start_date else None
     parsed_end = parse_date_or_datetime(end_date) if end_date else None
 
     if parsed_start is None and parsed_end is None:
         return None, None
 
-    resolved_start, resolved_end = resolve_date_range(parsed_start, parsed_end)
-    return resolved_start, resolved_end
-
-
-def _build_document_xml(
-    document: dict[str, Any],
-    matched_chunk_ids: set[int] | None = None,
-) -> str:
-    """Build citation-friendly XML with a ``<chunk_index>`` for smart seeking.
-
-    The ``<chunk_index>`` at the top of each document lists every chunk with its
-    line range inside ``<document_content>`` and flags chunks that directly
-    matched the search query (``matched="true"``).  This lets the LLM jump
-    straight to the most relevant section via ``read_file(offset=…, limit=…)``
-    instead of reading sequentially from the start.
-    """
-    matched = matched_chunk_ids or set()
-
-    doc_meta = document.get("document") or {}
-    metadata = (doc_meta.get("metadata") or {}) if isinstance(doc_meta, dict) else {}
-    document_id = doc_meta.get("id", document.get("document_id", "unknown"))
-    document_type = doc_meta.get("document_type", document.get("source", "UNKNOWN"))
-    title = doc_meta.get("title") or metadata.get("title") or "Untitled Document"
-    url = (
-        metadata.get("url") or metadata.get("source") or metadata.get("page_url") or ""
-    )
-    metadata_json = json.dumps(metadata, ensure_ascii=False)
-
-    # --- 1. Metadata header (fixed structure) ---
-    metadata_lines: list[str] = [
-        "<document>",
-        "<document_metadata>",
-        f"  <document_id>{document_id}</document_id>",
-        f"  <document_type>{document_type}</document_type>",
-        f"  <title><![CDATA[{title}]]></title>",
-        f"  <url><![CDATA[{url}]]></url>",
-        f"  <metadata_json><![CDATA[{metadata_json}]]></metadata_json>",
-        "</document_metadata>",
-        "",
-    ]
-
-    # --- 2. Pre-build chunk XML strings to compute line counts ---
-    chunks = document.get("chunks") or []
-    chunk_entries: list[tuple[int | None, str]] = []  # (chunk_id, xml_string)
-    if isinstance(chunks, list):
-        for chunk in chunks:
-            if not isinstance(chunk, dict):
-                continue
-            chunk_id = chunk.get("chunk_id") or chunk.get("id")
-            chunk_content = str(chunk.get("content", "")).strip()
-            if not chunk_content:
-                continue
-            if chunk_id is None:
-                xml = f"  <chunk><![CDATA[{chunk_content}]]></chunk>"
-            else:
-                xml = f"  <chunk id='{chunk_id}'><![CDATA[{chunk_content}]]></chunk>"
-            chunk_entries.append((chunk_id, xml))
-
-    # --- 3. Compute line numbers for every chunk ---
-    # Layout (1-indexed lines for read_file):
-    #   metadata_lines          -> len(metadata_lines) lines
-    #   <chunk_index>           -> 1 line
-    #   index entries           -> len(chunk_entries) lines
-    #   </chunk_index>          -> 1 line
-    #   (empty line)            -> 1 line
-    #   <document_content>      -> 1 line
-    #   chunk xml lines…
-    #   </document_content>     -> 1 line
-    #   </document>             -> 1 line
-    index_overhead = (
-        1 + len(chunk_entries) + 1 + 1 + 1
-    )  # tags + empty + <document_content>
-    first_chunk_line = len(metadata_lines) + index_overhead + 1  # 1-indexed
-
-    current_line = first_chunk_line
-    index_entry_lines: list[str] = []
-    for cid, xml_str in chunk_entries:
-        num_lines = xml_str.count("\n") + 1
-        end_line = current_line + num_lines - 1
-        matched_attr = ' matched="true"' if cid is not None and cid in matched else ""
-        if cid is not None:
-            index_entry_lines.append(
-                f'  <entry chunk_id="{cid}" lines="{current_line}-{end_line}"{matched_attr}/>'
-            )
-        else:
-            index_entry_lines.append(
-                f'  <entry lines="{current_line}-{end_line}"{matched_attr}/>'
-            )
-        current_line = end_line + 1
-
-    # --- 4. Assemble final XML ---
-    lines = metadata_lines.copy()
-    lines.append("<chunk_index>")
-    lines.extend(index_entry_lines)
-    lines.append("</chunk_index>")
-    lines.append("")
-    lines.append("<document_content>")
-    for _, xml_str in chunk_entries:
-        lines.append(xml_str)
-    lines.extend(["</document_content>", "</document>"])
-    return "\n".join(lines)
-
-
-async def _get_folder_paths(
-    session: AsyncSession, search_space_id: int
-) -> dict[int, str]:
-    """Return a map of folder_id -> virtual folder path under /documents."""
-    result = await session.execute(
-        select(Folder.id, Folder.name, Folder.parent_id).where(
-            Folder.search_space_id == search_space_id
-        )
-    )
-    rows = result.all()
-    by_id = {row.id: {"name": row.name, "parent_id": row.parent_id} for row in rows}
-
-    cache: dict[int, str] = {}
-
-    def resolve_path(folder_id: int) -> str:
-        if folder_id in cache:
-            return cache[folder_id]
-        parts: list[str] = []
-        cursor: int | None = folder_id
-        visited: set[int] = set()
-        while cursor is not None and cursor in by_id and cursor not in visited:
-            visited.add(cursor)
-            entry = by_id[cursor]
-            parts.append(
-                _safe_filename(str(entry["name"]), fallback="folder").removesuffix(
-                    ".xml"
-                )
-            )
-            cursor = entry["parent_id"]
-        parts.reverse()
-        path = "/documents/" + "/".join(parts) if parts else "/documents"
-        cache[folder_id] = path
-        return path
-
-    for folder_id in by_id:
-        resolve_path(folder_id)
-    return cache
-
-
-def _build_synthetic_ls(
-    existing_files: dict[str, Any] | None,
-    new_files: dict[str, Any],
-    *,
-    mentioned_paths: set[str] | None = None,
-) -> tuple[AIMessage, ToolMessage]:
-    """Build a synthetic ls("/documents") tool-call + result for the LLM context.
-
-    Mentioned files are listed first.  A separate header tells the LLM which
-    files the user explicitly selected; the path list itself stays clean so
-    paths can be passed directly to ``read_file`` without stripping tags.
-    """
-    _mentioned = mentioned_paths or set()
-    merged: dict[str, Any] = {**(existing_files or {}), **new_files}
-    doc_paths = [
-        p for p, v in merged.items() if p.startswith("/documents/") and v is not None
-    ]
-
-    new_set = set(new_files)
-    mentioned_list = [p for p in doc_paths if p in _mentioned]
-    new_non_mentioned = [p for p in doc_paths if p in new_set and p not in _mentioned]
-    old_paths = [p for p in doc_paths if p not in new_set]
-    ordered = mentioned_list + new_non_mentioned + old_paths
-
-    parts: list[str] = []
-    if mentioned_list:
-        parts.append(
-            "USER-MENTIONED documents (read these thoroughly before answering):"
-        )
-        for p in mentioned_list:
-            parts.append(f"  {p}")
-        parts.append("")
-    parts.append(str(ordered) if ordered else "No documents found.")
-
-    tool_call_id = f"auto_ls_{uuid.uuid4().hex[:12]}"
-    ai_msg = AIMessage(
-        content="",
-        tool_calls=[{"name": "ls", "args": {"path": "/documents"}, "id": tool_call_id}],
-    )
-    tool_msg = ToolMessage(
-        content="\n".join(parts),
-        tool_call_id=tool_call_id,
-    )
-    return ai_msg, tool_msg
+    return resolve_date_range(parsed_start, parsed_end)
 
 
 def _resolve_search_types(
     available_connectors: list[str] | None,
     available_document_types: list[str] | None,
 ) -> list[str] | None:
-    """Build a flat list of document-type strings for the chunk retriever.
-
-    Includes legacy equivalents from ``NATIVE_TO_LEGACY_DOCTYPE`` so that
-    old documents indexed under Composio names are still found.
-
-    Returns ``None`` when no filtering is desired (search all types).
-    """
     types: set[str] = set()
     if available_document_types:
         types.update(available_document_types)
@@ -506,6 +324,124 @@ def _resolve_search_types(
     return list(expanded) if expanded else None
 
 
+_RECENCY_MAX_CHUNKS_PER_DOC = 5
+
+
+async def browse_recent_documents(
+    *,
+    search_space_id: int,
+    document_type: list[str] | None = None,
+    top_k: int = 10,
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Return documents ordered by recency (newest first), no relevance ranking."""
+    from sqlalchemy import func
+
+    from app.db import DocumentType
+
+    async with shielded_async_session() as session:
+        base_conditions = [
+            Document.search_space_id == search_space_id,
+            func.coalesce(Document.status["state"].astext, "ready") != "deleting",
+        ]
+
+        if document_type is not None:
+            import contextlib
+
+            doc_type_enums = []
+            for dt in document_type:
+                if isinstance(dt, str):
+                    with contextlib.suppress(KeyError):
+                        doc_type_enums.append(DocumentType[dt])
+                else:
+                    doc_type_enums.append(dt)
+            if doc_type_enums:
+                if len(doc_type_enums) == 1:
+                    base_conditions.append(Document.document_type == doc_type_enums[0])
+                else:
+                    base_conditions.append(Document.document_type.in_(doc_type_enums))
+
+        if start_date is not None:
+            base_conditions.append(Document.updated_at >= start_date)
+        if end_date is not None:
+            base_conditions.append(Document.updated_at <= end_date)
+
+        doc_query = (
+            select(Document)
+            .where(*base_conditions)
+            .order_by(Document.updated_at.desc())
+            .limit(top_k)
+        )
+        result = await session.execute(doc_query)
+        documents = result.scalars().unique().all()
+
+        if not documents:
+            return []
+
+        doc_ids = [d.id for d in documents]
+        numbered = (
+            select(
+                Chunk.id.label("chunk_id"),
+                Chunk.document_id,
+                Chunk.content,
+                func.row_number()
+                .over(partition_by=Chunk.document_id, order_by=Chunk.id)
+                .label("rn"),
+            )
+            .where(Chunk.document_id.in_(doc_ids))
+            .subquery("numbered")
+        )
+
+        chunk_query = (
+            select(numbered.c.chunk_id, numbered.c.document_id, numbered.c.content)
+            .where(numbered.c.rn <= _RECENCY_MAX_CHUNKS_PER_DOC)
+            .order_by(numbered.c.document_id, numbered.c.chunk_id)
+        )
+        chunk_result = await session.execute(chunk_query)
+        fetched_chunks = chunk_result.all()
+
+    doc_chunks: dict[int, list[dict[str, Any]]] = {d.id: [] for d in documents}
+    for row in fetched_chunks:
+        if row.document_id in doc_chunks:
+            doc_chunks[row.document_id].append(
+                {"chunk_id": row.chunk_id, "content": row.content}
+            )
+
+    results: list[dict[str, Any]] = []
+    for doc in documents:
+        chunks_list = doc_chunks.get(doc.id, [])
+        metadata = doc.document_metadata or {}
+        results.append(
+            {
+                "document_id": doc.id,
+                "content": "\n\n".join(
+                    c["content"] for c in chunks_list if c.get("content")
+                ),
+                "score": 0.0,
+                "chunks": chunks_list,
+                "matched_chunk_ids": [],
+                "document": {
+                    "id": doc.id,
+                    "title": doc.title,
+                    "document_type": (
+                        doc.document_type.value
+                        if getattr(doc, "document_type", None)
+                        else None
+                    ),
+                    "metadata": metadata,
+                    "folder_id": getattr(doc, "folder_id", None),
+                },
+                "source": (
+                    doc.document_type.value
+                    if getattr(doc, "document_type", None)
+                    else None
+                ),
+            }
+        )
+    return results
+
+
 async def search_knowledge_base(
     *,
     query: str,
@@ -516,17 +452,11 @@ async def search_knowledge_base(
     start_date: datetime | None = None,
     end_date: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    """Run a single unified hybrid search against the knowledge base.
-
-    Uses one ``ChucksHybridSearchRetriever`` call across all document types
-    instead of fanning out per-connector.  This reduces the number of DB
-    queries from ~10 to 2 (one RRF query + one chunk fetch).
-    """
+    """Run a single unified hybrid search against the knowledge base."""
     if not query:
         return []
 
     [embedding] = embed_texts([query])
-
     doc_types = _resolve_search_types(available_connectors, available_document_types)
     retriever_top_k = min(top_k * 3, 30)
 
@@ -550,14 +480,7 @@ async def fetch_mentioned_documents(
     document_ids: list[int],
     search_space_id: int,
 ) -> list[dict[str, Any]]:
-    """Fetch explicitly mentioned documents with *all* their chunks.
-
-    Returns the same dict structure as ``search_knowledge_base`` so results
-    can be merged directly into ``build_scoped_filesystem``.  Unlike search
-    results, every chunk is included (no top-K limiting) and none are marked
-    as ``matched`` since the entire document is relevant by virtue of the
-    user's explicit mention.
-    """
+    """Fetch explicitly mentioned documents."""
     if not document_ids:
         return []
 
@@ -607,6 +530,7 @@ async def fetch_mentioned_documents(
                         else None
                     ),
                     "metadata": metadata,
+                    "folder_id": getattr(doc, "folder_id", None),
                 },
                 "source": (
                     doc.document_type.value
@@ -619,74 +543,43 @@ async def fetch_mentioned_documents(
     return results
 
 
-async def build_scoped_filesystem(
-    *,
-    documents: Sequence[dict[str, Any]],
-    search_space_id: int,
-) -> tuple[dict[str, dict[str, str]], dict[int, str]]:
-    """Build a StateBackend-compatible files dict from search results.
-
-    Returns ``(files, doc_id_to_path)`` so callers can reliably map a
-    document id back to its filesystem path without guessing by title.
-    Paths are collision-proof: when two documents resolve to the same
-    path the doc-id is appended to disambiguate.
-    """
-    async with shielded_async_session() as session:
-        folder_paths = await _get_folder_paths(session, search_space_id)
-        doc_ids = [
-            (doc.get("document") or {}).get("id")
-            for doc in documents
-            if isinstance(doc, dict)
-        ]
-        doc_ids = [doc_id for doc_id in doc_ids if isinstance(doc_id, int)]
-        folder_by_doc_id: dict[int, int | None] = {}
-        if doc_ids:
-            doc_rows = await session.execute(
-                select(Document.id, Document.folder_id).where(
-                    Document.search_space_id == search_space_id,
-                    Document.id.in_(doc_ids),
-                )
-            )
-            folder_by_doc_id = {
-                row.id: row.folder_id for row in doc_rows.all() if row.id is not None
-            }
-
-    files: dict[str, dict[str, str]] = {}
-    doc_id_to_path: dict[int, str] = {}
-    for document in documents:
-        doc_meta = document.get("document") or {}
-        title = str(doc_meta.get("title") or "untitled")
-        doc_id = doc_meta.get("id")
-        folder_id = folder_by_doc_id.get(doc_id) if isinstance(doc_id, int) else None
-        base_folder = folder_paths.get(folder_id, "/documents")
-        file_name = _safe_filename(title)
-        path = f"{base_folder}/{file_name}"
-        if path in files:
-            stem = file_name.removesuffix(".xml")
-            path = f"{base_folder}/{stem} ({doc_id}).xml"
-        matched_ids = set(document.get("matched_chunk_ids") or [])
-        xml_content = _build_document_xml(document, matched_chunk_ids=matched_ids)
-        files[path] = {
-            "content": xml_content.split("\n"),
-            "encoding": "utf-8",
-            "created_at": "",
-            "modified_at": "",
-        }
-        if isinstance(doc_id, int):
-            doc_id_to_path[doc_id] = path
-    return files, doc_id_to_path
+def _render_priority_message(priority: list[dict[str, Any]]) -> SystemMessage:
+    """Render the priority list as a single ``<priority_documents>`` system message."""
+    if not priority:
+        body = "(no priority documents for this turn)"
+    else:
+        lines: list[str] = []
+        for entry in priority:
+            score = entry.get("score")
+            mentioned = entry.get("mentioned")
+            score_str = f"{score:.3f}" if isinstance(score, int | float) else "n/a"
+            mark = " [USER-MENTIONED]" if mentioned else ""
+            lines.append(f"- {entry.get('path', '')} (score={score_str}){mark}")
+        body = "\n".join(lines)
+    return SystemMessage(
+        content=(
+            "<priority_documents>\n"
+            "These documents are most relevant to the latest user message; "
+            "read them first. Matched sections are flagged inside each "
+            "document's <chunk_index>.\n"
+            f"{body}\n"
+            "</priority_documents>"
+        )
+    )
 
 
-class KnowledgeBaseSearchMiddleware(AgentMiddleware):  # type: ignore[type-arg]
-    """Pre-agent middleware that always searches the KB and seeds a scoped filesystem."""
+class KnowledgePriorityMiddleware(AgentMiddleware):  # type: ignore[type-arg]
+    """Compute hybrid-search priority hints for the current turn."""
 
     tools = ()
+    state_schema = SurfSenseFilesystemState
 
     def __init__(
         self,
         *,
         llm: BaseChatModel | None = None,
         search_space_id: int,
+        filesystem_mode: FilesystemMode = FilesystemMode.CLOUD,
         available_connectors: list[str] | None = None,
         available_document_types: list[str] | None = None,
         top_k: int = 10,
@@ -694,20 +587,65 @@ class KnowledgeBaseSearchMiddleware(AgentMiddleware):  # type: ignore[type-arg]
     ) -> None:
         self.llm = llm
         self.search_space_id = search_space_id
+        self.filesystem_mode = filesystem_mode
         self.available_connectors = available_connectors
         self.available_document_types = available_document_types
         self.top_k = top_k
         self.mentioned_document_ids = mentioned_document_ids or []
+        # Build the kb-planner private Runnable ONCE here so we don't pay
+        # the ``create_agent`` compile cost (50-200ms) on every turn.
+        # Disabled by default behind ``enable_kb_planner_runnable``; when
+        # off the planner falls back to the legacy ``self.llm.ainvoke``
+        # path.
+        self._planner: Runnable | None = None
+        self._planner_compile_failed = False
+
+    def _build_kb_planner_runnable(self) -> Runnable | None:
+        """Compile the kb-planner private :class:`Runnable` once.
+
+        Returns ``None`` when the feature flag is disabled, when the LLM is
+        unavailable, or when ``create_agent`` raises (we fall back to the
+        legacy ``self.llm.ainvoke`` path in that case). Compilation happens
+        lazily on first call, then memoized via ``self._planner``.
+
+        The compiled agent is constructed without tools — the planner's
+        contract is "answer with structured JSON" — but it inherits the
+        :class:`RetryAfterMiddleware` so transient rate-limit errors
+        from the planner LLM call don't fail the whole turn.
+        """
+        if self._planner is not None or self._planner_compile_failed:
+            return self._planner
+        if self.llm is None:
+            return None
+        flags = get_flags()
+        if not flags.enable_kb_planner_runnable or flags.disable_new_agent_stack:
+            return None
+
+        from app.agents.new_chat.middleware.retry_after import RetryAfterMiddleware
+
+        try:
+            self._planner = create_agent(
+                self.llm,
+                tools=[],
+                middleware=[RetryAfterMiddleware(max_retries=2)],
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "kb-planner Runnable compile failed; falling back to llm.ainvoke: %s",
+                exc,
+            )
+            self._planner_compile_failed = True
+            self._planner = None
+        return self._planner
 
     async def _plan_search_inputs(
         self,
         *,
         messages: Sequence[BaseMessage],
         user_text: str,
-    ) -> tuple[str, datetime | None, datetime | None]:
-        """Rewrite the KB query and infer optional date filters with the LLM."""
+    ) -> tuple[str, datetime | None, datetime | None, bool]:
         if self.llm is None:
-            return user_text, None, None
+            return user_text, None, None, False
 
         recent_conversation = _render_recent_conversation(
             messages,
@@ -721,11 +659,32 @@ class KnowledgeBaseSearchMiddleware(AgentMiddleware):  # type: ignore[type-arg]
         loop = asyncio.get_running_loop()
         t0 = loop.time()
 
+        # Prefer the compiled-once planner Runnable when enabled; otherwise
+        # fall back to ``self.llm.ainvoke``. The ``surfsense:internal`` tag
+        # is preserved on both paths so ``_stream_agent_events`` still
+        # suppresses the planner's intermediate events from the UI.
+        planner = self._build_kb_planner_runnable()
         try:
-            response = await self.llm.ainvoke(
-                [HumanMessage(content=prompt)],
-                config={"tags": ["surfsense:internal"]},
-            )
+            if planner is not None:
+                planner_state = await planner.ainvoke(
+                    {"messages": [HumanMessage(content=prompt)]},
+                    config={"tags": ["surfsense:internal"]},
+                )
+                response_messages = (
+                    planner_state.get("messages", [])
+                    if isinstance(planner_state, dict)
+                    else []
+                )
+                response = (
+                    response_messages[-1]
+                    if response_messages
+                    else AIMessage(content="")
+                )
+            else:
+                response = await self.llm.ainvoke(
+                    [HumanMessage(content=prompt)],
+                    config={"tags": ["surfsense:internal"]},
+                )
             plan = _parse_kb_search_plan_response(_extract_text_from_message(response))
             optimized_query = (
                 re.sub(r"\s+", " ", plan.optimized_query).strip() or user_text
@@ -734,15 +693,18 @@ class KnowledgeBaseSearchMiddleware(AgentMiddleware):  # type: ignore[type-arg]
                 plan.start_date,
                 plan.end_date,
             )
+            is_recency = plan.is_recency_query
             _perf_log.info(
-                "[kb_fs_middleware] planner in %.3fs query=%r optimized=%r start=%s end=%s",
+                "[kb_priority] planner in %.3fs query=%r optimized=%r "
+                "start=%s end=%s recency=%s",
                 loop.time() - t0,
                 user_text[:80],
                 optimized_query[:120],
                 start_date.isoformat() if start_date else None,
                 end_date.isoformat() if end_date else None,
+                is_recency,
             )
-            return optimized_query, start_date, end_date
+            return optimized_query, start_date, end_date, is_recency
         except (json.JSONDecodeError, ValidationError, ValueError) as exc:
             logger.warning(
                 "KB planner returned invalid output, using raw query: %s", exc
@@ -750,7 +712,7 @@ class KnowledgeBaseSearchMiddleware(AgentMiddleware):  # type: ignore[type-arg]
         except Exception as exc:  # pragma: no cover - defensive fallback
             logger.warning("KB planner failed, using raw query: %s", exc)
 
-        return user_text, None, None
+        return user_text, None, None, False
 
     def before_agent(  # type: ignore[override]
         self,
@@ -770,91 +732,237 @@ class KnowledgeBaseSearchMiddleware(AgentMiddleware):  # type: ignore[type-arg]
         state: AgentState,
         runtime: Runtime[Any],
     ) -> dict[str, Any] | None:
-        del runtime
+        if self.filesystem_mode != FilesystemMode.CLOUD:
+            return None
+
         messages = state.get("messages") or []
         if not messages:
             return None
-        last_message = messages[-1]
-        if not isinstance(last_message, HumanMessage):
-            return None
 
-        user_text = _extract_text_from_message(last_message).strip()
+        last_human: HumanMessage | None = None
+        for msg in reversed(messages):
+            if isinstance(msg, HumanMessage):
+                last_human = msg
+                break
+        if last_human is None:
+            return None
+        user_text = _extract_text_from_message(last_human).strip()
         if not user_text:
             return None
 
-        t0 = _perf_log and asyncio.get_event_loop().time()
-        existing_files = state.get("files")
-        planned_query, start_date, end_date = await self._plan_search_inputs(
+        anon_doc = state.get("kb_anon_doc")
+        if anon_doc:
+            return self._anon_priority(state, anon_doc)
+
+        return await self._authenticated_priority(state, messages, user_text, runtime)
+
+    def _anon_priority(
+        self,
+        state: AgentState,
+        anon_doc: dict[str, Any],
+    ) -> dict[str, Any]:
+        path = str(anon_doc.get("path") or "")
+        title = str(anon_doc.get("title") or "uploaded_document")
+        priority = [
+            {
+                "path": path,
+                "score": 1.0,
+                "document_id": None,
+                "title": title,
+                "mentioned": True,
+            }
+        ]
+        new_messages = list(state.get("messages") or [])
+        insert_at = max(len(new_messages) - 1, 0)
+        new_messages.insert(insert_at, _render_priority_message(priority))
+        return {
+            "kb_priority": priority,
+            "kb_matched_chunk_ids": {},
+            "messages": new_messages,
+        }
+
+    async def _authenticated_priority(
+        self,
+        state: AgentState,
+        messages: Sequence[BaseMessage],
+        user_text: str,
+        runtime: Runtime[Any] | None = None,
+    ) -> dict[str, Any]:
+        t0 = asyncio.get_event_loop().time()
+        (
+            planned_query,
+            start_date,
+            end_date,
+            is_recency,
+        ) = await self._plan_search_inputs(
             messages=messages,
             user_text=user_text,
         )
 
-        # --- 1. Fetch mentioned documents (user-selected, all chunks) ---
-        mentioned_results: list[dict[str, Any]] = []
-        if self.mentioned_document_ids:
-            mentioned_results = await fetch_mentioned_documents(
-                document_ids=self.mentioned_document_ids,
-                search_space_id=self.search_space_id,
-            )
-            # Clear after first turn so they are not re-fetched on subsequent
-            # messages within the same agent instance.
+        # Per-turn ``mentioned_document_ids`` flow:
+        # 1. Preferred path (Phase 1.5+): read from ``runtime.context`` — the
+        #    streaming task supplies a fresh :class:`SurfSenseContextSchema`
+        #    on every ``astream_events`` call, so this list is naturally
+        #    scoped to the current turn. Allows cross-turn graph reuse via
+        #    ``agent_cache``.
+        # 2. Legacy fallback (cache disabled / context not propagated): the
+        #    constructor-injected ``self.mentioned_document_ids`` list. We
+        #    drain it after the first read so a cached graph (no Phase 1.5
+        #    wiring) doesn't keep replaying the same mentions on every
+        #    turn.
+        #
+        # CRITICAL: distinguish "context absent" (legacy caller, no field at
+        # all) from "context provided but empty" (turn with no mentions).
+        # ``ctx_mentions`` is a ``list[int]``; an empty list is falsy in
+        # Python, so a naive ``if ctx_mentions:`` would fall through to the
+        # legacy closure on every no-mention follow-up turn — replaying the
+        # mentions baked in by turn 1's cache-miss build. Always drain the
+        # closure once the runtime path has fired so a cached middleware
+        # instance can never resurrect stale state.
+        mention_ids: list[int] = []
+        ctx = getattr(runtime, "context", None) if runtime is not None else None
+        ctx_mentions = getattr(ctx, "mentioned_document_ids", None) if ctx else None
+        if ctx_mentions is not None:
+            # Runtime path is authoritative — even an empty list means
+            # "this turn has no mentions", NOT "look at the closure".
+            mention_ids = list(ctx_mentions)
+            if self.mentioned_document_ids:
+                self.mentioned_document_ids = []
+        elif self.mentioned_document_ids:
+            mention_ids = list(self.mentioned_document_ids)
             self.mentioned_document_ids = []
 
-        # --- 2. Run KB hybrid search ---
-        search_results = await search_knowledge_base(
-            query=planned_query,
-            search_space_id=self.search_space_id,
-            available_connectors=self.available_connectors,
-            available_document_types=self.available_document_types,
-            top_k=self.top_k,
-            start_date=start_date,
-            end_date=end_date,
-        )
+        mentioned_results: list[dict[str, Any]] = []
+        if mention_ids:
+            mentioned_results = await fetch_mentioned_documents(
+                document_ids=mention_ids,
+                search_space_id=self.search_space_id,
+            )
 
-        # --- 3. Merge: mentioned first, then search (dedup by doc id) ---
+        if is_recency:
+            doc_types = _resolve_search_types(
+                self.available_connectors, self.available_document_types
+            )
+            search_results = await browse_recent_documents(
+                search_space_id=self.search_space_id,
+                document_type=doc_types,
+                top_k=self.top_k,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        else:
+            search_results = await search_knowledge_base(
+                query=planned_query,
+                search_space_id=self.search_space_id,
+                available_connectors=self.available_connectors,
+                available_document_types=self.available_document_types,
+                top_k=self.top_k,
+                start_date=start_date,
+                end_date=end_date,
+            )
+
         seen_doc_ids: set[int] = set()
         merged: list[dict[str, Any]] = []
         for doc in mentioned_results:
             doc_id = (doc.get("document") or {}).get("id")
-            if doc_id is not None:
+            if isinstance(doc_id, int):
                 seen_doc_ids.add(doc_id)
             merged.append(doc)
         for doc in search_results:
             doc_id = (doc.get("document") or {}).get("id")
-            if doc_id is not None and doc_id in seen_doc_ids:
+            if isinstance(doc_id, int) and doc_id in seen_doc_ids:
                 continue
             merged.append(doc)
 
-        # --- 4. Build scoped filesystem ---
-        new_files, doc_id_to_path = await build_scoped_filesystem(
-            documents=merged,
-            search_space_id=self.search_space_id,
+        priority, matched_chunk_ids = await self._materialize_priority(merged)
+
+        new_messages = list(messages)
+        insert_at = max(len(new_messages) - 1, 0)
+        new_messages.insert(insert_at, _render_priority_message(priority))
+
+        _perf_log.info(
+            "[kb_priority] completed in %.3fs query=%r priority=%d mentioned=%d",
+            asyncio.get_event_loop().time() - t0,
+            user_text[:80],
+            len(priority),
+            len(mentioned_results),
         )
 
-        # Identify which paths belong to user-mentioned documents using
-        # the authoritative doc_id -> path mapping (no title guessing).
-        mentioned_doc_ids = {
-            (d.get("document") or {}).get("id") for d in mentioned_results
-        }
-        mentioned_paths = {
-            doc_id_to_path[did] for did in mentioned_doc_ids if did in doc_id_to_path
+        return {
+            "kb_priority": priority,
+            "kb_matched_chunk_ids": matched_chunk_ids,
+            "messages": new_messages,
         }
 
-        ai_msg, tool_msg = _build_synthetic_ls(
-            existing_files,
-            new_files,
-            mentioned_paths=mentioned_paths,
-        )
+    async def _materialize_priority(
+        self, merged: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], dict[int, list[int]]]:
+        """Resolve canonical paths and matched chunk ids for the priority list."""
+        priority: list[dict[str, Any]] = []
+        matched_chunk_ids: dict[int, list[int]] = {}
 
-        if t0 is not None:
-            _perf_log.info(
-                "[kb_fs_middleware] completed in %.3fs query=%r optimized=%r "
-                "mentioned=%d new_files=%d total=%d",
-                asyncio.get_event_loop().time() - t0,
-                user_text[:80],
-                planned_query[:120],
-                len(mentioned_results),
-                len(new_files),
-                len(new_files) + len(existing_files or {}),
+        if not merged:
+            return priority, matched_chunk_ids
+
+        async with shielded_async_session() as session:
+            index: PathIndex = await build_path_index(session, self.search_space_id)
+            doc_ids = [
+                (doc.get("document") or {}).get("id")
+                for doc in merged
+                if isinstance(doc, dict)
+            ]
+            doc_ids = [doc_id for doc_id in doc_ids if isinstance(doc_id, int)]
+            folder_by_doc_id: dict[int, int | None] = {}
+            if doc_ids:
+                folder_rows = await session.execute(
+                    select(Document.id, Document.folder_id).where(
+                        Document.search_space_id == self.search_space_id,
+                        Document.id.in_(doc_ids),
+                    )
+                )
+                folder_by_doc_id = {row.id: row.folder_id for row in folder_rows.all()}
+
+        for doc in merged:
+            doc_meta = doc.get("document") or {}
+            doc_id = doc_meta.get("id")
+            title = doc_meta.get("title") or "untitled"
+            folder_id = (
+                folder_by_doc_id.get(doc_id)
+                if isinstance(doc_id, int)
+                else doc_meta.get("folder_id")
             )
-        return {"files": new_files, "messages": [ai_msg, tool_msg]}
+            path = doc_to_virtual_path(
+                doc_id=doc_id if isinstance(doc_id, int) else None,
+                title=str(title),
+                folder_id=folder_id if isinstance(folder_id, int) else None,
+                index=index,
+            )
+            priority.append(
+                {
+                    "path": path,
+                    "score": float(doc.get("score") or 0.0),
+                    "document_id": doc_id if isinstance(doc_id, int) else None,
+                    "title": str(title),
+                    "mentioned": bool(doc.get("_user_mentioned")),
+                }
+            )
+            if isinstance(doc_id, int):
+                chunk_ids = doc.get("matched_chunk_ids") or []
+                if chunk_ids:
+                    matched_chunk_ids[doc_id] = [
+                        int(cid) for cid in chunk_ids if isinstance(cid, int | str)
+                    ]
+        return priority, matched_chunk_ids
+
+
+# Backwards-compatible alias for any external imports.
+KnowledgeBaseSearchMiddleware = KnowledgePriorityMiddleware
+
+
+__all__ = [
+    "KnowledgeBaseSearchMiddleware",
+    "KnowledgePriorityMiddleware",
+    "browse_recent_documents",
+    "fetch_mentioned_documents",
+    "search_knowledge_base",
+]

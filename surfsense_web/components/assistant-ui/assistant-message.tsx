@@ -1,4 +1,5 @@
 import {
+	ActionBarMorePrimitive,
 	ActionBarPrimitive,
 	AuiIf,
 	ErrorPrimitive,
@@ -14,24 +15,38 @@ import {
 	DownloadIcon,
 	ExternalLink,
 	Globe,
-	MessageSquare,
+	MessageCircleReply,
+	MoreHorizontalIcon,
 	RefreshCwIcon,
 } from "lucide-react";
 import dynamic from "next/dynamic";
 import type { FC } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { commentsEnabledAtom, targetCommentIdAtom } from "@/atoms/chat/current-thread.atom";
+import {
+	globalNewLLMConfigsAtom,
+	newLLMConfigsAtom,
+} from "@/atoms/new-llm-config/new-llm-config-query.atoms";
 import { activeSearchSpaceIdAtom } from "@/atoms/search-spaces/search-space-query.atoms";
 import {
 	CitationMetadataProvider,
 	useAllCitationMetadata,
 } from "@/components/assistant-ui/citation-metadata-context";
 import { MarkdownText } from "@/components/assistant-ui/markdown-text";
+import { ReasoningMessagePart } from "@/components/assistant-ui/reasoning-message-part";
+import { RevertTurnButton } from "@/components/assistant-ui/revert-turn-button";
+import { useTokenUsage } from "@/components/assistant-ui/token-usage-context";
 import { ToolFallback } from "@/components/assistant-ui/tool-fallback";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import { CommentPanelContainer } from "@/components/chat-comments/comment-panel-container/comment-panel-container";
 import { CommentSheet } from "@/components/chat-comments/comment-sheet/comment-sheet";
+import { withBundleStep } from "@/components/hitl-bundle-pager";
 import type { SerializableCitation } from "@/components/tool-ui/citation";
+import {
+	openSafeNavigationHref,
+	resolveSafeNavigationHref,
+} from "@/components/tool-ui/shared/media";
+import { Button } from "@/components/ui/button";
 import {
 	Drawer,
 	DrawerContent,
@@ -39,9 +54,11 @@ import {
 	DrawerHeader,
 	DrawerTitle,
 } from "@/components/ui/drawer";
+import { DropdownMenuLabel } from "@/components/ui/dropdown-menu";
 import { useComments } from "@/hooks/use-comments";
 import { useMediaQuery } from "@/hooks/use-media-query";
 import { useElectronAPI } from "@/hooks/use-platform";
+import { getProviderIcon } from "@/lib/provider-icons";
 import { cn } from "@/lib/utils";
 
 // Captured once at module load — survives client-side navigations that strip the query param.
@@ -54,6 +71,13 @@ const GenerateReportToolUI = dynamic(
 	() =>
 		import("@/components/tool-ui/generate-report").then((m) => ({
 			default: m.GenerateReportToolUI,
+		})),
+	{ ssr: false }
+);
+const GenerateResumeToolUI = dynamic(
+	() =>
+		import("@/components/tool-ui/generate-resume").then((m) => ({
+			default: m.GenerateResumeToolUI,
 		})),
 	{ ssr: false }
 );
@@ -76,12 +100,8 @@ const GenerateImageToolUI = dynamic(
 		import("@/components/tool-ui/generate-image").then((m) => ({ default: m.GenerateImageToolUI })),
 	{ ssr: false }
 );
-const SaveMemoryToolUI = dynamic(
-	() => import("@/components/tool-ui/user-memory").then((m) => ({ default: m.SaveMemoryToolUI })),
-	{ ssr: false }
-);
-const RecallMemoryToolUI = dynamic(
-	() => import("@/components/tool-ui/user-memory").then((m) => ({ default: m.RecallMemoryToolUI })),
+const UpdateMemoryToolUI = dynamic(
+	() => import("@/components/tool-ui/user-memory").then((m) => ({ default: m.UpdateMemoryToolUI })),
 	{ ssr: false }
 );
 const SandboxExecuteToolUI = dynamic(
@@ -370,6 +390,164 @@ export const MessageError: FC = () => {
 	);
 };
 
+function formatMessageDate(date: Date): string {
+	return date.toLocaleDateString(undefined, {
+		month: "short",
+		day: "numeric",
+		hour: "numeric",
+		minute: "2-digit",
+		hour12: true,
+	});
+}
+
+/**
+ * Format provider USD cost (in micro-USD) for inline display next to a
+ * token count. Falls back to ``"<$0.001"`` for sub-tenth-of-a-cent
+ * costs so a real-but-tiny figure doesn't render as ``$0.000``.
+ */
+function formatTurnCost(micros: number): string {
+	const dollars = micros / 1_000_000;
+	if (dollars >= 1) return `$${dollars.toFixed(2)}`;
+	if (dollars >= 0.01) return `$${dollars.toFixed(3)}`;
+	if (dollars > 0) return "<$0.001";
+	return "$0";
+}
+
+const MessageInfoDropdown: FC = () => {
+	const messageId = useAuiState(({ message }) => message?.id);
+	const createdAt = useAuiState(({ message }) => message?.createdAt);
+	const usage = useTokenUsage(messageId);
+
+	const { data: localConfigs } = useAtomValue(newLLMConfigsAtom);
+	const { data: globalConfigs } = useAtomValue(globalNewLLMConfigsAtom);
+
+	const configByModel = useMemo(() => {
+		const map = new Map<string, { name: string; provider: string }>();
+		for (const c of [...(globalConfigs ?? []), ...(localConfigs ?? [])]) {
+			map.set(c.model_name, { name: c.name, provider: c.provider });
+		}
+		return map;
+	}, [localConfigs, globalConfigs]);
+
+	const resolveModel = (modelKey: string) => {
+		const parts = modelKey.split("/");
+		const bare = parts[parts.length - 1] ?? modelKey;
+		const config = configByModel.get(modelKey) ?? configByModel.get(bare);
+		return config
+			? { name: config.name, icon: getProviderIcon(config.provider, { className: "size-3.5" }) }
+			: { name: modelKey, icon: null };
+	};
+
+	const modelBreakdown = usage ? (usage.usage ?? usage.model_breakdown) : undefined;
+	const models = modelBreakdown ? Object.entries(modelBreakdown) : [];
+	const hasUsage = usage && usage.total_tokens > 0;
+
+	return (
+		<ActionBarMorePrimitive.Root>
+			<ActionBarMorePrimitive.Trigger asChild>
+				<Button variant="ghost" size="icon" className="aui-button-icon size-6 p-1">
+					<MoreHorizontalIcon className="size-4" />
+					<span className="sr-only">More</span>
+				</Button>
+			</ActionBarMorePrimitive.Trigger>
+			<ActionBarMorePrimitive.Content
+				align="start"
+				className="bg-muted text-popover-foreground z-50 max-h-(--radix-dropdown-menu-content-available-height) min-w-[180px] origin-(--radix-dropdown-menu-content-transform-origin) overflow-x-hidden overflow-y-auto rounded-md border dark:border-neutral-700 p-1 shadow-md data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2"
+			>
+				{createdAt && (
+					<DropdownMenuLabel className="text-xs text-muted-foreground font-normal select-none">
+						{formatMessageDate(createdAt)}
+					</DropdownMenuLabel>
+				)}
+				{hasUsage && (
+					<>
+						<ActionBarMorePrimitive.Separator className="bg-border mx-2 my-1 h-px" />
+						{models.length > 0 ? (
+							models.map(([model, counts]) => {
+								const { name, icon } = resolveModel(model);
+								const costMicros = counts.cost_micros;
+								return (
+									<ActionBarMorePrimitive.Item
+										key={model}
+										className="focus:bg-neutral-200 dark:focus:bg-neutral-700 relative flex cursor-default flex-col items-start gap-0.5 rounded-sm px-2 py-1.5 text-sm outline-hidden select-none"
+										onSelect={(e) => e.preventDefault()}
+									>
+										<span className="flex items-center gap-1.5 text-xs font-medium">
+											{icon}
+											{name}
+										</span>
+										<span className="text-xs text-muted-foreground">
+											{counts.total_tokens.toLocaleString()} tokens
+											{costMicros && costMicros > 0 ? ` · ${formatTurnCost(costMicros)}` : ""}
+										</span>
+									</ActionBarMorePrimitive.Item>
+								);
+							})
+						) : (
+							<ActionBarMorePrimitive.Item
+								className="focus:bg-neutral-200 dark:focus:bg-neutral-700 relative flex cursor-default flex-col items-start gap-0.5 rounded-sm px-2 py-1.5 text-sm outline-hidden select-none"
+								onSelect={(e) => e.preventDefault()}
+							>
+								<span className="text-xs text-muted-foreground">
+									{usage.total_tokens.toLocaleString()} tokens
+									{usage.cost_micros && usage.cost_micros > 0
+										? ` · ${formatTurnCost(usage.cost_micros)}`
+										: ""}
+								</span>
+							</ActionBarMorePrimitive.Item>
+						)}
+					</>
+				)}
+			</ActionBarMorePrimitive.Content>
+		</ActionBarMorePrimitive.Root>
+	);
+};
+
+// Wrap each tool-ui card with ``withBundleStep`` so multi-card HITL bundles
+// page through them and stage decisions instead of firing one resume per card.
+const TOOLS_BY_NAME = {
+	generate_report: withBundleStep(GenerateReportToolUI),
+	generate_resume: withBundleStep(GenerateResumeToolUI),
+	generate_podcast: withBundleStep(GeneratePodcastToolUI),
+	generate_video_presentation: withBundleStep(GenerateVideoPresentationToolUI),
+	display_image: withBundleStep(GenerateImageToolUI),
+	generate_image: withBundleStep(GenerateImageToolUI),
+	update_memory: withBundleStep(UpdateMemoryToolUI),
+	execute: withBundleStep(SandboxExecuteToolUI),
+	execute_code: withBundleStep(SandboxExecuteToolUI),
+	create_notion_page: withBundleStep(CreateNotionPageToolUI),
+	update_notion_page: withBundleStep(UpdateNotionPageToolUI),
+	delete_notion_page: withBundleStep(DeleteNotionPageToolUI),
+	create_linear_issue: withBundleStep(CreateLinearIssueToolUI),
+	update_linear_issue: withBundleStep(UpdateLinearIssueToolUI),
+	delete_linear_issue: withBundleStep(DeleteLinearIssueToolUI),
+	create_google_drive_file: withBundleStep(CreateGoogleDriveFileToolUI),
+	delete_google_drive_file: withBundleStep(DeleteGoogleDriveFileToolUI),
+	create_onedrive_file: withBundleStep(CreateOneDriveFileToolUI),
+	delete_onedrive_file: withBundleStep(DeleteOneDriveFileToolUI),
+	create_dropbox_file: withBundleStep(CreateDropboxFileToolUI),
+	delete_dropbox_file: withBundleStep(DeleteDropboxFileToolUI),
+	create_calendar_event: withBundleStep(CreateCalendarEventToolUI),
+	update_calendar_event: withBundleStep(UpdateCalendarEventToolUI),
+	delete_calendar_event: withBundleStep(DeleteCalendarEventToolUI),
+	create_gmail_draft: withBundleStep(CreateGmailDraftToolUI),
+	update_gmail_draft: withBundleStep(UpdateGmailDraftToolUI),
+	send_gmail_email: withBundleStep(SendGmailEmailToolUI),
+	trash_gmail_email: withBundleStep(TrashGmailEmailToolUI),
+	create_jira_issue: withBundleStep(CreateJiraIssueToolUI),
+	update_jira_issue: withBundleStep(UpdateJiraIssueToolUI),
+	delete_jira_issue: withBundleStep(DeleteJiraIssueToolUI),
+	create_confluence_page: withBundleStep(CreateConfluencePageToolUI),
+	update_confluence_page: withBundleStep(UpdateConfluencePageToolUI),
+	delete_confluence_page: withBundleStep(DeleteConfluencePageToolUI),
+	web_search: () => null,
+	link_preview: () => null,
+	multi_link_preview: () => null,
+	scrape_webpage: () => null,
+} as const;
+
+const TOOLS_FALLBACK = withBundleStep(ToolFallback);
+
 const AssistantMessageInner: FC = () => {
 	const isMobile = !useMediaQuery("(min-width: 768px)");
 
@@ -379,47 +557,10 @@ const AssistantMessageInner: FC = () => {
 				<MessagePrimitive.Parts
 					components={{
 						Text: MarkdownText,
+						Reasoning: ReasoningMessagePart,
 						tools: {
-							by_name: {
-								generate_report: GenerateReportToolUI,
-								generate_podcast: GeneratePodcastToolUI,
-								generate_video_presentation: GenerateVideoPresentationToolUI,
-								display_image: GenerateImageToolUI,
-								generate_image: GenerateImageToolUI,
-								save_memory: SaveMemoryToolUI,
-								recall_memory: RecallMemoryToolUI,
-								execute: SandboxExecuteToolUI,
-								create_notion_page: CreateNotionPageToolUI,
-								update_notion_page: UpdateNotionPageToolUI,
-								delete_notion_page: DeleteNotionPageToolUI,
-								create_linear_issue: CreateLinearIssueToolUI,
-								update_linear_issue: UpdateLinearIssueToolUI,
-								delete_linear_issue: DeleteLinearIssueToolUI,
-								create_google_drive_file: CreateGoogleDriveFileToolUI,
-								delete_google_drive_file: DeleteGoogleDriveFileToolUI,
-								create_onedrive_file: CreateOneDriveFileToolUI,
-								delete_onedrive_file: DeleteOneDriveFileToolUI,
-								create_dropbox_file: CreateDropboxFileToolUI,
-								delete_dropbox_file: DeleteDropboxFileToolUI,
-								create_calendar_event: CreateCalendarEventToolUI,
-								update_calendar_event: UpdateCalendarEventToolUI,
-								delete_calendar_event: DeleteCalendarEventToolUI,
-								create_gmail_draft: CreateGmailDraftToolUI,
-								update_gmail_draft: UpdateGmailDraftToolUI,
-								send_gmail_email: SendGmailEmailToolUI,
-								trash_gmail_email: TrashGmailEmailToolUI,
-								create_jira_issue: CreateJiraIssueToolUI,
-								update_jira_issue: UpdateJiraIssueToolUI,
-								delete_jira_issue: DeleteJiraIssueToolUI,
-								create_confluence_page: CreateConfluencePageToolUI,
-								update_confluence_page: UpdateConfluencePageToolUI,
-								delete_confluence_page: DeleteConfluencePageToolUI,
-								web_search: () => null,
-								link_preview: () => null,
-								multi_link_preview: () => null,
-								scrape_webpage: () => null,
-							},
-							Fallback: ToolFallback,
+							by_name: TOOLS_BY_NAME,
+							Fallback: TOOLS_FALLBACK,
 						},
 					}}
 				/>
@@ -432,8 +573,10 @@ const AssistantMessageInner: FC = () => {
 				</div>
 			)}
 
-			<div className="aui-assistant-message-footer mt-1 mb-5 ml-2 flex">
-				<AssistantActionBar />
+			<div className="aui-assistant-message-footer mt-3 mb-5 ml-2 h-6">
+				<div className="h-full opacity-100 transition-opacity">
+					<AssistantActionBar />
+				</div>
 			</div>
 		</CitationMetadataProvider>
 	);
@@ -526,35 +669,41 @@ export const AssistantMessage: FC = () => {
 			className="aui-assistant-message-root group fade-in slide-in-from-bottom-1 relative mx-auto w-full max-w-(--thread-max-width) animate-in py-3 duration-150"
 			data-role="assistant"
 		>
-			{/* Comment trigger — right-aligned, just below user query on all screen sizes */}
-			{showCommentTrigger && (
-				<div className="mr-2 mb-1 flex justify-end">
-					<button
-						ref={isDesktop ? commentTriggerRef : undefined}
-						type="button"
-						onClick={
-							isDesktop ? () => setIsInlineOpen((prev) => !prev) : () => setIsSheetOpen(true)
-						}
-						className={cn(
-							"flex items-center gap-1.5 rounded-full px-3 py-1 text-sm transition-colors",
-							isDesktop && isInlineOpen
-								? "bg-primary/10 text-primary"
-								: hasComments
-									? "text-primary hover:bg-primary/10"
-									: "text-muted-foreground hover:text-foreground hover:bg-muted"
-						)}
-					>
-						<MessageSquare className={cn("size-3.5", hasComments && "fill-current")} />
-						{hasComments ? (
-							<span>
-								{commentCount} {commentCount === 1 ? "comment" : "comments"}
-							</span>
-						) : (
-							<span>Add comment</span>
-						)}
-					</button>
-				</div>
-			)}
+			{/* Fixed trigger slot prevents any vertical reflow when visibility changes */}
+			<div className="mr-2 mb-1 flex h-7 justify-end">
+				<button
+					ref={isDesktop ? commentTriggerRef : undefined}
+					type="button"
+					onClick={
+						showCommentTrigger
+							? isDesktop
+								? () => setIsInlineOpen((prev) => !prev)
+								: () => setIsSheetOpen(true)
+							: undefined
+					}
+					aria-hidden={!showCommentTrigger}
+					tabIndex={showCommentTrigger ? 0 : -1}
+					className={cn(
+						"flex items-center gap-1.5 rounded-full px-3 py-1 text-sm transition-colors",
+						"opacity-0 pointer-events-none",
+						showCommentTrigger && "opacity-100 pointer-events-auto",
+						isDesktop && isInlineOpen
+							? "bg-primary/10 text-primary"
+							: hasComments
+								? "text-primary hover:bg-primary/10"
+								: "text-muted-foreground hover:text-foreground hover:bg-muted"
+					)}
+				>
+					<MessageCircleReply className={cn("size-3.5", hasComments && "fill-current")} />
+					{hasComments ? (
+						<span>
+							{commentCount} {commentCount === 1 ? "comment" : "comments"}
+						</span>
+					) : (
+						<span>Add comment</span>
+					)}
+				</button>
+			</div>
 
 			{/* Desktop floating comment panel — overlays on top of chat content */}
 			{showCommentTrigger && isDesktop && isInlineOpen && dbMessageId && (
@@ -586,6 +735,13 @@ const AssistantActionBar: FC = () => {
 	const isLast = useAuiState((s) => s.message.isLast);
 	const aui = useAui();
 	const api = useElectronAPI();
+	// Surface the persisted ``chat_turn_id`` so the per-turn revert
+	// affordance can scope to just this message's actions. Streamed
+	// turns get their id once the assistant message is hydrated/finalised.
+	const chatTurnId = useAuiState(({ message }) => {
+		const meta = message?.metadata as { custom?: { chatTurnId?: string | null } } | undefined;
+		return meta?.custom?.chatTurnId ?? null;
+	});
 
 	const isQuickAssist = !!api?.replaceText && IS_QUICK_ASSIST_WINDOW;
 
@@ -629,6 +785,10 @@ const AssistantActionBar: FC = () => {
 					<ClipboardPaste />
 				</TooltipIconButton>
 			)}
+			<MessageInfoDropdown />
+			<div className="ml-auto">
+				<RevertTurnButton chatTurnId={chatTurnId} />
+			</div>
 		</ActionBarPrimitive.Root>
 	);
 };

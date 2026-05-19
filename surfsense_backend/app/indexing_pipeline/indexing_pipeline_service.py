@@ -19,7 +19,7 @@ from app.db import (
     DocumentType,
 )
 from app.indexing_pipeline.connector_document import ConnectorDocument
-from app.indexing_pipeline.document_chunker import chunk_text
+from app.indexing_pipeline.document_chunker import chunk_text, chunk_text_hybrid
 from app.indexing_pipeline.document_embedder import embed_texts
 from app.indexing_pipeline.document_hashing import (
     compute_content_hash,
@@ -387,11 +387,19 @@ class IndexingPipelineService:
             )
 
             t_step = time.perf_counter()
-            chunk_texts = await asyncio.to_thread(
-                chunk_text,
-                connector_doc.source_markdown,
-                use_code_chunker=connector_doc.should_use_code_chunker,
-            )
+            if connector_doc.should_use_code_chunker:
+                chunk_texts = await asyncio.to_thread(
+                    chunk_text,
+                    connector_doc.source_markdown,
+                    use_code_chunker=True,
+                )
+            else:
+                # Use the table-aware hybrid chunker so Markdown tables are not
+                # split mid-row (see issue #1334).
+                chunk_texts = await asyncio.to_thread(
+                    chunk_text_hybrid,
+                    connector_doc.source_markdown,
+                )
 
             texts_to_embed = [content, *chunk_texts]
             embeddings = await asyncio.to_thread(embed_texts, texts_to_embed)
@@ -421,6 +429,8 @@ class IndexingPipelineService:
                 time.perf_counter() - t_index,
             )
             log_index_success(ctx, chunk_count=len(chunks))
+
+            await self._enqueue_ai_sort_if_enabled(document)
 
         except RETRYABLE_LLM_ERRORS as e:
             log_retryable_llm_error(ctx, e)
@@ -456,6 +466,29 @@ class IndexingPipelineService:
             await self.session.refresh(document)
 
         return document
+
+    async def _enqueue_ai_sort_if_enabled(self, document: Document) -> None:
+        """Fire-and-forget: enqueue incremental AI sort if the search space has it enabled."""
+        try:
+            from app.db import SearchSpace
+
+            result = await self.session.execute(
+                select(SearchSpace.ai_file_sort_enabled).where(
+                    SearchSpace.id == document.search_space_id
+                )
+            )
+            enabled = result.scalar()
+            if not enabled:
+                return
+
+            from app.tasks.celery_tasks.document_tasks import ai_sort_document_task
+
+            user_id = str(document.created_by_id) if document.created_by_id else ""
+            ai_sort_document_task.delay(document.search_space_id, user_id, document.id)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Failed to enqueue AI sort for document %s", document.id, exc_info=True
+            )
 
     async def index_batch_parallel(
         self,

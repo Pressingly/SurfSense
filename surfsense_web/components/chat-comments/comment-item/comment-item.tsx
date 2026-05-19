@@ -1,11 +1,12 @@
 "use client";
 
 import { useAtomValue, useSetAtom } from "jotai";
-import { MessageSquare } from "lucide-react";
+import { MessageCircleReply } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { clearTargetCommentIdAtom, targetCommentIdAtom } from "@/atoms/chat/current-thread.atom";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
+import { convertRenderedToDisplay } from "@/lib/comments/utils";
 import { cn } from "@/lib/utils";
 import { CommentComposer } from "../comment-composer/comment-composer";
 import { CommentActions } from "./comment-actions";
@@ -67,11 +68,6 @@ function formatTimestamp(dateString: string): string {
 			year: date.getFullYear() !== now.getFullYear() ? "numeric" : undefined,
 		}) + ` at ${timeStr}`
 	);
-}
-
-export function convertRenderedToDisplay(contentRendered: string): string {
-	// Convert @{DisplayName} format to @DisplayName for editing
-	return contentRendered.replace(/@\{([^}]+)\}/g, "@$1");
 }
 
 function renderMentions(content: string): React.ReactNode {
@@ -220,7 +216,7 @@ export function CommentItem({
 						className="mt-1 h-7 w-fit px-2 text-xs text-muted-foreground hover:text-foreground"
 						onClick={() => onReply(comment.id)}
 					>
-						<MessageSquare className="mr-1 size-3" />
+						<MessageCircleReply className="mr-1 size-3" />
 						Reply
 					</Button>
 				)}

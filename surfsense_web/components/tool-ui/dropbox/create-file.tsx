@@ -2,7 +2,7 @@
 
 import type { ToolCallMessagePartProps } from "@assistant-ui/react";
 import { useSetAtom } from "jotai";
-import { CornerDownLeftIcon, FileIcon, Pen } from "lucide-react";
+import { CornerDownLeftIcon, FileIcon, Pencil } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { openHitlEditPanelAtom } from "@/atoms/chat/hitl-edit-panel.atom";
 import { PlateEditor } from "@/components/editor/plate-editor";
@@ -16,6 +16,8 @@ import {
 	SelectValue,
 } from "@/components/ui/select";
 import { useHitlPhase } from "@/hooks/use-hitl-phase";
+import type { HitlDecision, InterruptResult } from "@/lib/hitl";
+import { isInterruptResult, useHitlDecision } from "@/lib/hitl";
 
 interface DropboxAccount {
 	id: number;
@@ -29,22 +31,12 @@ interface SupportedType {
 	label: string;
 }
 
-interface InterruptResult {
-	__interrupt__: true;
-	__decided__?: "approve" | "reject" | "edit";
-	__completed__?: boolean;
-	action_requests: Array<{ name: string; args: Record<string, unknown> }>;
-	review_configs: Array<{
-		action_name: string;
-		allowed_decisions: Array<"approve" | "edit" | "reject">;
-	}>;
-	context?: {
-		accounts?: DropboxAccount[];
-		parent_folders?: Record<number, Array<{ folder_path: string; name: string }>>;
-		supported_types?: SupportedType[];
-		error?: string;
-	};
-}
+type DropboxCreateFileContext = {
+	accounts?: DropboxAccount[];
+	parent_folders?: Record<number, Array<{ folder_path: string; name: string }>>;
+	supported_types?: SupportedType[];
+	error?: string;
+};
 
 interface SuccessResult {
 	status: "success";
@@ -65,16 +57,11 @@ interface AuthErrorResult {
 	connector_type?: string;
 }
 
-type CreateDropboxFileResult = InterruptResult | SuccessResult | ErrorResult | AuthErrorResult;
-
-function isInterruptResult(result: unknown): result is InterruptResult {
-	return (
-		typeof result === "object" &&
-		result !== null &&
-		"__interrupt__" in result &&
-		(result as InterruptResult).__interrupt__ === true
-	);
-}
+type CreateDropboxFileResult =
+	| InterruptResult<DropboxCreateFileContext>
+	| SuccessResult
+	| ErrorResult
+	| AuthErrorResult;
 
 function isErrorResult(result: unknown): result is ErrorResult {
 	return (
@@ -100,12 +87,8 @@ function ApprovalCard({
 	onDecision,
 }: {
 	args: { name: string; file_type?: string; content?: string };
-	interruptData: InterruptResult;
-	onDecision: (decision: {
-		type: "approve" | "reject" | "edit";
-		message?: string;
-		edited_action?: { name: string; args: Record<string, unknown> };
-	}) => void;
+	interruptData: InterruptResult<DropboxCreateFileContext>;
+	onDecision: (decision: HitlDecision) => void;
 }) {
 	const { phase, setProcessing, setRejected } = useHitlPhase(interruptData);
 	const [isPanelOpen, setIsPanelOpen] = useState(false);
@@ -241,7 +224,7 @@ function ApprovalCard({
 							});
 						}}
 					>
-						<Pen className="size-3.5" />
+						<Pencil className="size-3.5" />
 						Edit
 					</Button>
 				)}
@@ -455,17 +438,14 @@ export const CreateDropboxFileToolUI = ({
 	{ name: string; file_type?: string; content?: string },
 	CreateDropboxFileResult
 >) => {
+	const { dispatch } = useHitlDecision();
 	if (!result) return null;
 	if (isInterruptResult(result)) {
 		return (
 			<ApprovalCard
 				args={args}
-				interruptData={result}
-				onDecision={(decision) => {
-					window.dispatchEvent(
-						new CustomEvent("hitl-decision", { detail: { decisions: [decision] } })
-					);
-				}}
+				interruptData={result as InterruptResult<DropboxCreateFileContext>}
+				onDecision={(decision) => dispatch([decision])}
 			/>
 		);
 	}

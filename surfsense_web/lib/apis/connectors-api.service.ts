@@ -404,6 +404,42 @@ class ConnectorsApiService {
 			listDiscordChannelsResponse
 		);
 	};
+
+	// =============================================================================
+	// MCP Tool Trust (Allow-List) Methods
+	// =============================================================================
+
+	/**
+	 * Add a tool to the MCP connector's "Always Allow" list.
+	 * Subsequent calls to this tool will skip HITL approval.
+	 */
+	trustMCPTool = async (connectorId: number, toolName: string): Promise<void> => {
+		await baseApiService.post(`/api/v1/connectors/mcp/${connectorId}/trust-tool`, undefined, {
+			body: { tool_name: toolName },
+		});
+	};
+
+	/**
+	 * Remove a tool from the MCP connector's "Always Allow" list.
+	 */
+	untrustMCPTool = async (connectorId: number, toolName: string): Promise<void> => {
+		await baseApiService.post(`/api/v1/connectors/mcp/${connectorId}/untrust-tool`, undefined, {
+			body: { tool_name: toolName },
+		});
+	};
+
+	/** Live stats for the Obsidian connector tile. */
+	getObsidianStats = async (vaultId: string): Promise<ObsidianStats> => {
+		return baseApiService.get<ObsidianStats>(
+			`/api/v1/obsidian/stats?vault_id=${encodeURIComponent(vaultId)}`
+		);
+	};
+}
+
+export interface ObsidianStats {
+	vault_id: string;
+	files_synced: number;
+	last_sync_at: string | null;
 }
 
 export type { SlackChannel, DiscordChannel };
