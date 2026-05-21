@@ -1,10 +1,11 @@
 "use client";
 
 import { AssistantRuntimeProvider } from "@assistant-ui/react";
-import { ThinkingStepsDataUI } from "@/components/assistant-ui/thinking-steps";
+import { StepSeparatorDataUI } from "@/components/assistant-ui/step-separator";
 import { Navbar } from "@/components/homepage/navbar";
 import { ReportPanel } from "@/components/report-panel/report-panel";
 import { Spinner } from "@/components/ui/spinner";
+import { TimelineDataUI } from "@/features/chat-messages/timeline";
 import { usePublicChat } from "@/hooks/use-public-chat";
 import { usePublicChatRuntime } from "@/hooks/use-public-chat-runtime";
 import { PublicChatFooter } from "./public-chat-footer";
@@ -40,7 +41,8 @@ export function PublicChatView({ shareToken }: PublicChatViewProps) {
 		<main className="min-h-screen bg-main-panel text-foreground overflow-x-hidden">
 			<Navbar scrolledBgClassName={navbarScrolledBg} />
 			<AssistantRuntimeProvider runtime={runtime}>
-				<ThinkingStepsDataUI />
+				<TimelineDataUI />
+				<StepSeparatorDataUI />
 				<div className="flex h-screen pt-16 overflow-hidden">
 					<div className="flex-1 flex flex-col min-w-0 overflow-hidden">
 						<PublicThread footer={<PublicChatFooter shareToken={shareToken} />} />

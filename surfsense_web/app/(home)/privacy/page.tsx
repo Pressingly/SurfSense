@@ -3,6 +3,9 @@ import type { Metadata } from "next";
 export const metadata: Metadata = {
 	title: "Privacy Policy | SurfSense",
 	description: "Privacy Policy for SurfSense application",
+	alternates: {
+		canonical: "https://www.surfsense.com/privacy",
+	},
 };
 
 export default function PrivacyPolicy() {

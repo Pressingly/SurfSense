@@ -6,7 +6,8 @@ import { useCallback, useEffect, useState } from "react";
 import { TextShimmerLoader } from "@/components/prompt-kit/loader";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import { useHitlPhase } from "@/hooks/use-hitl-phase";
+import type { HitlDecision, InterruptResult } from "@/features/chat-messages/hitl";
+import { isInterruptResult, useHitlDecision, useHitlPhase } from "@/features/chat-messages/hitl";
 
 interface OneDriveAccount {
 	id: number;
@@ -22,14 +23,11 @@ interface OneDriveFile {
 	web_url?: string;
 }
 
-interface InterruptResult {
-	__interrupt__: true;
-	__decided__?: "approve" | "reject";
-	__completed__?: boolean;
-	action_requests: Array<{ name: string; args: Record<string, unknown> }>;
-	review_configs: Array<{ action_name: string; allowed_decisions: Array<"approve" | "reject"> }>;
-	context?: { account?: OneDriveAccount; file?: OneDriveFile; error?: string };
-}
+type OneDriveTrashFileContext = {
+	account?: OneDriveAccount;
+	file?: OneDriveFile;
+	error?: string;
+};
 
 interface SuccessResult {
 	status: "success";
@@ -52,20 +50,11 @@ interface AuthErrorResult {
 }
 
 type DeleteOneDriveFileResult =
-	| InterruptResult
+	| InterruptResult<OneDriveTrashFileContext>
 	| SuccessResult
 	| ErrorResult
 	| NotFoundResult
 	| AuthErrorResult;
-
-function isInterruptResult(result: unknown): result is InterruptResult {
-	return (
-		typeof result === "object" &&
-		result !== null &&
-		"__interrupt__" in result &&
-		(result as InterruptResult).__interrupt__ === true
-	);
-}
 function isErrorResult(result: unknown): result is ErrorResult {
 	return (
 		typeof result === "object" &&
@@ -95,12 +84,8 @@ function ApprovalCard({
 	interruptData,
 	onDecision,
 }: {
-	interruptData: InterruptResult;
-	onDecision: (decision: {
-		type: "approve" | "reject";
-		message?: string;
-		edited_action?: { name: string; args: Record<string, unknown> };
-	}) => void;
+	interruptData: InterruptResult<OneDriveTrashFileContext>;
+	onDecision: (decision: HitlDecision) => void;
 }) {
 	const { phase, setProcessing, setRejected } = useHitlPhase(interruptData);
 	const [deleteFromKb, setDeleteFromKb] = useState(false);
@@ -311,16 +296,13 @@ export const DeleteOneDriveFileToolUI = ({
 	{ file_name: string; delete_from_kb?: boolean },
 	DeleteOneDriveFileResult
 >) => {
+	const { dispatch } = useHitlDecision();
 	if (!result) return null;
 	if (isInterruptResult(result)) {
 		return (
 			<ApprovalCard
-				interruptData={result}
-				onDecision={(decision) => {
-					window.dispatchEvent(
-						new CustomEvent("hitl-decision", { detail: { decisions: [decision] } })
-					);
-				}}
+				interruptData={result as InterruptResult<OneDriveTrashFileContext>}
+				onDecision={(decision) => dispatch([decision])}
 			/>
 		);
 	}

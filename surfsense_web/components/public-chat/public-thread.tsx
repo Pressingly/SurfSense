@@ -5,6 +5,7 @@ import {
 	AuiIf,
 	MessagePrimitive,
 	ThreadPrimitive,
+	type ToolCallMessagePartComponent,
 	useAuiState,
 } from "@assistant-ui/react";
 import { CheckIcon, CopyIcon } from "lucide-react";
@@ -13,11 +14,12 @@ import Image from "next/image";
 import { type FC, type ReactNode, useState } from "react";
 import { CitationMetadataProvider } from "@/components/assistant-ui/citation-metadata-context";
 import { MarkdownText } from "@/components/assistant-ui/markdown-text";
-import { ToolFallback } from "@/components/assistant-ui/tool-fallback";
+import { ReasoningMessagePart } from "@/components/assistant-ui/reasoning-message-part";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import { GenerateImageToolUI } from "@/components/tool-ui/generate-image";
 import { GeneratePodcastToolUI } from "@/components/tool-ui/generate-podcast";
 import { GenerateReportToolUI } from "@/components/tool-ui/generate-report";
+import { GenerateResumeToolUI } from "@/components/tool-ui/generate-resume";
 
 const GenerateVideoPresentationToolUI = dynamic(
 	() =>
@@ -26,6 +28,8 @@ const GenerateVideoPresentationToolUI = dynamic(
 		})),
 	{ ssr: false }
 );
+
+const NullToolUi: ToolCallMessagePartComponent = () => null;
 
 interface PublicThreadProps {
 	footer?: ReactNode;
@@ -43,20 +47,21 @@ export const PublicThread: FC<PublicThreadProps> = ({ footer }) => {
 				["--thread-max-width" as string]: "44rem",
 			}}
 		>
-			<ThreadPrimitive.Viewport className="aui-thread-viewport relative flex flex-1 min-h-0 flex-col overflow-y-auto px-4 pt-4">
+			<ThreadPrimitive.Viewport
+				scrollToBottomOnInitialize
+				scrollToBottomOnThreadSwitch
+				className="aui-thread-viewport relative flex flex-1 min-h-0 flex-col overflow-y-auto px-4 pt-4 pb-6"
+			>
 				<ThreadPrimitive.Messages
 					components={{
 						UserMessage: PublicUserMessage,
 						AssistantMessage: PublicAssistantMessage,
 					}}
 				/>
-
-				{/* Spacer to ensure footer doesn't overlap last message */}
-				<div className="h-24" />
 			</ThreadPrimitive.Viewport>
 
 			{footer && (
-				<div className="sticky bottom-0 z-20 border-t bg-main-panel/95 backdrop-blur supports-backdrop-filter:bg-main-panel/60">
+				<div className="border-t bg-main-panel/95 backdrop-blur supports-backdrop-filter:bg-main-panel/60">
 					{footer}
 				</div>
 			)}
@@ -102,7 +107,7 @@ const UserAvatar: FC<AuthorMetadata & { hasError: boolean; onError: () => void }
 	}
 
 	return (
-		<div className="flex size-8 items-center justify-center rounded-full bg-primary/10 text-xs font-medium text-primary">
+		<div className="flex size-8 items-center justify-center rounded-full bg-muted text-xs font-medium text-foreground">
 			{initials}
 		</div>
 	);
@@ -119,7 +124,7 @@ const PublicUserMessage: FC = () => {
 		>
 			<div className="aui-user-message-content-wrapper col-start-2 min-w-0 flex items-end gap-2">
 				<div className="flex-1 min-w-0">
-					<div className="aui-user-message-content wrap-break-word rounded-2xl bg-muted px-4 py-2.5 text-foreground">
+					<div className="aui-user-message-content wrap-break-word rounded-xl bg-muted px-4 py-2.5 text-foreground">
 						<MessagePrimitive.Parts />
 					</div>
 				</div>
@@ -156,19 +161,17 @@ const PublicAssistantMessage: FC = () => {
 					<MessagePrimitive.Parts
 						components={{
 							Text: MarkdownText,
+							Reasoning: ReasoningMessagePart,
 							tools: {
 								by_name: {
 									generate_podcast: GeneratePodcastToolUI,
 									generate_report: GenerateReportToolUI,
+									generate_resume: GenerateResumeToolUI,
 									generate_video_presentation: GenerateVideoPresentationToolUI,
 									display_image: GenerateImageToolUI,
 									generate_image: GenerateImageToolUI,
-									web_search: () => null,
-									link_preview: () => null,
-									multi_link_preview: () => null,
-									scrape_webpage: () => null,
 								},
-								Fallback: ToolFallback,
+								Fallback: NullToolUi,
 							},
 						}}
 					/>

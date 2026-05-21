@@ -18,6 +18,8 @@ import { authenticatedFetch } from "@/lib/auth-utils";
 import {
 	trackConnectorConnected,
 	trackConnectorDeleted,
+	trackConnectorSetupFailure,
+	trackConnectorSetupStarted,
 	trackIndexWithDateRangeOpened,
 	trackIndexWithDateRangeStarted,
 	trackPeriodicIndexingStarted,
@@ -30,9 +32,11 @@ import {
 	AUTO_INDEX_CONNECTOR_TYPES,
 	AUTO_INDEX_DEFAULTS,
 	COMPOSIO_CONNECTORS,
+	LIVE_CONNECTOR_TYPES,
 	OAUTH_CONNECTORS,
 	OTHER_CONNECTORS,
 } from "../constants/connector-constants";
+
 import {
 	dateRangeSchema,
 	frequencyMinutesSchema,
@@ -80,6 +84,7 @@ export const useConnectorDialog = () => {
 	const [periodicEnabled, setPeriodicEnabled] = useState(false);
 	const [frequencyMinutes, setFrequencyMinutes] = useState("1440");
 	const [enableSummary, setEnableSummary] = useState(false);
+	const [enableVisionLlm, setEnableVisionLlm] = useState(false);
 
 	// Edit mode state
 	const [editingConnector, setEditingConnector] = useState<SearchSourceConnector | null>(null);
@@ -220,9 +225,19 @@ export const useConnectorDialog = () => {
 
 		if (result.error) {
 			const oauthConnector = result.connector
-				? OAUTH_CONNECTORS.find((c) => c.id === result.connector)
+				? OAUTH_CONNECTORS.find((c) => c.id === result.connector) ||
+					COMPOSIO_CONNECTORS.find((c) => c.id === result.connector)
 				: null;
 			const name = oauthConnector?.title || "connector";
+
+			if (oauthConnector) {
+				trackConnectorSetupFailure(
+					Number(searchSpaceId),
+					oauthConnector.connectorType,
+					result.error,
+					"oauth_callback"
+				);
+			}
 
 			if (result.error === "duplicate_account") {
 				toast.error(`This ${name} account is already connected`, {
@@ -293,7 +308,12 @@ export const useConnectorDialog = () => {
 							newConnector.id
 						);
 
-						if (
+						const isLiveConnector = LIVE_CONNECTOR_TYPES.has(oauthConnector.connectorType);
+
+						if (isLiveConnector) {
+							toast.success(`${oauthConnector.title} connected successfully!`);
+							await refetchAllConnectors();
+						} else if (
 							newConnector.is_indexable &&
 							AUTO_INDEX_CONNECTOR_TYPES.has(oauthConnector.connectorType)
 						) {
@@ -302,6 +322,9 @@ export const useConnectorDialog = () => {
 								oauthConnector.title,
 								oauthConnector.connectorType
 							);
+						} else if (!newConnector.is_indexable) {
+							toast.success(`${oauthConnector.title} connected successfully!`);
+							await refetchAllConnectors();
 						} else {
 							toast.dismiss("auto-index");
 							const config = validateIndexingConfigState({
@@ -336,6 +359,8 @@ export const useConnectorDialog = () => {
 			// Set connecting state immediately to disable button and show spinner
 			setConnectingId(connector.id);
 
+			trackConnectorSetupStarted(Number(searchSpaceId), connector.connectorType, "oauth_click");
+
 			try {
 				// Check if authEndpoint already has query parameters
 				const separator = connector.authEndpoint.includes("?") ? "&" : "?";
@@ -357,6 +382,12 @@ export const useConnectorDialog = () => {
 				window.location.href = validatedData.auth_url;
 			} catch (error) {
 				console.error(`Error connecting to ${connector.title}:`, error);
+				trackConnectorSetupFailure(
+					Number(searchSpaceId),
+					connector.connectorType,
+					error instanceof Error ? error.message : "oauth_initiation_failed",
+					"oauth_init"
+				);
 				if (error instanceof Error && error.message.includes("Invalid auth URL")) {
 					toast.error(`Invalid response from ${connector.title} OAuth endpoint`);
 				} else {
@@ -380,6 +411,11 @@ export const useConnectorDialog = () => {
 		if (!searchSpaceId) return;
 
 		setConnectingId("webcrawler-connector");
+		trackConnectorSetupStarted(
+			Number(searchSpaceId),
+			EnumConnectorName.WEBCRAWLER_CONNECTOR,
+			"webcrawler_quick_add"
+		);
 		try {
 			await createConnector({
 				data: {
@@ -393,6 +429,7 @@ export const useConnectorDialog = () => {
 					indexing_frequency_minutes: null,
 					next_scheduled_at: null,
 					enable_summary: false,
+					enable_vision_llm: false,
 				},
 				queryParams: {
 					search_space_id: searchSpaceId,
@@ -429,16 +466,25 @@ export const useConnectorDialog = () => {
 			}
 		} catch (error) {
 			console.error("Error creating webcrawler connector:", error);
+			trackConnectorSetupFailure(
+				Number(searchSpaceId),
+				EnumConnectorName.WEBCRAWLER_CONNECTOR,
+				error instanceof Error ? error.message : "webcrawler_create_failed",
+				"webcrawler_quick_add"
+			);
 			toast.error("Failed to create web crawler connector");
 		} finally {
 			setConnectingId(null);
 		}
 	}, [searchSpaceId, createConnector, refetchAllConnectors, setIsOpen]);
 
-	// Handle connecting non-OAuth connectors (like Tavily API)
+	// Handle connecting non-OAuth connectors (like Tavily API, Obsidian plugin, etc.)
 	const handleConnectNonOAuth = useCallback(
 		(connectorType: string) => {
 			if (!searchSpaceId) return;
+
+			trackConnectorSetupStarted(Number(searchSpaceId), connectorType, "non_oauth_click");
+
 			setConnectingConnectorType(connectorType);
 		},
 		[searchSpaceId]
@@ -485,6 +531,7 @@ export const useConnectorDialog = () => {
 						is_active: true,
 						next_scheduled_at: connectorData.next_scheduled_at as string | null,
 						enable_summary: false,
+						enable_vision_llm: false,
 					},
 					queryParams: {
 						search_space_id: searchSpaceId,
@@ -621,6 +668,7 @@ export const useConnectorDialog = () => {
 									setPeriodicEnabled(false);
 									setFrequencyMinutes("1440");
 									setEnableSummary(connector.enable_summary ?? false);
+									setEnableVisionLlm(connector.enable_vision_llm ?? false);
 									setStartDate(undefined);
 									setEndDate(undefined);
 
@@ -651,6 +699,12 @@ export const useConnectorDialog = () => {
 				}
 			} catch (error) {
 				console.error("Error creating connector:", error);
+				trackConnectorSetupFailure(
+					Number(searchSpaceId),
+					connectingConnectorType ?? formData.connector_type,
+					error instanceof Error ? error.message : "connector_create_failed",
+					"non_oauth_form"
+				);
 				toast.error(error instanceof Error ? error.message : "Failed to create connector");
 			} finally {
 				isCreatingConnectorRef.current = false;
@@ -763,12 +817,13 @@ export const useConnectorDialog = () => {
 				const endDateStr = endDate ? format(endDate, "yyyy-MM-dd") : undefined;
 
 				// Update connector with summary, periodic sync settings, and config changes
-				if (enableSummary || periodicEnabled || indexingConnectorConfig) {
+				if (enableSummary || enableVisionLlm || periodicEnabled || indexingConnectorConfig) {
 					const frequency = periodicEnabled ? parseInt(frequencyMinutes, 10) : undefined;
 					await updateConnector({
 						id: indexingConfig.connectorId,
 						data: {
 							enable_summary: enableSummary,
+							enable_vision_llm: enableVisionLlm,
 							...(periodicEnabled && {
 								periodic_indexing_enabled: true,
 								indexing_frequency_minutes: frequency,
@@ -896,6 +951,7 @@ export const useConnectorDialog = () => {
 			periodicEnabled,
 			frequencyMinutes,
 			enableSummary,
+			enableVisionLlm,
 			indexingConnectorConfig,
 			setIsOpen,
 		]
@@ -960,6 +1016,7 @@ export const useConnectorDialog = () => {
 			setPeriodicEnabled(!connector.is_indexable ? false : connector.periodic_indexing_enabled);
 			setFrequencyMinutes(connector.indexing_frequency_minutes?.toString() || "1440");
 			setEnableSummary(connector.enable_summary ?? false);
+			setEnableVisionLlm(connector.enable_vision_llm ?? false);
 			setStartDate(undefined);
 			setEndDate(undefined);
 		},
@@ -1038,6 +1095,7 @@ export const useConnectorDialog = () => {
 					data: {
 						name: connectorName || editingConnector.name,
 						enable_summary: enableSummary,
+						enable_vision_llm: enableVisionLlm,
 						periodic_indexing_enabled: !editingConnector.is_indexable ? false : periodicEnabled,
 						indexing_frequency_minutes: !editingConnector.is_indexable ? null : frequency,
 						config: connectorConfig || editingConnector.config,
@@ -1172,6 +1230,7 @@ export const useConnectorDialog = () => {
 			periodicEnabled,
 			frequencyMinutes,
 			enableSummary,
+			enableVisionLlm,
 			getFrequencyLabel,
 			connectorConfig,
 			connectorName,
@@ -1332,6 +1391,7 @@ export const useConnectorDialog = () => {
 					setPeriodicEnabled(false);
 					setFrequencyMinutes("1440");
 					setEnableSummary(false);
+					setEnableVisionLlm(false);
 				}
 			}
 		},
@@ -1368,6 +1428,7 @@ export const useConnectorDialog = () => {
 		periodicEnabled,
 		frequencyMinutes,
 		enableSummary,
+		enableVisionLlm,
 		searchSpaceId,
 		allConnectors,
 		viewingAccountsType,
@@ -1382,6 +1443,7 @@ export const useConnectorDialog = () => {
 		setPeriodicEnabled,
 		setFrequencyMinutes,
 		setEnableSummary,
+		setEnableVisionLlm,
 		setConnectorName,
 
 		// Handlers

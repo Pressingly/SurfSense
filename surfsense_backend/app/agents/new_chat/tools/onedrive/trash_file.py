@@ -2,17 +2,18 @@ import logging
 from typing import Any
 
 from langchain_core.tools import tool
-from langgraph.types import interrupt
 from sqlalchemy import String, and_, cast, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
+from app.agents.new_chat.tools.hitl import request_approval
 from app.connectors.onedrive.client import OneDriveClient
 from app.db import (
     Document,
     DocumentType,
     SearchSourceConnector,
     SearchSourceConnectorType,
+    async_session_maker,
 )
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,23 @@ def create_delete_onedrive_file_tool(
     search_space_id: int | None = None,
     user_id: str | None = None,
 ):
+    """
+    Factory function to create the delete_onedrive_file tool.
+
+    The tool acquires its own short-lived ``AsyncSession`` per call via
+    :data:`async_session_maker` so the closure is safe to share across
+    HTTP requests by the compiled-agent cache. Capturing a per-request
+    session here would surface stale/closed sessions on cache hits.
+
+    Args:
+        db_session: Reserved for registry compatibility. Per-call sessions
+            are opened via :data:`async_session_maker` inside the tool body.
+
+    Returns:
+        Configured delete_onedrive_file tool
+    """
+    del db_session  # per-call session — see docstring
+
     @tool
     async def delete_onedrive_file(
         file_name: str,
@@ -56,33 +74,14 @@ def create_delete_onedrive_file_tool(
             f"delete_onedrive_file called: file_name='{file_name}', delete_from_kb={delete_from_kb}"
         )
 
-        if db_session is None or search_space_id is None or user_id is None:
+        if search_space_id is None or user_id is None:
             return {
                 "status": "error",
                 "message": "OneDrive tool not properly configured.",
             }
 
         try:
-            doc_result = await db_session.execute(
-                select(Document)
-                .join(
-                    SearchSourceConnector,
-                    Document.connector_id == SearchSourceConnector.id,
-                )
-                .filter(
-                    and_(
-                        Document.search_space_id == search_space_id,
-                        Document.document_type == DocumentType.ONEDRIVE_FILE,
-                        func.lower(Document.title) == func.lower(file_name),
-                        SearchSourceConnector.user_id == user_id,
-                    )
-                )
-                .order_by(Document.updated_at.desc().nullslast())
-                .limit(1)
-            )
-            document = doc_result.scalars().first()
-
-            if not document:
+            async with async_session_maker() as db_session:
                 doc_result = await db_session.execute(
                     select(Document)
                     .join(
@@ -93,13 +92,7 @@ def create_delete_onedrive_file_tool(
                         and_(
                             Document.search_space_id == search_space_id,
                             Document.document_type == DocumentType.ONEDRIVE_FILE,
-                            func.lower(
-                                cast(
-                                    Document.document_metadata["onedrive_file_name"],
-                                    String,
-                                )
-                            )
-                            == func.lower(file_name),
+                            func.lower(Document.title) == func.lower(file_name),
                             SearchSourceConnector.user_id == user_id,
                         )
                     )
@@ -108,125 +101,64 @@ def create_delete_onedrive_file_tool(
                 )
                 document = doc_result.scalars().first()
 
-            if not document:
-                return {
-                    "status": "not_found",
-                    "message": (
-                        f"File '{file_name}' not found in your indexed OneDrive files. "
-                        "This could mean: (1) the file doesn't exist, (2) it hasn't been indexed yet, "
-                        "or (3) the file name is different."
-                    ),
-                }
-
-            if not document.connector_id:
-                return {
-                    "status": "error",
-                    "message": "Document has no associated connector.",
-                }
-
-            meta = document.document_metadata or {}
-            file_id = meta.get("onedrive_file_id")
-            document_id = document.id
-
-            if not file_id:
-                return {
-                    "status": "error",
-                    "message": "File ID is missing. Please re-index the file.",
-                }
-
-            conn_result = await db_session.execute(
-                select(SearchSourceConnector).filter(
-                    and_(
-                        SearchSourceConnector.id == document.connector_id,
-                        SearchSourceConnector.search_space_id == search_space_id,
-                        SearchSourceConnector.user_id == user_id,
-                        SearchSourceConnector.connector_type
-                        == SearchSourceConnectorType.ONEDRIVE_CONNECTOR,
+                if not document:
+                    doc_result = await db_session.execute(
+                        select(Document)
+                        .join(
+                            SearchSourceConnector,
+                            Document.connector_id == SearchSourceConnector.id,
+                        )
+                        .filter(
+                            and_(
+                                Document.search_space_id == search_space_id,
+                                Document.document_type == DocumentType.ONEDRIVE_FILE,
+                                func.lower(
+                                    cast(
+                                        Document.document_metadata[
+                                            "onedrive_file_name"
+                                        ],
+                                        String,
+                                    )
+                                )
+                                == func.lower(file_name),
+                                SearchSourceConnector.user_id == user_id,
+                            )
+                        )
+                        .order_by(Document.updated_at.desc().nullslast())
+                        .limit(1)
                     )
-                )
-            )
-            connector = conn_result.scalars().first()
-            if not connector:
-                return {
-                    "status": "error",
-                    "message": "OneDrive connector not found or access denied.",
-                }
+                    document = doc_result.scalars().first()
 
-            cfg = connector.config or {}
-            if cfg.get("auth_expired"):
-                return {
-                    "status": "auth_error",
-                    "message": "OneDrive account needs re-authentication. Please re-authenticate in your connector settings.",
-                    "connector_type": "onedrive",
-                }
+                if not document:
+                    return {
+                        "status": "not_found",
+                        "message": (
+                            f"File '{file_name}' not found in your indexed OneDrive files. "
+                            "This could mean: (1) the file doesn't exist, (2) it hasn't been indexed yet, "
+                            "or (3) the file name is different."
+                        ),
+                    }
 
-            context = {
-                "file": {
-                    "file_id": file_id,
-                    "name": file_name,
-                    "document_id": document_id,
-                    "web_url": meta.get("web_url"),
-                },
-                "account": {
-                    "id": connector.id,
-                    "name": connector.name,
-                    "user_email": cfg.get("user_email"),
-                },
-            }
+                if not document.connector_id:
+                    return {
+                        "status": "error",
+                        "message": "Document has no associated connector.",
+                    }
 
-            approval = interrupt(
-                {
-                    "type": "onedrive_file_trash",
-                    "action": {
-                        "tool": "delete_onedrive_file",
-                        "params": {
-                            "file_id": file_id,
-                            "connector_id": connector.id,
-                            "delete_from_kb": delete_from_kb,
-                        },
-                    },
-                    "context": context,
-                }
-            )
+                meta = document.document_metadata or {}
+                file_id = meta.get("onedrive_file_id")
+                document_id = document.id
 
-            decisions_raw = (
-                approval.get("decisions", []) if isinstance(approval, dict) else []
-            )
-            decisions = (
-                decisions_raw if isinstance(decisions_raw, list) else [decisions_raw]
-            )
-            decisions = [d for d in decisions if isinstance(d, dict)]
-            if not decisions:
-                return {"status": "error", "message": "No approval decision received"}
+                if not file_id:
+                    return {
+                        "status": "error",
+                        "message": "File ID is missing. Please re-index the file.",
+                    }
 
-            decision = decisions[0]
-            decision_type = decision.get("type") or decision.get("decision_type")
-            logger.info(f"User decision: {decision_type}")
-
-            if decision_type == "reject":
-                return {
-                    "status": "rejected",
-                    "message": "User declined. The file was not trashed. Do not ask again or suggest alternatives.",
-                }
-
-            final_params: dict[str, Any] = {}
-            edited_action = decision.get("edited_action")
-            if isinstance(edited_action, dict):
-                edited_args = edited_action.get("args")
-                if isinstance(edited_args, dict):
-                    final_params = edited_args
-            elif isinstance(decision.get("args"), dict):
-                final_params = decision["args"]
-
-            final_file_id = final_params.get("file_id", file_id)
-            final_connector_id = final_params.get("connector_id", connector.id)
-            final_delete_from_kb = final_params.get("delete_from_kb", delete_from_kb)
-
-            if final_connector_id != connector.id:
-                result = await db_session.execute(
+                conn_result = await db_session.execute(
                     select(SearchSourceConnector).filter(
                         and_(
-                            SearchSourceConnector.id == final_connector_id,
+                            SearchSourceConnector.id == document.connector_id,
                             SearchSourceConnector.search_space_id == search_space_id,
                             SearchSourceConnector.user_id == user_id,
                             SearchSourceConnector.connector_type
@@ -234,65 +166,130 @@ def create_delete_onedrive_file_tool(
                         )
                     )
                 )
-                validated_connector = result.scalars().first()
-                if not validated_connector:
+                connector = conn_result.scalars().first()
+                if not connector:
                     return {
                         "status": "error",
-                        "message": "Selected OneDrive connector is invalid or has been disconnected.",
+                        "message": "OneDrive connector not found or access denied.",
                     }
-                actual_connector_id = validated_connector.id
-            else:
-                actual_connector_id = connector.id
 
-            logger.info(
-                f"Deleting OneDrive file: file_id='{final_file_id}', connector={actual_connector_id}"
-            )
+                cfg = connector.config or {}
+                if cfg.get("auth_expired"):
+                    return {
+                        "status": "auth_error",
+                        "message": "OneDrive account needs re-authentication. Please re-authenticate in your connector settings.",
+                        "connector_type": "onedrive",
+                    }
 
-            client = OneDriveClient(
-                session=db_session, connector_id=actual_connector_id
-            )
-            await client.trash_file(final_file_id)
+                context = {
+                    "file": {
+                        "file_id": file_id,
+                        "name": file_name,
+                        "document_id": document_id,
+                        "web_url": meta.get("web_url"),
+                    },
+                    "account": {
+                        "id": connector.id,
+                        "name": connector.name,
+                        "user_email": cfg.get("user_email"),
+                    },
+                }
 
-            logger.info(
-                f"OneDrive file deleted (moved to recycle bin): file_id={final_file_id}"
-            )
-
-            trash_result: dict[str, Any] = {
-                "status": "success",
-                "file_id": final_file_id,
-                "message": f"Successfully moved '{file_name}' to the recycle bin.",
-            }
-
-            deleted_from_kb = False
-            if final_delete_from_kb and document_id:
-                try:
-                    doc_result = await db_session.execute(
-                        select(Document).filter(Document.id == document_id)
-                    )
-                    doc = doc_result.scalars().first()
-                    if doc:
-                        await db_session.delete(doc)
-                        await db_session.commit()
-                        deleted_from_kb = True
-                        logger.info(
-                            f"Deleted document {document_id} from knowledge base"
-                        )
-                    else:
-                        logger.warning(f"Document {document_id} not found in KB")
-                except Exception as e:
-                    logger.error(f"Failed to delete document from KB: {e}")
-                    await db_session.rollback()
-                    trash_result["warning"] = (
-                        f"File moved to recycle bin, but failed to remove from knowledge base: {e!s}"
-                    )
-
-            trash_result["deleted_from_kb"] = deleted_from_kb
-            if deleted_from_kb:
-                trash_result["message"] = (
-                    f"{trash_result.get('message', '')} (also removed from knowledge base)"
+                result = request_approval(
+                    action_type="onedrive_file_trash",
+                    tool_name="delete_onedrive_file",
+                    params={
+                        "file_id": file_id,
+                        "connector_id": connector.id,
+                        "delete_from_kb": delete_from_kb,
+                    },
+                    context=context,
                 )
 
-            return trash_result
+                if result.rejected:
+                    return {
+                        "status": "rejected",
+                        "message": "User declined. Do not retry or suggest alternatives.",
+                    }
+
+                final_file_id = result.params.get("file_id", file_id)
+                final_connector_id = result.params.get("connector_id", connector.id)
+                final_delete_from_kb = result.params.get(
+                    "delete_from_kb", delete_from_kb
+                )
+
+                if final_connector_id != connector.id:
+                    result = await db_session.execute(
+                        select(SearchSourceConnector).filter(
+                            and_(
+                                SearchSourceConnector.id == final_connector_id,
+                                SearchSourceConnector.search_space_id
+                                == search_space_id,
+                                SearchSourceConnector.user_id == user_id,
+                                SearchSourceConnector.connector_type
+                                == SearchSourceConnectorType.ONEDRIVE_CONNECTOR,
+                            )
+                        )
+                    )
+                    validated_connector = result.scalars().first()
+                    if not validated_connector:
+                        return {
+                            "status": "error",
+                            "message": "Selected OneDrive connector is invalid or has been disconnected.",
+                        }
+                    actual_connector_id = validated_connector.id
+                else:
+                    actual_connector_id = connector.id
+
+                logger.info(
+                    f"Deleting OneDrive file: file_id='{final_file_id}', connector={actual_connector_id}"
+                )
+
+                client = OneDriveClient(
+                    session=db_session, connector_id=actual_connector_id
+                )
+                await client.trash_file(final_file_id)
+
+                logger.info(
+                    f"OneDrive file deleted (moved to recycle bin): file_id={final_file_id}"
+                )
+
+                trash_result: dict[str, Any] = {
+                    "status": "success",
+                    "file_id": final_file_id,
+                    "message": f"Successfully moved '{file_name}' to the recycle bin.",
+                }
+
+                deleted_from_kb = False
+                if final_delete_from_kb and document_id:
+                    try:
+                        doc_result = await db_session.execute(
+                            select(Document).filter(Document.id == document_id)
+                        )
+                        doc = doc_result.scalars().first()
+                        if doc:
+                            await db_session.delete(doc)
+                            await db_session.commit()
+                            deleted_from_kb = True
+                            logger.info(
+                                f"Deleted document {document_id} from knowledge base"
+                            )
+                        else:
+                            logger.warning(f"Document {document_id} not found in KB")
+                    except Exception as e:
+                        logger.error(f"Failed to delete document from KB: {e}")
+                        await db_session.rollback()
+                        trash_result["warning"] = (
+                            f"File moved to recycle bin, but failed to remove from knowledge base: {e!s}"
+                        )
+
+                trash_result["deleted_from_kb"] = deleted_from_kb
+                if deleted_from_kb:
+                    trash_result["message"] = (
+                        f"{trash_result.get('message', '')} (also removed from knowledge base)"
+                    )
+
+                return trash_result
 
         except Exception as e:
             from langgraph.errors import GraphInterrupt

@@ -19,10 +19,23 @@ const nextConfig: NextConfig = {
 	images: {
 		remotePatterns: [
 			{
+				protocol: "http",
+				hostname: "localhost",
+				port: "8000",
+				pathname: "/api/v1/image-generations/**",
+			},
+			{
 				protocol: "https",
 				hostname: "**",
 			},
 		],
+		// Allow remote SVGs (e.g. README badges from img.shields.io, trendshift.io,
+		// etc.) which are otherwise blocked by next/image. The CSP below sandboxes
+		// the SVG and forbids any embedded scripts, which is the mitigation
+		// recommended by Vercel's NEXTJS_SAFE_SVG_IMAGES conformance rule.
+		dangerouslyAllowSVG: true,
+		contentDispositionType: "attachment",
+		contentSecurityPolicy: "default-src 'self'; script-src 'none'; sandbox;",
 	},
 	experimental: {
 		optimizePackageImports: [

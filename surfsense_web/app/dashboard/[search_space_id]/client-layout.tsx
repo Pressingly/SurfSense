@@ -6,6 +6,7 @@ import { useTranslations } from "next-intl";
 import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import { pendingUserImageDataUrlsAtom } from "@/atoms/chat/pending-user-images.atom";
 import { myAccessAtom } from "@/atoms/members/members-query.atoms";
 import { updateLLMPreferencesMutationAtom } from "@/atoms/new-llm-config/new-llm-config-mutation.atoms";
 import {
@@ -33,6 +34,7 @@ export function DashboardClientLayout({
 	const pathname = usePathname();
 	const { search_space_id } = useParams();
 	const setActiveSearchSpaceIdState = useSetAtom(activeSearchSpaceIdAtom);
+	const setPendingUserImageUrls = useSetAtom(pendingUserImageDataUrlsAtom);
 
 	const {
 		data: preferences = {},
@@ -143,6 +145,27 @@ export function DashboardClientLayout({
 	const electronAPI = useElectronAPI();
 
 	useEffect(() => {
+		const htmlBackground = document.documentElement.style.backgroundColor;
+		const bodyBackground = document.body.style.backgroundColor;
+
+		document.documentElement.style.backgroundColor = "var(--panel)";
+		document.body.style.backgroundColor = "var(--panel)";
+
+		return () => {
+			document.documentElement.style.backgroundColor = htmlBackground;
+			document.body.style.backgroundColor = bodyBackground;
+		};
+	}, []);
+
+	useEffect(() => {
+		if (!electronAPI?.onChatScreenCapture) return;
+		return electronAPI.onChatScreenCapture((dataUrl: string) => {
+			if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:image/")) return;
+			setPendingUserImageUrls((prev) => [...prev, dataUrl]);
+		});
+	}, [electronAPI, setPendingUserImageUrls]);
+
+	useEffect(() => {
 		const activeSeacrhSpaceId =
 			typeof search_space_id === "string"
 				? search_space_id
@@ -153,12 +176,13 @@ export function DashboardClientLayout({
 		setActiveSearchSpaceIdState(activeSeacrhSpaceId);
 
 		// Sync to Electron store if stored value is null (first navigation)
-		if (electronAPI?.setActiveSearchSpace) {
+		if (electronAPI?.getActiveSearchSpace && electronAPI.setActiveSearchSpace) {
+			const setActiveSearchSpace = electronAPI.setActiveSearchSpace;
 			electronAPI
-				.getActiveSearchSpace?.()
-				.then((stored) => {
+				.getActiveSearchSpace()
+				.then((stored: string | null) => {
 					if (!stored) {
-						electronAPI.setActiveSearchSpace!(activeSeacrhSpaceId);
+						setActiveSearchSpace(activeSeacrhSpaceId);
 					}
 				})
 				.catch(() => {});

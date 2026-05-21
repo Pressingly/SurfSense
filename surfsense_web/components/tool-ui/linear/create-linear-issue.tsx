@@ -2,9 +2,8 @@
 
 import type { ToolCallMessagePartProps } from "@assistant-ui/react";
 import { useSetAtom } from "jotai";
-import { CornerDownLeftIcon, Pen } from "lucide-react";
+import { CornerDownLeftIcon, Pencil } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { openHitlEditPanelAtom } from "@/atoms/chat/hitl-edit-panel.atom";
 import { PlateEditor } from "@/components/editor/plate-editor";
 import { TextShimmerLoader } from "@/components/prompt-kit/loader";
 import { Badge } from "@/components/ui/badge";
@@ -17,7 +16,13 @@ import {
 	SelectValue,
 } from "@/components/ui/select";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { useHitlPhase } from "@/hooks/use-hitl-phase";
+import type { HitlDecision, InterruptResult } from "@/features/chat-messages/hitl";
+import {
+	isInterruptResult,
+	openHitlEditPanelAtom,
+	useHitlDecision,
+	useHitlPhase,
+} from "@/features/chat-messages/hitl";
 
 interface LinearLabel {
 	id: string;
@@ -64,24 +69,10 @@ interface LinearWorkspace {
 	auth_expired?: boolean;
 }
 
-interface InterruptResult {
-	__interrupt__: true;
-	__decided__?: "approve" | "reject" | "edit";
-	__completed__?: boolean;
-	action_requests: Array<{
-		name: string;
-		args: Record<string, unknown>;
-	}>;
-	review_configs: Array<{
-		action_name: string;
-		allowed_decisions: Array<"approve" | "edit" | "reject">;
-	}>;
-	interrupt_type?: string;
-	context?: {
-		workspaces?: LinearWorkspace[];
-		error?: string;
-	};
-}
+type LinearCreateIssueContext = {
+	workspaces?: LinearWorkspace[];
+	error?: string;
+};
 
 interface SuccessResult {
 	status: "success";
@@ -103,16 +94,11 @@ interface AuthErrorResult {
 	connector_type: string;
 }
 
-type CreateLinearIssueResult = InterruptResult | SuccessResult | ErrorResult | AuthErrorResult;
-
-function isInterruptResult(result: unknown): result is InterruptResult {
-	return (
-		typeof result === "object" &&
-		result !== null &&
-		"__interrupt__" in result &&
-		(result as InterruptResult).__interrupt__ === true
-	);
-}
+type CreateLinearIssueResult =
+	| InterruptResult<LinearCreateIssueContext>
+	| SuccessResult
+	| ErrorResult
+	| AuthErrorResult;
 
 function isErrorResult(result: unknown): result is ErrorResult {
 	return (
@@ -138,12 +124,8 @@ function ApprovalCard({
 	onDecision,
 }: {
 	args: { title: string; description?: string };
-	interruptData: InterruptResult;
-	onDecision: (decision: {
-		type: "approve" | "reject" | "edit";
-		message?: string;
-		edited_action?: { name: string; args: Record<string, unknown> };
-	}) => void;
+	interruptData: InterruptResult<LinearCreateIssueContext>;
+	onDecision: (decision: HitlDecision) => void;
 }) {
 	const { phase, setProcessing, setRejected } = useHitlPhase(interruptData);
 	const [isPanelOpen, setIsPanelOpen] = useState(false);
@@ -290,7 +272,7 @@ function ApprovalCard({
 							});
 						}}
 					>
-						<Pen className="size-3.5" />
+						<Pencil className="size-3.5" />
 						Edit
 					</Button>
 				)}
@@ -609,18 +591,16 @@ export const CreateLinearIssueToolUI = ({
 	args,
 	result,
 }: ToolCallMessagePartProps<{ title: string; description?: string }, CreateLinearIssueResult>) => {
+	const { dispatch } = useHitlDecision();
+
 	if (!result) return null;
 
 	if (isInterruptResult(result)) {
 		return (
 			<ApprovalCard
 				args={args}
-				interruptData={result}
-				onDecision={(decision) => {
-					window.dispatchEvent(
-						new CustomEvent("hitl-decision", { detail: { decisions: [decision] } })
-					);
-				}}
+				interruptData={result as InterruptResult<LinearCreateIssueContext>}
+				onDecision={(decision) => dispatch([decision])}
 			/>
 		);
 	}

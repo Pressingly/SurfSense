@@ -11,12 +11,13 @@ export const IPC_CHANNELS = {
   REQUEST_ACCESSIBILITY: 'request-accessibility',
   REQUEST_SCREEN_RECORDING: 'request-screen-recording',
   RESTART_APP: 'restart-app',
-  // Autocomplete
-  AUTOCOMPLETE_CONTEXT: 'autocomplete-context',
-  ACCEPT_SUGGESTION: 'accept-suggestion',
-  DISMISS_SUGGESTION: 'dismiss-suggestion',
-  SET_AUTOCOMPLETE_ENABLED: 'set-autocomplete-enabled',
-  GET_AUTOCOMPLETE_ENABLED: 'get-autocomplete-enabled',
+  CAPTURE_FULL_SCREEN: 'capture-full-screen',
+  SCREEN_REGION_SUBMIT: 'screen-region:submit',
+  SCREEN_REGION_CANCEL: 'screen-region:cancel',
+  WINDOW_PICK_LIST: 'window-pick:list',
+  WINDOW_PICK_SUBMIT: 'window-pick:submit',
+  WINDOW_PICK_CANCEL: 'window-pick:cancel',
+  CHAT_SCREEN_CAPTURE: 'chat:screen-capture',
   // Folder sync channels
   FOLDER_SYNC_SELECT_FOLDER: 'folder-sync:select-folder',
   FOLDER_SYNC_ADD_FOLDER: 'folder-sync:add-folder',
@@ -34,6 +35,8 @@ export const IPC_CHANNELS = {
   FOLDER_SYNC_SEED_MTIMES: 'folder-sync:seed-mtimes',
   BROWSE_FILES: 'browse:files',
   READ_LOCAL_FILES: 'browse:read-local-files',
+  READ_AGENT_LOCAL_FILE_TEXT: 'agent-filesystem:read-local-file-text',
+  WRITE_AGENT_LOCAL_FILE_TEXT: 'agent-filesystem:write-local-file-text',
   // Auth token sync across windows
   GET_AUTH_TOKENS: 'auth:get-tokens',
   SET_AUTH_TOKENS: 'auth:set-tokens',
@@ -43,4 +46,21 @@ export const IPC_CHANNELS = {
   // Active search space
   GET_ACTIVE_SEARCH_SPACE: 'search-space:get-active',
   SET_ACTIVE_SEARCH_SPACE: 'search-space:set-active',
+  // Launch on system startup
+  GET_AUTO_LAUNCH: 'auto-launch:get',
+  SET_AUTO_LAUNCH: 'auto-launch:set',
+  // Analytics (PostHog) bridge: renderer <-> main
+  ANALYTICS_IDENTIFY: 'analytics:identify',
+  ANALYTICS_RESET: 'analytics:reset',
+  ANALYTICS_CAPTURE: 'analytics:capture',
+  ANALYTICS_GET_CONTEXT: 'analytics:get-context',
+  // Agent filesystem mode
+  AGENT_FILESYSTEM_GET_SETTINGS: 'agent-filesystem:get-settings',
+  AGENT_FILESYSTEM_GET_MOUNTS: 'agent-filesystem:get-mounts',
+  AGENT_FILESYSTEM_LIST_FILES: 'agent-filesystem:list-files',
+  AGENT_FILESYSTEM_TREE_WATCH_START: 'agent-filesystem:tree-watch-start',
+  AGENT_FILESYSTEM_TREE_WATCH_STOP: 'agent-filesystem:tree-watch-stop',
+  AGENT_FILESYSTEM_TREE_DIRTY: 'agent-filesystem:tree-dirty',
+  AGENT_FILESYSTEM_SET_SETTINGS: 'agent-filesystem:set-settings',
+  AGENT_FILESYSTEM_PICK_ROOT: 'agent-filesystem:pick-root',
 } as const;

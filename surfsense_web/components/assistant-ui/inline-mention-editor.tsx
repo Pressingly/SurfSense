@@ -1,25 +1,51 @@
 "use client";
 
-import { X } from "lucide-react";
+import { Folder as FolderIcon, X as XIcon } from "lucide-react";
+import type { NodeEntry, TElement } from "platejs";
+import type { PlateElementProps } from "platejs/react";
 import {
-	createElement,
+	createPlatePlugin,
+	ParagraphPlugin,
+	Plate,
+	PlateContent,
+	usePlateEditor,
+} from "platejs/react";
+import {
+	createContext,
+	type FC,
 	forwardRef,
 	useCallback,
-	useEffect,
+	useContext,
 	useImperativeHandle,
+	useMemo,
 	useRef,
-	useState,
 } from "react";
-import ReactDOMServer from "react-dom/server";
+import { FOLDER_MENTION_DOCUMENT_TYPE } from "@/atoms/chat/mentioned-documents.atom";
 import { getConnectorIcon } from "@/contracts/enums/connectorIcons";
 import type { Document } from "@/contracts/types/document.types";
+import { getMentionDocKey } from "@/lib/chat/mention-doc-key";
 import { cn } from "@/lib/utils";
+
+export type MentionKind = "doc" | "folder";
 
 export interface MentionedDocument {
 	id: number;
 	title: string;
 	document_type?: string;
+	kind: MentionKind;
 }
+
+/**
+ * Input shape for inserting a chip. ``kind`` defaults to ``"doc"``.
+ * Folder chips default ``document_type`` to ``FOLDER_MENTION_DOCUMENT_TYPE``
+ * so the dedup key never collides with a doc chip sharing the same id.
+ */
+export type MentionChipInput = {
+	id: number;
+	title: string;
+	document_type?: string;
+	kind?: MentionKind;
+};
 
 export interface InlineMentionEditorRef {
 	focus: () => void;
@@ -27,7 +53,15 @@ export interface InlineMentionEditorRef {
 	setText: (text: string) => void;
 	getText: () => string;
 	getMentionedDocuments: () => MentionedDocument[];
-	insertDocumentChip: (doc: Pick<Document, "id" | "title" | "document_type">) => void;
+	insertMentionChip: (mention: MentionChipInput, options?: { removeTriggerText?: boolean }) => void;
+	/**
+	 * @deprecated Use ``insertMentionChip``. Kept for one transition
+	 * cycle so we don't break ad-hoc callers; prefer the new name.
+	 */
+	insertDocumentChip: (
+		doc: Pick<Document, "id" | "title" | "document_type">,
+		options?: { removeTriggerText?: boolean }
+	) => void;
 	removeDocumentChip: (docId: number, docType?: string) => void;
 	setDocumentChipStatus: (
 		docId: number,
@@ -49,42 +83,220 @@ interface InlineMentionEditorProps {
 	onKeyDown?: (e: React.KeyboardEvent) => void;
 	disabled?: boolean;
 	className?: string;
-	initialDocuments?: MentionedDocument[];
 	initialText?: string;
 }
 
-// Unique data attribute to identify chip elements
-const CHIP_DATA_ATTR = "data-mention-chip";
-const CHIP_ID_ATTR = "data-mention-id";
-const CHIP_DOCTYPE_ATTR = "data-mention-doctype";
-const CHIP_STATUS_ATTR = "data-mention-status";
+type MentionStatusKind = "pending" | "processing" | "ready" | "failed";
+type ComposerTextNode = { text: string };
+type MentionElementNode = {
+	type: "mention";
+	id: number;
+	title: string;
+	document_type?: string;
+	/** Discriminator; defaults to ``"doc"`` for legacy nodes. */
+	kind?: MentionKind;
+	statusLabel?: string | null;
+	statusKind?: MentionStatusKind;
+	children: [{ text: "" }];
+};
+type ComposerNode = ComposerTextNode | MentionElementNode;
+type ComposerParagraph = { type: "p"; children: ComposerNode[] };
+type ComposerValue = ComposerParagraph[];
+
+const MENTION_TYPE = "mention";
+const MENTION_CHIP_CLASSNAME =
+	"group inline-flex h-5 items-center gap-1 mx-0.5 rounded bg-primary/10 px-1 text-xs font-bold text-primary/60 select-none align-middle leading-none";
+const MENTION_CHIP_ICON_CLASSNAME = "flex items-center text-muted-foreground leading-none";
+const MENTION_CHIP_TITLE_CLASSNAME = "max-w-[120px] truncate leading-none";
+const COMPOSER_TEXT_METRICS_CLASSNAME = "text-sm leading-6";
+
+const EMPTY_VALUE: ComposerValue = [{ type: "p", children: [{ text: "" }] }];
 
 /**
- * Type guard to check if a node is a chip element
+ * Lets ``MentionElement`` reach the editor's chip-removal helper so
+ * the X button and Backspace go through the same call site.
  */
-function isChipElement(node: Node | null): node is HTMLSpanElement {
+type MentionEditorContextValue = {
+	removeChip: (docId: number, docType: string | undefined) => void;
+};
+const MentionEditorContext = createContext<MentionEditorContextValue | null>(null);
+
+const MentionElement: FC<PlateElementProps<MentionElementNode>> = ({
+	attributes,
+	children,
+	element,
+}) => {
+	const statusClass =
+		element.statusKind === "failed"
+			? "text-destructive"
+			: element.statusKind === "ready"
+				? "text-emerald-700"
+				: "text-amber-700";
+
+	const isFolder = element.kind === "folder";
+	const ctx = useContext(MentionEditorContext);
+
 	return (
-		node !== null &&
-		node.nodeType === Node.ELEMENT_NODE &&
-		(node as Element).hasAttribute(CHIP_DATA_ATTR)
+		<span {...attributes} className="inline-flex align-middle">
+			<span contentEditable={false} className={`${MENTION_CHIP_CLASSNAME} cursor-default`}>
+				<span className={MENTION_CHIP_ICON_CLASSNAME}>
+					<span className="relative flex h-3 w-3 items-center justify-center">
+						<span className="flex items-center justify-center transition-opacity group-hover:opacity-0">
+							{isFolder ? (
+								<FolderIcon className="h-3 w-3" />
+							) : (
+								getConnectorIcon(element.document_type ?? "UNKNOWN", "h-3 w-3")
+							)}
+						</span>
+						{ctx ? (
+							<button
+								type="button"
+								aria-label={`Remove mention ${element.title}`}
+								title={`Remove ${element.title}`}
+								onMouseDown={(e) => e.preventDefault()}
+								onClick={(e) => {
+									e.stopPropagation();
+									ctx.removeChip(element.id, element.document_type);
+								}}
+								className="absolute inset-0 flex items-center justify-center rounded-sm opacity-0 transition-opacity hover:text-primary focus-visible:opacity-100 focus-visible:outline-none group-hover:opacity-100"
+							>
+								<XIcon className="h-3 w-3" />
+							</button>
+						) : null}
+					</span>
+				</span>
+				<span className={MENTION_CHIP_TITLE_CLASSNAME} title={element.title}>
+					{element.title}
+				</span>
+				{element.statusLabel ? (
+					<span className={cn("text-[10px] font-semibold opacity-80", statusClass)}>
+						{element.statusLabel}
+					</span>
+				) : null}
+			</span>
+			{children}
+		</span>
 	);
+};
+
+const MentionPlugin = createPlatePlugin({
+	key: MENTION_TYPE,
+	node: {
+		isElement: true,
+		isInline: true,
+		isVoid: true,
+		type: MENTION_TYPE,
+		component: MentionElement,
+	},
+});
+
+function isMentionNode(node: ComposerNode): node is MentionElementNode {
+	return typeof node === "object" && "type" in node && node.type === MENTION_TYPE;
 }
 
-/**
- * Safely parse chip ID from element attribute
- */
-function getChipId(element: Element): number | null {
-	const idStr = element.getAttribute(CHIP_ID_ATTR);
-	if (!idStr) return null;
-	const id = parseInt(idStr, 10);
-	return Number.isNaN(id) ? null : id;
+function getTextNode(node: ComposerNode): ComposerTextNode | null {
+	if (typeof node === "object" && "text" in node && typeof node.text === "string") return node;
+	return null;
 }
 
-/**
- * Get chip document type from element attribute
- */
-function getChipDocType(element: Element): string {
-	return element.getAttribute(CHIP_DOCTYPE_ATTR) ?? "UNKNOWN";
+function toValueFromText(text: string): ComposerValue {
+	const lines = text.split("\n");
+	if (lines.length === 0) return EMPTY_VALUE;
+	return lines.map((line) => ({ type: "p", children: [{ text: line }] })) as ComposerValue;
+}
+
+function getPlainText(value: ComposerValue): string {
+	const lines = value.map((block) =>
+		block.children
+			.map((node) => {
+				if (isMentionNode(node)) return `@${node.title}`;
+				return getTextNode(node)?.text ?? "";
+			})
+			.join("")
+	);
+	return lines.join("\n").trim();
+}
+
+function getMentionedDocuments(value: ComposerValue): MentionedDocument[] {
+	const map = new Map<string, MentionedDocument>();
+	for (const block of value) {
+		for (const node of block.children) {
+			if (!isMentionNode(node)) continue;
+			const kind: MentionKind = node.kind ?? "doc";
+			const doc: MentionedDocument = {
+				id: node.id,
+				title: node.title,
+				document_type: node.document_type,
+				kind,
+			};
+			map.set(getMentionDocKey(doc), doc);
+		}
+	}
+	return Array.from(map.values());
+}
+
+type EditorSelection = {
+	anchor: { path: number[]; offset: number };
+	focus: { path: number[]; offset: number };
+} | null;
+
+function getCursorTextContext(value: ComposerValue, selection: EditorSelection) {
+	if (!selection || !selection.anchor || !selection.focus) return null;
+	if (
+		selection.anchor.path.length < 2 ||
+		selection.focus.path.length < 2 ||
+		selection.anchor.path[0] !== selection.focus.path[0] ||
+		selection.anchor.path[1] !== selection.focus.path[1]
+	) {
+		return null;
+	}
+
+	const block = value[selection.anchor.path[0]];
+	if (!block) return null;
+	const child = block.children[selection.anchor.path[1]];
+	const textNode = getTextNode(child);
+	if (!textNode) return null;
+
+	return {
+		blockIndex: selection.anchor.path[0],
+		childIndex: selection.anchor.path[1],
+		text: textNode.text,
+		cursor: selection.anchor.offset,
+	};
+}
+
+function scanActiveTrigger(text: string, cursor: number) {
+	let wordStart = 0;
+	for (let i = cursor - 1; i >= 0; i--) {
+		if (text[i] === " " || text[i] === "\n") {
+			wordStart = i + 1;
+			break;
+		}
+	}
+
+	let triggerChar: "@" | "/" | null = null;
+	let triggerIndex = -1;
+	for (let i = wordStart; i < cursor; i++) {
+		if (text[i] === "@" || text[i] === "/") {
+			triggerChar = text[i] as "@" | "/";
+			triggerIndex = i;
+			break;
+		}
+	}
+	if (!triggerChar || triggerIndex === -1) return null;
+
+	const query = text.slice(triggerIndex + 1, cursor);
+	if (query.startsWith(" ")) return null;
+	if (
+		triggerChar === "/" &&
+		triggerIndex > 0 &&
+		text[triggerIndex - 1] !== " " &&
+		text[triggerIndex - 1] !== "\n"
+	) {
+		return null;
+	}
+
+	return { triggerChar, query };
 }
 
 export const InlineMentionEditor = forwardRef<InlineMentionEditorRef, InlineMentionEditorProps>(
@@ -101,653 +313,349 @@ export const InlineMentionEditor = forwardRef<InlineMentionEditorRef, InlineMent
 			onKeyDown,
 			disabled = false,
 			className,
-			initialDocuments = [],
 			initialText,
 		},
 		ref
 	) => {
-		const editorRef = useRef<HTMLDivElement>(null);
-		const [isEmpty, setIsEmpty] = useState(true);
-		const [mentionedDocs, setMentionedDocs] = useState<Map<string, MentionedDocument>>(
-			() => new Map(initialDocuments.map((d) => [`${d.document_type ?? "UNKNOWN"}:${d.id}`, d]))
-		);
-		const isComposingRef = useRef(false);
+		const editableRef = useRef<HTMLDivElement | null>(null);
+		const editor = usePlateEditor({
+			readOnly: disabled,
+			plugins: [ParagraphPlugin, MentionPlugin],
+			value: initialText ? toValueFromText(initialText) : EMPTY_VALUE,
+		});
 
-		// Sync initial documents
-		useEffect(() => {
-			if (initialDocuments.length > 0) {
-				setMentionedDocs(
-					new Map(initialDocuments.map((d) => [`${d.document_type ?? "UNKNOWN"}:${d.id}`, d]))
-				);
-			}
-		}, [initialDocuments]);
-
-		useEffect(() => {
-			if (!initialText || !editorRef.current) return;
-			editorRef.current.innerText = initialText;
-			editorRef.current.appendChild(document.createElement("br"));
-			editorRef.current.appendChild(document.createElement("br"));
-			setIsEmpty(false);
-			onChange?.(initialText, Array.from(mentionedDocs.values()));
-			editorRef.current.focus();
-			const sel = window.getSelection();
-			const range = document.createRange();
-			range.selectNodeContents(editorRef.current);
-			range.collapse(false);
-			sel?.removeAllRanges();
-			sel?.addRange(range);
-			const anchor = document.createElement("span");
-			range.insertNode(anchor);
-			anchor.scrollIntoView({ block: "end" });
-			anchor.remove();
-		}, [initialText]); // eslint-disable-line react-hooks/exhaustive-deps
-
-		// Focus at the end of the editor
+		// Move the caret to end-of-doc and focus the editor. Falls back
+		// to DOM focus if Plate's API throws (transient unmount race).
 		const focusAtEnd = useCallback(() => {
-			if (!editorRef.current) return;
-			editorRef.current.focus();
-			const selection = window.getSelection();
-			const range = document.createRange();
-			range.selectNodeContents(editorRef.current);
-			range.collapse(false);
-			selection?.removeAllRanges();
-			selection?.addRange(range);
-		}, []);
-
-		// Get plain text content with inline mention tokens for chips.
-		// This preserves the original query structure sent to the backend/LLM.
-		const getText = useCallback((): string => {
-			if (!editorRef.current) return "";
-
-			const extractText = (node: Node): string => {
-				if (node.nodeType === Node.TEXT_NODE) {
-					return node.textContent ?? "";
-				}
-
-				if (node.nodeType === Node.ELEMENT_NODE) {
-					const element = node as Element;
-
-					// Preserve mention chips as inline @title tokens.
-					if (element.hasAttribute(CHIP_DATA_ATTR)) {
-						const title = element.querySelector("[data-mention-title='true']")?.textContent?.trim();
-						if (title) {
-							return `@${title}`;
-						}
-						return "";
-					}
-
-					let result = "";
-					for (const child of Array.from(element.childNodes)) {
-						result += extractText(child);
-					}
-					return result;
-				}
-
-				return "";
-			};
-
-			return extractText(editorRef.current).trim();
-		}, []);
-
-		// Get all mentioned documents
-		const getMentionedDocuments = useCallback((): MentionedDocument[] => {
-			return Array.from(mentionedDocs.values());
-		}, [mentionedDocs]);
-
-		// Create a chip element for a document
-		const createChipElement = useCallback(
-			(doc: MentionedDocument): HTMLSpanElement => {
-				const chip = document.createElement("span");
-				chip.setAttribute(CHIP_DATA_ATTR, "true");
-				chip.setAttribute(CHIP_ID_ATTR, String(doc.id));
-				chip.setAttribute(CHIP_DOCTYPE_ATTR, doc.document_type ?? "UNKNOWN");
-				chip.contentEditable = "false";
-				chip.className =
-					"inline-flex items-center gap-1 mx-0.5 px-1 py-0.5 rounded bg-primary/10 text-xs font-bold text-primary/60 select-none cursor-default";
-				chip.style.userSelect = "none";
-				chip.style.verticalAlign = "baseline";
-
-				// Container that swaps between icon and remove button on hover
-				const iconContainer = document.createElement("span");
-				iconContainer.className = "shrink-0 flex items-center size-3 relative";
-
-				const iconSpan = document.createElement("span");
-				iconSpan.className = "flex items-center text-muted-foreground";
-				iconSpan.innerHTML = ReactDOMServer.renderToString(
-					getConnectorIcon(doc.document_type ?? "UNKNOWN", "h-3 w-3")
-				);
-
-				const removeBtn = document.createElement("button");
-				removeBtn.type = "button";
-				removeBtn.className =
-					"size-3 items-center justify-center rounded-full text-muted-foreground transition-colors";
-				removeBtn.style.display = "none";
-				removeBtn.innerHTML = ReactDOMServer.renderToString(
-					createElement(X, { className: "h-3 w-3", strokeWidth: 2.5 })
-				);
-				removeBtn.onclick = (e) => {
-					e.preventDefault();
-					e.stopPropagation();
-					chip.remove();
-					const docKey = `${doc.document_type ?? "UNKNOWN"}:${doc.id}`;
-					setMentionedDocs((prev) => {
-						const next = new Map(prev);
-						next.delete(docKey);
-						return next;
-					});
-					onDocumentRemove?.(doc.id, doc.document_type);
-					focusAtEnd();
-				};
-
-				const titleSpan = document.createElement("span");
-				titleSpan.className = "max-w-[120px] truncate";
-				titleSpan.textContent = doc.title;
-				titleSpan.title = doc.title;
-				titleSpan.setAttribute("data-mention-title", "true");
-
-				const statusSpan = document.createElement("span");
-				statusSpan.setAttribute(CHIP_STATUS_ATTR, "true");
-				statusSpan.className = "text-[10px] font-semibold opacity-80 hidden";
-
-				const isTouchDevice = window.matchMedia("(hover: none)").matches;
-				if (isTouchDevice) {
-					// Mobile: icon on left, title, X on right
-					chip.appendChild(iconSpan);
-					chip.appendChild(titleSpan);
-					chip.appendChild(statusSpan);
-					removeBtn.style.display = "flex";
-					removeBtn.className += " ml-0.5";
-					chip.appendChild(removeBtn);
-				} else {
-					// Desktop: icon/X swap on hover in the same slot
-					iconContainer.appendChild(iconSpan);
-					iconContainer.appendChild(removeBtn);
-					chip.addEventListener("mouseenter", () => {
-						iconSpan.style.display = "none";
-						removeBtn.style.display = "flex";
-					});
-					chip.addEventListener("mouseleave", () => {
-						iconSpan.style.display = "";
-						removeBtn.style.display = "none";
-					});
-					chip.appendChild(iconContainer);
-					chip.appendChild(titleSpan);
-					chip.appendChild(statusSpan);
-				}
-
-				return chip;
-			},
-			[focusAtEnd, onDocumentRemove]
-		);
-
-		// Insert a document chip at the current cursor position
-		const insertDocumentChip = useCallback(
-			(doc: Pick<Document, "id" | "title" | "document_type">) => {
-				if (!editorRef.current) return;
-
-				// Validate required fields for type safety
-				if (typeof doc.id !== "number" || typeof doc.title !== "string") {
-					console.warn("[InlineMentionEditor] Invalid document passed to insertDocumentChip:", doc);
-					return;
-				}
-
-				const mentionDoc: MentionedDocument = {
-					id: doc.id,
-					title: doc.title,
-					document_type: doc.document_type,
-				};
-
-				// Add to mentioned docs map using unique key
-				const docKey = `${doc.document_type ?? "UNKNOWN"}:${doc.id}`;
-				setMentionedDocs((prev) => new Map(prev).set(docKey, mentionDoc));
-
-				// Find and remove the @query text
-				const selection = window.getSelection();
-				if (!selection || selection.rangeCount === 0) {
-					// No selection, just append
-					const chip = createChipElement(mentionDoc);
-					editorRef.current.appendChild(chip);
-					editorRef.current.appendChild(document.createTextNode(" "));
-					focusAtEnd();
-					return;
-				}
-
-				// Find the @ symbol before the cursor and remove it along with any query text
-				const range = selection.getRangeAt(0);
-				const textNode = range.startContainer;
-
-				if (textNode.nodeType === Node.TEXT_NODE) {
-					const text = textNode.textContent || "";
-					const cursorPos = range.startOffset;
-
-					// Find the @ symbol before cursor
-					let atIndex = -1;
-					for (let i = cursorPos - 1; i >= 0; i--) {
-						if (text[i] === "@") {
-							atIndex = i;
-							break;
-						}
-					}
-
-					if (atIndex !== -1) {
-						// Remove @query and insert chip
-						const beforeAt = text.slice(0, atIndex);
-						const afterCursor = text.slice(cursorPos);
-
-						// Create chip
-						const chip = createChipElement(mentionDoc);
-
-						// Replace text node content
-						const parent = textNode.parentNode;
-						if (parent) {
-							const beforeNode = document.createTextNode(beforeAt);
-							const afterNode = document.createTextNode(` ${afterCursor}`);
-
-							parent.insertBefore(beforeNode, textNode);
-							parent.insertBefore(chip, textNode);
-							parent.insertBefore(afterNode, textNode);
-							parent.removeChild(textNode);
-
-							// Set cursor after the chip
-							const newRange = document.createRange();
-							newRange.setStart(afterNode, 1);
-							newRange.collapse(true);
-							selection.removeAllRanges();
-							selection.addRange(newRange);
-						}
-					} else {
-						// No @ found, just insert at cursor
-						const chip = createChipElement(mentionDoc);
-						range.insertNode(chip);
-						range.setStartAfter(chip);
-						range.collapse(true);
-
-						// Add space after chip
-						const space = document.createTextNode(" ");
-						range.insertNode(space);
-						range.setStartAfter(space);
-						range.collapse(true);
-					}
-				} else {
-					// Not in a text node, append to editor
-					const chip = createChipElement(mentionDoc);
-					editorRef.current.appendChild(chip);
-					editorRef.current.appendChild(document.createTextNode(" "));
-					focusAtEnd();
-				}
-
-				// Update empty state
-				setIsEmpty(false);
-
-				// Trigger onChange
-				if (onChange) {
-					setTimeout(() => {
-						onChange(getText(), getMentionedDocuments());
-					}, 0);
-				}
-			},
-			[createChipElement, focusAtEnd, getText, getMentionedDocuments, onChange]
-		);
-
-		// Clear the editor
-		const clear = useCallback(() => {
-			if (editorRef.current) {
-				editorRef.current.innerHTML = "";
-				setIsEmpty(true);
-				setMentionedDocs(new Map());
+			try {
+				editor.tf.select(editor.api.end([]));
+				editor.tf.focus();
+			} catch {
+				editableRef.current?.focus();
 			}
-		}, []);
+		}, [editor]);
 
-		// Replace editor content with plain text and place cursor at end
-		const setText = useCallback(
-			(text: string) => {
-				if (!editorRef.current) return;
-				editorRef.current.innerText = text;
-				const empty = text.length === 0;
-				setIsEmpty(empty);
-				onChange?.(text, Array.from(mentionedDocs.values()));
-				focusAtEnd();
-			},
-			[focusAtEnd, onChange, mentionedDocs]
+		const getCurrentValue = useCallback(
+			() => (editor.children as ComposerValue) ?? EMPTY_VALUE,
+			[editor]
 		);
 
+		const emitState = useCallback(
+			(nextValue: ComposerValue) => {
+				const text = getPlainText(nextValue);
+				const docs = getMentionedDocuments(nextValue);
+				onChange?.(text, docs);
+
+				const cursorCtx = getCursorTextContext(nextValue, editor.selection);
+				if (!cursorCtx) {
+					onMentionClose?.();
+					onActionClose?.();
+					return;
+				}
+
+				const trigger = scanActiveTrigger(cursorCtx.text, cursorCtx.cursor);
+				if (!trigger) {
+					onMentionClose?.();
+					onActionClose?.();
+					return;
+				}
+
+				if (trigger.triggerChar === "@") {
+					onMentionTrigger?.(trigger.query);
+					onActionClose?.();
+					return;
+				}
+
+				onActionTrigger?.(trigger.query);
+				onMentionClose?.();
+			},
+			[editor.selection, onActionClose, onActionTrigger, onChange, onMentionClose, onMentionTrigger]
+		);
+
+		const setValue = useCallback(
+			(nextValue: ComposerValue) => {
+				const tf = editor.tf as { setValue: (value: ComposerValue) => void };
+				tf.setValue(nextValue);
+				emitState(nextValue);
+			},
+			[editor, emitState]
+		);
+
+		// Insert chip + trailing space as a single ``insertNodes`` call.
+		// The chip is a void inline; ``select: true`` on it alone would
+		// land the caret inside its empty children (an unrenderable
+		// point). With the space as the last inserted node, the caret
+		// resolves to that text node and stays visible. The
+		// ``withoutNormalizing`` wrapper batches the optional trigger
+		// delete + insert into a single undo step.
+		const insertMentionChip = useCallback(
+			(mention: MentionChipInput, options?: { removeTriggerText?: boolean }) => {
+				if (typeof mention.id !== "number" || typeof mention.title !== "string") return;
+
+				const removeTriggerText = options?.removeTriggerText ?? true;
+				const kind: MentionKind = mention.kind ?? "doc";
+				const document_type =
+					mention.document_type ?? (kind === "folder" ? FOLDER_MENTION_DOCUMENT_TYPE : undefined);
+				const mentionNode: MentionElementNode = {
+					type: MENTION_TYPE,
+					id: mention.id,
+					title: mention.title,
+					document_type,
+					kind,
+					children: [{ text: "" }],
+				};
+
+				editor.tf.withoutNormalizing(() => {
+					const selection = editor.selection;
+
+					// No active selection (focus moved to a picker) — snap
+					// to end-of-doc so the chip appends cleanly.
+					if (!selection) {
+						editor.tf.select(editor.api.end([]));
+					} else if (removeTriggerText) {
+						// Delete the in-progress "@query" so the chip stands in for it.
+						const cursorCtx = getCursorTextContext(getCurrentValue(), selection);
+						if (cursorCtx) {
+							const text = cursorCtx.text;
+							let triggerIndex = -1;
+							for (let i = cursorCtx.cursor - 1; i >= 0; i--) {
+								if (text[i] === "@") {
+									triggerIndex = i;
+									break;
+								}
+								if (text[i] === " " || text[i] === "\n") break;
+							}
+							if (triggerIndex >= 0 && triggerIndex < cursorCtx.cursor) {
+								const path = [cursorCtx.blockIndex, cursorCtx.childIndex];
+								editor.tf.delete({
+									at: {
+										anchor: { path, offset: triggerIndex },
+										focus: { path, offset: cursorCtx.cursor },
+									},
+								});
+							}
+						}
+					}
+
+					editor.tf.insertNodes([mentionNode, { text: " " }] as unknown as TElement[], {
+						select: true,
+					});
+				});
+				editor.tf.focus();
+			},
+			[editor, getCurrentValue]
+		);
+
+		// Doc-only shim that routes through ``insertMentionChip``.
+		const insertDocumentChip = useCallback(
+			(
+				doc: Pick<Document, "id" | "title" | "document_type">,
+				options?: { removeTriggerText?: boolean }
+			) => {
+				insertMentionChip({ ...doc, kind: "doc" }, options);
+			},
+			[insertMentionChip]
+		);
+
+		// Remove chip(s) matching (id, document_type). Iterates in
+		// descending path order so removing one entry can't invalidate
+		// later paths. Chips are deduped today, so this typically runs
+		// at most once.
+		const removeDocumentChip = useCallback(
+			(docId: number, docType?: string) => {
+				const match = (n: unknown) => {
+					if (!n || typeof n !== "object" || !("type" in n)) return false;
+					const node = n as MentionElementNode;
+					if (node.type !== MENTION_TYPE) return false;
+					if (node.id !== docId) return false;
+					return (node.document_type ?? "UNKNOWN") === (docType ?? "UNKNOWN");
+				};
+
+				const entries = Array.from(editor.api.nodes({ at: [], match })) as NodeEntry[];
+				if (entries.length === 0) return;
+				editor.tf.withoutNormalizing(() => {
+					for (const [, path] of entries.reverse()) {
+						editor.tf.removeNodes({ at: path });
+					}
+				});
+			},
+			[editor]
+		);
+
+		// Single removal call site for Backspace and the X button so the
+		// two can never diverge (e.g. one forgetting to notify the parent).
+		const removeChip = useCallback(
+			(docId: number, docType: string | undefined) => {
+				removeDocumentChip(docId, docType);
+				onDocumentRemove?.(docId, docType);
+			},
+			[onDocumentRemove, removeDocumentChip]
+		);
+
+		// Update chip status in place via ``tf.setNodes`` so the user's
+		// selection survives backend status events arriving mid-typing.
 		const setDocumentChipStatus = useCallback(
 			(
 				docId: number,
 				docType: string | undefined,
 				statusLabel: string | null,
-				statusKind: "pending" | "processing" | "ready" | "failed" = "pending"
+				statusKind: MentionStatusKind = "pending"
 			) => {
-				if (!editorRef.current) return;
+				const match = (n: unknown) => {
+					if (!n || typeof n !== "object" || !("type" in n)) return false;
+					const node = n as MentionElementNode;
+					if (node.type !== MENTION_TYPE) return false;
+					if (node.id !== docId) return false;
+					return (node.document_type ?? "UNKNOWN") === (docType ?? "UNKNOWN");
+				};
 
-				const chips = editorRef.current.querySelectorAll<HTMLSpanElement>(
-					`span[${CHIP_DATA_ATTR}="true"]`
+				editor.tf.setNodes(
+					{
+						statusLabel,
+						statusKind: statusLabel ? statusKind : undefined,
+					} as Partial<TElement>,
+					{ at: [], match }
 				);
-				for (const chip of chips) {
-					const chipId = getChipId(chip);
-					const chipType = getChipDocType(chip);
-					if (chipId !== docId) continue;
-					if ((docType ?? "UNKNOWN") !== chipType) continue;
-
-					const statusEl = chip.querySelector<HTMLSpanElement>(`span[${CHIP_STATUS_ATTR}="true"]`);
-					if (!statusEl) continue;
-
-					if (!statusLabel) {
-						statusEl.textContent = "";
-						statusEl.className = "text-[10px] font-semibold opacity-80 hidden";
-						continue;
-					}
-
-					const statusClass =
-						statusKind === "failed"
-							? "text-destructive"
-							: statusKind === "processing"
-								? "text-amber-700"
-								: statusKind === "ready"
-									? "text-emerald-700"
-									: "text-amber-700";
-					statusEl.textContent = statusLabel;
-					statusEl.className = `text-[10px] font-semibold opacity-80 ${statusClass}`;
-				}
 			},
-			[]
+			[editor]
 		);
 
-		const removeDocumentChip = useCallback(
-			(docId: number, docType?: string) => {
-				if (!editorRef.current) return;
-				const chipKey = `${docType ?? "UNKNOWN"}:${docId}`;
-				const chips = editorRef.current.querySelectorAll<HTMLSpanElement>(
-					`span[${CHIP_DATA_ATTR}="true"]`
-				);
-				for (const chip of chips) {
-					if (getChipId(chip) === docId && getChipDocType(chip) === (docType ?? "UNKNOWN")) {
-						chip.remove();
-						break;
-					}
-				}
-				setMentionedDocs((prev) => {
-					const next = new Map(prev);
-					next.delete(chipKey);
-					return next;
-				});
+		const clear = useCallback(() => {
+			setValue(EMPTY_VALUE);
+			// ``tf.setValue`` wipes the selection — refocus so the caret
+			// returns after Enter-to-submit.
+			requestAnimationFrame(focusAtEnd);
+		}, [focusAtEnd, setValue]);
 
-				const text = getText();
-				const empty = text.length === 0 && mentionedDocs.size <= 1;
-				setIsEmpty(empty);
+		const setText = useCallback(
+			(text: string) => {
+				setValue(toValueFromText(text));
+				requestAnimationFrame(focusAtEnd);
 			},
-			[getText, mentionedDocs.size]
+			[focusAtEnd, setValue]
 		);
 
-		// Expose methods via ref
-		useImperativeHandle(ref, () => ({
-			focus: () => editorRef.current?.focus(),
-			clear,
-			setText,
-			getText,
-			getMentionedDocuments,
-			insertDocumentChip,
-			removeDocumentChip,
-			setDocumentChipStatus,
-		}));
+		const getText = useCallback(() => getPlainText(getCurrentValue()), [getCurrentValue]);
+		const getMentionedDocs = useCallback(
+			() => getMentionedDocuments(getCurrentValue()),
+			[getCurrentValue]
+		);
 
-		// Handle input changes
-		const handleInput = useCallback(() => {
-			if (!editorRef.current) return;
-
-			const text = getText();
-			const empty = text.length === 0 && mentionedDocs.size === 0;
-			setIsEmpty(empty);
-
-			// Check for @ mentions
-			const selection = window.getSelection();
-			let shouldTriggerMention = false;
-			let mentionQuery = "";
-
-			if (selection && selection.rangeCount > 0) {
-				const range = selection.getRangeAt(0);
-				const textNode = range.startContainer;
-
-				if (textNode.nodeType === Node.TEXT_NODE) {
-					const textContent = textNode.textContent || "";
-					const cursorPos = range.startOffset;
-
-					// Look for @ before cursor
-					let atIndex = -1;
-					for (let i = cursorPos - 1; i >= 0; i--) {
-						if (textContent[i] === "@") {
-							atIndex = i;
-							break;
+		useImperativeHandle(
+			ref,
+			() => ({
+				// Preserve existing selection if any; otherwise seed one
+				// at end-of-doc so the contentEditable shows a caret.
+				focus: () => {
+					try {
+						if (!editor.selection) {
+							editor.tf.select(editor.api.end([]));
 						}
-						// Stop if we hit a space (@ must be at word boundary)
-						if (textContent[i] === " " || textContent[i] === "\n") {
-							break;
-						}
+						editor.tf.focus();
+					} catch {
+						editableRef.current?.focus();
 					}
+				},
+				clear,
+				setText,
+				getText,
+				getMentionedDocuments: getMentionedDocs,
+				insertMentionChip,
+				insertDocumentChip,
+				removeDocumentChip,
+				setDocumentChipStatus,
+			}),
+			[
+				clear,
+				editor,
+				getMentionedDocs,
+				getText,
+				insertMentionChip,
+				insertDocumentChip,
+				removeDocumentChip,
+				setDocumentChipStatus,
+				setText,
+			]
+		);
 
-					if (atIndex !== -1) {
-						const query = textContent.slice(atIndex + 1, cursorPos);
-						// Only trigger if query doesn't start with space
-						if (!query.startsWith(" ")) {
-							shouldTriggerMention = true;
-							mentionQuery = query;
-						}
-					}
-				}
-			}
-
-			// Check for / actions (same pattern as @)
-			let shouldTriggerAction = false;
-			let actionQuery = "";
-
-			if (!shouldTriggerMention && selection && selection.rangeCount > 0) {
-				const range = selection.getRangeAt(0);
-				const textNode = range.startContainer;
-
-				if (textNode.nodeType === Node.TEXT_NODE) {
-					const textContent = textNode.textContent || "";
-					const cursorPos = range.startOffset;
-
-					let slashIndex = -1;
-					for (let i = cursorPos - 1; i >= 0; i--) {
-						if (textContent[i] === "/") {
-							slashIndex = i;
-							break;
-						}
-						if (textContent[i] === " " || textContent[i] === "\n") {
-							break;
-						}
-					}
-
-					if (
-						slashIndex !== -1 &&
-						(slashIndex === 0 ||
-							textContent[slashIndex - 1] === " " ||
-							textContent[slashIndex - 1] === "\n")
-					) {
-						const query = textContent.slice(slashIndex + 1, cursorPos);
-						if (!query.startsWith(" ")) {
-							shouldTriggerAction = true;
-							actionQuery = query;
-						}
-					}
-				}
-			}
-
-			// If no @ found before cursor, check if text contains @ at all
-			// If text is empty or doesn't contain @, close the mention
-			if (!shouldTriggerMention) {
-				if (text.length === 0 || !text.includes("@")) {
-					onMentionClose?.();
-				} else {
-					// Text contains @ but not before cursor, close mention
-					onMentionClose?.();
-				}
-			} else {
-				onMentionTrigger?.(mentionQuery);
-			}
-
-			if (!shouldTriggerAction) {
-				onActionClose?.();
-			} else {
-				onActionTrigger?.(actionQuery);
-			}
-
-			// Notify parent of change
-			onChange?.(text, Array.from(mentionedDocs.values()));
-		}, [
-			getText,
-			mentionedDocs,
-			onChange,
-			onMentionTrigger,
-			onMentionClose,
-			onActionTrigger,
-			onActionClose,
-		]);
-
-		// Handle keydown
 		const handleKeyDown = useCallback(
 			(e: React.KeyboardEvent<HTMLDivElement>) => {
-				// Let parent handle navigation keys when mention popover is open
-				if (onKeyDown) {
-					onKeyDown(e);
-					if (e.defaultPrevented) return;
-				}
+				onKeyDown?.(e);
+				if (e.defaultPrevented) return;
 
-				// Handle Enter for submit (without shift)
 				if (e.key === "Enter" && !e.shiftKey) {
 					e.preventDefault();
 					onSubmit?.();
 					return;
 				}
 
-				// Handle backspace on chips
-				if (e.key === "Backspace") {
-					const selection = window.getSelection();
-					if (selection && selection.rangeCount > 0) {
-						const range = selection.getRangeAt(0);
-						if (range.collapsed) {
-							// Check if cursor is right after a chip
-							const node = range.startContainer;
-							const offset = range.startOffset;
-
-							if (node.nodeType === Node.TEXT_NODE && offset === 0) {
-								// Check previous sibling using type guard
-								const prevSibling = node.previousSibling;
-								if (isChipElement(prevSibling)) {
-									e.preventDefault();
-									const chipId = getChipId(prevSibling);
-									const chipDocType = getChipDocType(prevSibling);
-									if (chipId !== null) {
-										prevSibling.remove();
-										const chipKey = `${chipDocType}:${chipId}`;
-										setMentionedDocs((prev) => {
-											const next = new Map(prev);
-											next.delete(chipKey);
-											return next;
-										});
-										// Notify parent that a document was removed
-										onDocumentRemove?.(chipId, chipDocType);
-									}
-									return;
-								}
-								// Check if we're about to delete @ at the start
-								const textContent = node.textContent || "";
-								if (textContent.length > 0 && textContent[0] === "@") {
-									// Will delete @, close mention popover
-									setTimeout(() => {
-										onMentionClose?.();
-									}, 0);
-								}
-							} else if (node.nodeType === Node.TEXT_NODE && offset > 0) {
-								// Check if we're about to delete @
-								const textContent = node.textContent || "";
-								if (textContent[offset - 1] === "@") {
-									// Will delete @, close mention popover
-									setTimeout(() => {
-										onMentionClose?.();
-									}, 0);
-								}
-							} else if (node.nodeType === Node.ELEMENT_NODE && offset > 0) {
-								// Check if previous child is a chip using type guard
-								const prevChild = (node as Element).childNodes[offset - 1];
-								if (isChipElement(prevChild)) {
-									e.preventDefault();
-									const chipId = getChipId(prevChild);
-									const chipDocType = getChipDocType(prevChild);
-									if (chipId !== null) {
-										prevChild.remove();
-										const chipKey = `${chipDocType}:${chipId}`;
-										setMentionedDocs((prev) => {
-											const next = new Map(prev);
-											next.delete(chipKey);
-											return next;
-										});
-										// Notify parent that a document was removed
-										onDocumentRemove?.(chipId, chipDocType);
-									}
-								}
-							}
-						}
-					}
+				if (e.key !== "Backspace") return;
+				const selection = editor.selection;
+				if (!selection || !selection.anchor || !selection.focus) return;
+				if (
+					selection.anchor.path.length < 2 ||
+					selection.focus.path.length < 2 ||
+					selection.anchor.path[0] !== selection.focus.path[0]
+				) {
+					return;
 				}
+				if (selection.anchor.offset !== 0 || selection.focus.offset !== 0) return;
+
+				const value = getCurrentValue();
+				const block = value[selection.anchor.path[0]];
+				if (!block) return;
+				const childIndex = selection.anchor.path[1];
+				if (childIndex <= 0) return;
+				const prev = block.children[childIndex - 1];
+				if (!isMentionNode(prev)) return;
+
+				e.preventDefault();
+				removeChip(prev.id, prev.document_type);
 			},
-			[onKeyDown, onSubmit, onDocumentRemove, onMentionClose]
+			[editor.selection, getCurrentValue, onKeyDown, onSubmit, removeChip]
 		);
 
-		// Handle paste - strip formatting
-		const handlePaste = useCallback((e: React.ClipboardEvent) => {
-			e.preventDefault();
-			const text = e.clipboardData.getData("text/plain");
-			document.execCommand("insertText", false, text);
-		}, []);
+		const editableProps = useMemo(
+			() => ({
+				placeholder,
+				onPaste: (e: React.ClipboardEvent<HTMLDivElement>) => {
+					e.preventDefault();
+					const text = e.clipboardData.getData("text/plain");
+					const tf = editor.tf as { insertText: (value: string) => void };
+					tf.insertText(text);
+				},
+				onKeyDown: handleKeyDown,
+			}),
+			[editor, handleKeyDown, placeholder]
+		);
 
-		// Handle composition (for IME input)
-		const handleCompositionStart = useCallback(() => {
-			isComposingRef.current = true;
-		}, []);
-
-		const handleCompositionEnd = useCallback(() => {
-			isComposingRef.current = false;
-			handleInput();
-		}, [handleInput]);
+		const mentionEditorContextValue = useMemo<MentionEditorContextValue>(
+			() => ({ removeChip }),
+			[removeChip]
+		);
 
 		return (
 			<div className="relative w-full">
-				{/** biome-ignore lint/a11y/useSemanticElements: <not important> */}
-				<div
-					ref={editorRef}
-					contentEditable={!disabled}
-					suppressContentEditableWarning
-					tabIndex={disabled ? -1 : 0}
-					onInput={handleInput}
-					onKeyDown={handleKeyDown}
-					onPaste={handlePaste}
-					onCompositionStart={handleCompositionStart}
-					onCompositionEnd={handleCompositionEnd}
-					className={cn(
-						"min-h-[24px] max-h-32 overflow-y-auto",
-						"text-sm outline-none",
-						"whitespace-pre-wrap wrap-break-word",
-						disabled && "opacity-50 cursor-not-allowed",
-						className
-					)}
-					style={{ wordBreak: "break-word" }}
-					data-placeholder={placeholder}
-					aria-label="Message input with inline mentions"
-					role="textbox"
-					aria-multiline="true"
-				/>
-				{/* Placeholder with fade animation on change */}
-				{isEmpty && (
-					<div
-						key={placeholder}
-						className="absolute top-0 left-0 pointer-events-none text-muted-foreground text-sm animate-in fade-in duration-1000"
-						aria-hidden="true"
+				<MentionEditorContext.Provider value={mentionEditorContextValue}>
+					<Plate
+						editor={editor}
+						onChange={({ value }) => {
+							emitState(value as ComposerValue);
+						}}
 					>
-						{placeholder}
-					</div>
-				)}
+						<PlateContent
+							ref={editableRef}
+							readOnly={disabled}
+							{...editableProps}
+							className={cn(
+								"min-h-[24px] max-h-32 overflow-y-auto outline-none whitespace-pre-wrap wrap-break-word",
+								COMPOSER_TEXT_METRICS_CLASSNAME,
+								disabled && "opacity-50 cursor-not-allowed",
+								className
+							)}
+						/>
+					</Plate>
+				</MentionEditorContext.Provider>
 			</div>
 		);
 	}

@@ -13,23 +13,9 @@ import type { SearchSourceConnector } from "@/contracts/types/connector.types";
 import { authenticatedFetch } from "@/lib/auth-utils";
 import { formatRelativeDate } from "@/lib/format-date";
 import { cn } from "@/lib/utils";
+import { getReauthEndpoint, LIVE_CONNECTOR_TYPES } from "../constants/connector-constants";
 import { useConnectorStatus } from "../hooks/use-connector-status";
 import { getConnectorDisplayName } from "../tabs/all-connectors-tab";
-
-const REAUTH_ENDPOINTS: Partial<Record<string, string>> = {
-	[EnumConnectorName.LINEAR_CONNECTOR]: "/api/v1/auth/linear/connector/reauth",
-	[EnumConnectorName.NOTION_CONNECTOR]: "/api/v1/auth/notion/connector/reauth",
-	[EnumConnectorName.GOOGLE_DRIVE_CONNECTOR]: "/api/v1/auth/google/drive/connector/reauth",
-	[EnumConnectorName.GOOGLE_GMAIL_CONNECTOR]: "/api/v1/auth/google/gmail/connector/reauth",
-	[EnumConnectorName.GOOGLE_CALENDAR_CONNECTOR]: "/api/v1/auth/google/calendar/connector/reauth",
-	[EnumConnectorName.COMPOSIO_GOOGLE_DRIVE_CONNECTOR]: "/api/v1/auth/composio/connector/reauth",
-	[EnumConnectorName.COMPOSIO_GMAIL_CONNECTOR]: "/api/v1/auth/composio/connector/reauth",
-	[EnumConnectorName.COMPOSIO_GOOGLE_CALENDAR_CONNECTOR]: "/api/v1/auth/composio/connector/reauth",
-	[EnumConnectorName.ONEDRIVE_CONNECTOR]: "/api/v1/auth/onedrive/connector/reauth",
-	[EnumConnectorName.JIRA_CONNECTOR]: "/api/v1/auth/jira/connector/reauth",
-	[EnumConnectorName.DROPBOX_CONNECTOR]: "/api/v1/auth/dropbox/connector/reauth",
-	[EnumConnectorName.CONFLUENCE_CONNECTOR]: "/api/v1/auth/confluence/connector/reauth",
-};
 
 interface ConnectorAccountsListViewProps {
 	connectorType: string;
@@ -38,17 +24,10 @@ interface ConnectorAccountsListViewProps {
 	indexingConnectorIds: Set<number>;
 	onBack: () => void;
 	onManage: (connector: SearchSourceConnector) => void;
+	onDisconnect?: (connector: SearchSourceConnector) => Promise<void> | void;
 	onAddAccount: () => void;
 	isConnecting?: boolean;
 	addButtonText?: string;
-}
-
-/**
- * Check if a connector type is indexable
- */
-function isIndexableConnector(connectorType: string): boolean {
-	const nonIndexableTypes = ["MCP_CONNECTOR"];
-	return !nonIndexableTypes.includes(connectorType);
 }
 
 export const ConnectorAccountsListView: FC<ConnectorAccountsListViewProps> = ({
@@ -58,12 +37,15 @@ export const ConnectorAccountsListView: FC<ConnectorAccountsListViewProps> = ({
 	indexingConnectorIds,
 	onBack,
 	onManage,
+	onDisconnect,
 	onAddAccount,
 	isConnecting = false,
 	addButtonText,
 }) => {
 	const searchSpaceId = useAtomValue(activeSearchSpaceIdAtom);
 	const [reauthingId, setReauthingId] = useState<number | null>(null);
+	const [confirmDisconnectId, setConfirmDisconnectId] = useState<number | null>(null);
+	const [disconnectingId, setDisconnectingId] = useState<number | null>(null);
 
 	// Get connector status
 	const { isConnectorEnabled, getConnectorStatusMessage } = useConnectorStatus();
@@ -71,16 +53,15 @@ export const ConnectorAccountsListView: FC<ConnectorAccountsListViewProps> = ({
 	const isEnabled = isConnectorEnabled(connectorType);
 	const statusMessage = getConnectorStatusMessage(connectorType);
 
-	const reauthEndpoint = REAUTH_ENDPOINTS[connectorType];
-
 	const handleReauth = useCallback(
-		async (connectorId: number) => {
-			if (!searchSpaceId || !reauthEndpoint) return;
-			setReauthingId(connectorId);
+		async (connector: SearchSourceConnector) => {
+			const endpoint = getReauthEndpoint(connector);
+			if (!searchSpaceId || !endpoint) return;
+			setReauthingId(connector.id);
 			try {
 				const backendUrl = process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL || "http://localhost:8000";
-				const url = new URL(`${backendUrl}${reauthEndpoint}`);
-				url.searchParams.set("connector_id", String(connectorId));
+				const url = new URL(`${backendUrl}${endpoint}`);
+				url.searchParams.set("connector_id", String(connector.id));
 				url.searchParams.set("space_id", String(searchSpaceId));
 				url.searchParams.set("return_url", window.location.pathname);
 				const response = await authenticatedFetch(url.toString());
@@ -102,7 +83,7 @@ export const ConnectorAccountsListView: FC<ConnectorAccountsListViewProps> = ({
 				setReauthingId(null);
 			}
 		},
-		[searchSpaceId, reauthEndpoint]
+		[searchSpaceId]
 	);
 
 	// Filter connectors to only show those of this type
@@ -127,16 +108,17 @@ export const ConnectorAccountsListView: FC<ConnectorAccountsListViewProps> = ({
 	return (
 		<div className="flex flex-col h-full">
 			{/* Header */}
-			<div className="px-6 sm:px-12 pt-8 sm:pt-10 pb-1 sm:pb-4 border-b border-border/50 bg-muted">
+			<div className="px-6 sm:px-12 pt-8 sm:pt-10 pb-1 sm:pb-4 bg-popover">
 				{/* Back button */}
-				<button
+				<Button
 					type="button"
+					variant="ghost"
 					onClick={onBack}
-					className="flex items-center gap-2 text-xs sm:text-sm text-muted-foreground hover:text-foreground mb-6 w-fit"
+					className="mb-6 h-auto w-fit gap-2 px-0 py-0 text-xs font-normal text-muted-foreground hover:bg-transparent hover:text-accent-foreground sm:text-sm"
 				>
 					<ArrowLeft className="size-4" />
 					Back to connectors
-				</button>
+				</Button>
 
 				{/* Connector header */}
 				<div className="flex flex-col sm:flex-row items-start sm:items-center gap-4 mb-6">
@@ -149,20 +131,21 @@ export const ConnectorAccountsListView: FC<ConnectorAccountsListViewProps> = ({
 								{connectorTitle}
 							</h2>
 							<p className="text-xs sm:text-base text-muted-foreground mt-1">
-								{statusMessage || "Manage your connector settings and sync configuration"}
+								{statusMessage || "Manage your connected accounts"}
 							</p>
 						</div>
 					</div>
 					{/* Add Account Button with dashed border */}
-					<button
+					<Button
 						type="button"
+						variant="ghost"
 						onClick={onAddAccount}
 						disabled={isConnecting || !isEnabled}
 						className={cn(
-							"flex items-center justify-center gap-1.5 h-8 px-3 rounded-md border-2 border-dashed text-xs sm:text-sm transition-all duration-200 shrink-0 w-full sm:w-auto",
+							"h-8 w-full shrink-0 gap-1.5 rounded-md border-2 border-dashed px-3 text-xs transition-all duration-200 sm:w-auto sm:text-sm",
 							!isEnabled
 								? "border-border/30 opacity-50 cursor-not-allowed"
-								: "border-slate-400/20 dark:border-white/20 hover:bg-primary/5",
+								: "border-slate-400/20 dark:border-white/20 hover:bg-accent hover:text-accent-foreground",
 							isConnecting && "opacity-50 cursor-not-allowed"
 						)}
 					>
@@ -174,7 +157,7 @@ export const ConnectorAccountsListView: FC<ConnectorAccountsListViewProps> = ({
 							)}
 						</div>
 						<span className="text-xs sm:text-sm font-medium">{buttonText}</span>
-					</button>
+					</Button>
 				</div>
 			</div>
 
@@ -203,7 +186,12 @@ export const ConnectorAccountsListView: FC<ConnectorAccountsListViewProps> = ({
 					<div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
 						{typeConnectors.map((connector) => {
 							const isIndexing = indexingConnectorIds.has(connector.id);
-							const isAuthExpired = !!reauthEndpoint && connector.config?.auth_expired === true;
+							const connectorReauthEndpoint = getReauthEndpoint(connector);
+							const isAuthExpired =
+								!!connectorReauthEndpoint && connector.config?.auth_expired === true;
+							const isLive =
+								LIVE_CONNECTOR_TYPES.has(connector.connector_type) ||
+								Boolean(connector.config?.server_config);
 
 							return (
 								<div
@@ -212,7 +200,7 @@ export const ConnectorAccountsListView: FC<ConnectorAccountsListViewProps> = ({
 										"flex items-center gap-4 p-4 rounded-xl transition-all",
 										isIndexing
 											? "bg-primary/5 border-0"
-											: "bg-slate-400/5 dark:bg-white/5 hover:bg-slate-400/10 dark:hover:bg-white/10 border border-border"
+											: "bg-slate-400/5 dark:bg-white/5 hover:bg-accent hover:text-accent-foreground border border-border"
 									)}
 								>
 									<div
@@ -234,21 +222,19 @@ export const ConnectorAccountsListView: FC<ConnectorAccountsListViewProps> = ({
 												<Spinner size="xs" />
 												Syncing
 											</p>
-										) : (
-											<p className="text-[10px] text-muted-foreground mt-1 whitespace-nowrap truncate">
-												{isIndexableConnector(connector.connector_type)
-													? connector.last_indexed_at
-														? `Last indexed: ${formatRelativeDate(connector.last_indexed_at)}`
-														: "Never indexed"
-													: "Active"}
+										) : !isLive ? (
+											<p className="text-[10px] mt-1 whitespace-nowrap truncate text-muted-foreground">
+												{connector.last_indexed_at
+													? `Last indexed: ${formatRelativeDate(connector.last_indexed_at)}`
+													: "Never indexed"}
 											</p>
-										)}
+										) : null}
 									</div>
 									{isAuthExpired ? (
 										<Button
 											size="sm"
-											className="h-8 text-[11px] px-3 rounded-lg font-medium bg-amber-600 hover:bg-amber-700 text-white border-0 shadow-xs shrink-0"
-											onClick={() => handleReauth(connector.id)}
+											className="h-8 text-[11px] px-3 font-medium bg-amber-600 hover:bg-amber-700 text-white border-0 shadow-xs shrink-0"
+											onClick={() => handleReauth(connector)}
 											disabled={reauthingId === connector.id}
 										>
 											<RefreshCw
@@ -256,11 +242,55 @@ export const ConnectorAccountsListView: FC<ConnectorAccountsListViewProps> = ({
 											/>
 											Re-authenticate
 										</Button>
+									) : isLive && onDisconnect ? (
+										confirmDisconnectId === connector.id ? (
+											<div className="flex items-center gap-1.5 shrink-0">
+												<Button
+													variant="destructive"
+													size="sm"
+													className="h-8 text-[11px] px-3 font-medium shadow-xs"
+													onClick={async () => {
+														setDisconnectingId(connector.id);
+														setConfirmDisconnectId(null);
+														try {
+															await onDisconnect(connector);
+														} finally {
+															setDisconnectingId(null);
+														}
+													}}
+													disabled={disconnectingId === connector.id}
+												>
+													{disconnectingId === connector.id ? (
+														<RefreshCw className="size-3.5 animate-spin" />
+													) : (
+														"Confirm"
+													)}
+												</Button>
+												<Button
+													variant="ghost"
+													size="sm"
+													className="h-8 text-[11px] px-2"
+													onClick={() => setConfirmDisconnectId(null)}
+													disabled={disconnectingId === connector.id}
+												>
+													Cancel
+												</Button>
+											</div>
+										) : (
+											<Button
+												variant="destructive"
+												size="sm"
+												className="h-8 text-[11px] px-3 font-medium shrink-0"
+												onClick={() => setConfirmDisconnectId(connector.id)}
+											>
+												Disconnect
+											</Button>
+										)
 									) : (
 										<Button
 											variant="secondary"
 											size="sm"
-											className="h-8 text-[11px] px-3 rounded-lg font-medium bg-white text-slate-700 hover:bg-slate-50 border-0 shadow-xs dark:bg-secondary dark:text-secondary-foreground dark:hover:bg-secondary/80 shrink-0"
+											className="h-8 text-[11px] px-3 font-medium bg-white text-slate-700 hover:bg-accent hover:text-accent-foreground border-0 shadow-xs dark:bg-secondary dark:text-secondary-foreground shrink-0"
 											onClick={() => onManage(connector)}
 										>
 											Manage

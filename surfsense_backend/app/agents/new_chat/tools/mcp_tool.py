@@ -7,28 +7,49 @@ Supports both transport types:
 - stdio: Local process-based MCP servers (command, args, env)
 - streamable-http/http/sse: Remote HTTP-based MCP servers (url, headers)
 
-This implements real MCP protocol support similar to Cursor's implementation.
+All MCP tools are unconditionally gated by HITL (Human-in-the-Loop) approval.
+Per the MCP spec: "Clients MUST consider tool annotations to be untrusted unless
+they come from trusted servers."  Users can bypass HITL for specific tools by
+clicking "Always Allow", which adds the tool name to the connector's
+``config.trusted_tools`` allow-list.
 """
 
+from __future__ import annotations
+
+import asyncio
 import logging
 import time
-from typing import Any
+from collections import defaultdict
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from app.utils.oauth_security import TokenEncryption
 
 from langchain_core.tools import StructuredTool
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
-from pydantic import BaseModel, create_model
-from sqlalchemy import select
+from pydantic import BaseModel, ConfigDict, Field, create_model
+from sqlalchemy import cast, select
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.new_chat.middleware.dedup_tool_calls import dedup_key_full_args
+from app.agents.new_chat.tools.hitl import request_approval
 from app.agents.new_chat.tools.mcp_client import MCPClient
-from app.db import SearchSourceConnector, SearchSourceConnectorType
+from app.db import SearchSourceConnector
+from app.services.mcp_oauth.registry import MCP_SERVICES, get_service_by_connector_type
 
 logger = logging.getLogger(__name__)
 
 _MCP_CACHE_TTL_SECONDS = 300  # 5 minutes
 _MCP_CACHE_MAX_SIZE = 50
-_mcp_tools_cache: dict[int, tuple[float, list[StructuredTool]]] = {}
+_MCP_DISCOVERY_TIMEOUT_SECONDS = 30
+_TOOL_CALL_MAX_RETRIES = 3
+_TOOL_CALL_RETRY_DELAY = 1.5  # seconds, doubles per attempt
+# Keyed by ``(search_space_id, bypass_internal_hitl)`` so single-agent and
+# multi-agent paths cannot share tool closures with different HITL wiring.
+_MCPCacheKey = tuple[int, bool]
+_mcp_tools_cache: dict[_MCPCacheKey, tuple[float, list[StructuredTool]]] = {}
 
 
 def _evict_expired_mcp_cache() -> None:
@@ -51,100 +72,173 @@ def _create_dynamic_input_model_from_schema(
 ) -> type[BaseModel]:
     """Create a Pydantic model from MCP tool's JSON schema.
 
-    Args:
-        tool_name: Name of the tool (used for model class name)
-        input_schema: JSON schema from MCP server
+    Models always allow extra fields (``extra="allow"``) so that parameters
+    missing from a broken or incomplete JSON schema (e.g. ``zod-to-json-schema``
+    producing an empty ``$schema``-only object) can still be forwarded to the
+    MCP server.
 
-    Returns:
-        Pydantic model class for tool input validation
-
+    When the schema declares **no** properties, a synthetic ``input_data``
+    field of type ``dict`` is injected so the LLM has a visible parameter to
+    populate.  The caller should unpack ``input_data`` before forwarding to
+    the MCP server (see ``_unpack_synthetic_input_data``).
     """
     properties = input_schema.get("properties", {})
     required_fields = input_schema.get("required", [])
 
-    # Build Pydantic field definitions
     field_definitions = {}
     for param_name, param_schema in properties.items():
         param_description = param_schema.get("description", "")
         is_required = param_name in required_fields
 
-        # Use Any type for complex schemas to preserve structure
-        # This allows the MCP server to do its own validation
-        from typing import Any as AnyType
-
-        from pydantic import Field
-
         if is_required:
             field_definitions[param_name] = (
-                AnyType,
+                Any,
                 Field(..., description=param_description),
             )
         else:
             field_definitions[param_name] = (
-                AnyType | None,
+                Any | None,
                 Field(None, description=param_description),
             )
 
-    # Create dynamic model
+    if not properties:
+        field_definitions["input_data"] = (
+            dict[str, Any] | None,
+            Field(
+                None,
+                description=(
+                    "Arguments to pass to this tool as a JSON object. "
+                    "Infer sensible key names from the tool name and description "
+                    '(e.g. {"search": "my query"} for a search tool).'
+                ),
+            ),
+        )
+
     model_name = f"{tool_name.replace(' ', '').replace('-', '_')}Input"
-    return create_model(model_name, **field_definitions)
+    model = create_model(
+        model_name, __config__=ConfigDict(extra="allow"), **field_definitions
+    )
+    return model
+
+
+def _unpack_synthetic_input_data(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Unpack the synthetic ``input_data`` field into top-level kwargs.
+
+    When the MCP tool schema is empty, ``_create_dynamic_input_model_from_schema``
+    adds a catch-all ``input_data: dict`` field.  This helper merges that dict
+    back into the top-level kwargs so the MCP server receives flat arguments.
+    """
+    input_data = kwargs.pop("input_data", None)
+    if isinstance(input_data, dict):
+        kwargs.update(input_data)
+    return kwargs
 
 
 async def _create_mcp_tool_from_definition_stdio(
     tool_def: dict[str, Any],
     mcp_client: MCPClient,
+    *,
+    connector_name: str = "",
+    connector_id: int | None = None,
+    trusted_tools: list[str] | None = None,
+    bypass_internal_hitl: bool = False,
 ) -> StructuredTool:
     """Create a LangChain tool from an MCP tool definition (stdio transport).
 
-    Args:
-        tool_def: Tool definition from MCP server with name, description, input_schema
-        mcp_client: MCP client instance for calling the tool
-
-    Returns:
-        LangChain StructuredTool instance
-
+    Set ``bypass_internal_hitl=True`` when an outer ``HumanInTheLoopMiddleware``
+    already gates the tool, otherwise the body's ``request_approval()`` is the
+    sole HITL gate (single-agent path).
     """
     tool_name = tool_def.get("name", "unnamed_tool")
-    tool_description = tool_def.get("description", "No description provided")
+    raw_description = tool_def.get("description", "No description provided")
+    tool_description = (
+        f"[MCP server: {connector_name}] {raw_description}"
+        if connector_name
+        else raw_description
+    )
     input_schema = tool_def.get("input_schema", {"type": "object", "properties": {}})
 
-    # Log the actual schema for debugging
-    logger.info(f"MCP tool '{tool_name}' input schema: {input_schema}")
+    logger.debug("MCP tool '%s' input schema: %s", tool_name, input_schema)
 
-    # Create dynamic input model from schema
     input_model = _create_dynamic_input_model_from_schema(tool_name, input_schema)
 
     async def mcp_tool_call(**kwargs) -> str:
         """Execute the MCP tool call via the client with retry support."""
-        logger.info(f"MCP tool '{tool_name}' called with params: {kwargs}")
+        logger.debug("MCP tool '%s' called", tool_name)
 
-        try:
-            # Connect to server and call tool (connect has built-in retry logic)
-            async with mcp_client.connect():
-                result = await mcp_client.call_tool(tool_name, kwargs)
-                return str(result)
-        except RuntimeError as e:
-            # Connection failures after all retries
-            error_msg = f"MCP tool '{tool_name}' connection failed after retries: {e!s}"
-            logger.error(error_msg)
-            return f"Error: {error_msg}"
-        except Exception as e:
-            # Tool execution or other errors
-            error_msg = f"MCP tool '{tool_name}' execution failed: {e!s}"
-            logger.exception(error_msg)
-            return f"Error: {error_msg}"
+        if bypass_internal_hitl:
+            call_kwargs = _unpack_synthetic_input_data(
+                {k: v for k, v in kwargs.items() if v is not None}
+            )
+        else:
+            # Outside try/except so ``GraphInterrupt`` propagates to LangGraph.
+            hitl_result = request_approval(
+                action_type="mcp_tool_call",
+                tool_name=tool_name,
+                params=kwargs,
+                context={
+                    "mcp_server": connector_name,
+                    "tool_description": raw_description,
+                    "mcp_transport": "stdio",
+                    "mcp_connector_id": connector_id,
+                },
+                trusted_tools=trusted_tools,
+            )
+            if hitl_result.rejected:
+                return "Tool call rejected by user."
+            call_kwargs = _unpack_synthetic_input_data(
+                {k: v for k, v in hitl_result.params.items() if v is not None}
+            )
 
-    # Create StructuredTool with response_format to preserve exact schema
+        last_error: Exception | None = None
+        for attempt in range(_TOOL_CALL_MAX_RETRIES):
+            try:
+                async with mcp_client.connect():
+                    result = await mcp_client.call_tool(tool_name, call_kwargs)
+                    return str(result)
+            except Exception as e:
+                last_error = e
+                if attempt < _TOOL_CALL_MAX_RETRIES - 1:
+                    delay = _TOOL_CALL_RETRY_DELAY * (2**attempt)
+                    logger.warning(
+                        "MCP tool '%s' failed (attempt %d/%d): %s. Retrying in %.1fs...",
+                        tool_name,
+                        attempt + 1,
+                        _TOOL_CALL_MAX_RETRIES,
+                        e,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(
+                        "MCP tool '%s' failed after %d attempts: %s",
+                        tool_name,
+                        _TOOL_CALL_MAX_RETRIES,
+                        e,
+                        exc_info=True,
+                    )
+
+        return f"Error: MCP tool '{tool_name}' failed after {_TOOL_CALL_MAX_RETRIES} attempts: {last_error!s}"
+
     tool = StructuredTool(
         name=tool_name,
         description=tool_description,
         coroutine=mcp_tool_call,
         args_schema=input_model,
-        # Store the original MCP schema as metadata so we can access it later
-        metadata={"mcp_input_schema": input_schema, "mcp_transport": "stdio"},
+        metadata={
+            "mcp_input_schema": input_schema,
+            "mcp_transport": "stdio",
+            "mcp_connector_name": connector_name or None,
+            "mcp_connector_id": connector_id,
+            "mcp_is_generic": True,
+            "hitl": True,
+            # Full-args hash: shared identifiers (cloudId, workspaceId, …)
+            # would otherwise collapse legitimate batches.
+            "dedup_key": dedup_key_full_args,
+        },
     )
 
-    logger.info(f"Created MCP tool (stdio): '{tool_name}'")
+    logger.debug("Created MCP tool (stdio): '%s'", tool_name)
     return tool
 
 
@@ -152,66 +246,151 @@ async def _create_mcp_tool_from_definition_http(
     tool_def: dict[str, Any],
     url: str,
     headers: dict[str, str],
+    *,
+    connector_name: str = "",
+    connector_id: int | None = None,
+    trusted_tools: list[str] | None = None,
+    readonly_tools: frozenset[str] | None = None,
+    tool_name_prefix: str | None = None,
+    is_generic_mcp: bool = False,
+    bypass_internal_hitl: bool = False,
 ) -> StructuredTool:
     """Create a LangChain tool from an MCP tool definition (HTTP transport).
 
-    Args:
-        tool_def: Tool definition from MCP server with name, description, input_schema
-        url: URL of the MCP server
-        headers: HTTP headers for authentication
+    Write tools are wrapped with HITL approval; read-only tools (listed in
+    ``readonly_tools``) execute immediately without user confirmation. Set
+    ``bypass_internal_hitl=True`` when an outer ``HumanInTheLoopMiddleware``
+    already gates the tool.
 
-    Returns:
-        LangChain StructuredTool instance
-
+    When ``tool_name_prefix`` is set (multi-account disambiguation), the
+    tool exposed to the LLM gets a prefixed name (e.g. ``linear_25_list_issues``)
+    but the actual MCP ``call_tool`` still uses the original name.
     """
-    tool_name = tool_def.get("name", "unnamed_tool")
-    tool_description = tool_def.get("description", "No description provided")
+    original_tool_name = tool_def.get("name", "unnamed_tool")
+    raw_description = tool_def.get("description", "No description provided")
     input_schema = tool_def.get("input_schema", {"type": "object", "properties": {}})
+    is_readonly = readonly_tools is not None and original_tool_name in readonly_tools
 
-    # Log the actual schema for debugging
-    logger.info(f"MCP HTTP tool '{tool_name}' input schema: {input_schema}")
+    exposed_name = (
+        f"{tool_name_prefix}_{original_tool_name}"
+        if tool_name_prefix
+        else original_tool_name
+    )
+    if tool_name_prefix:
+        tool_description = f"[Account: {connector_name}] {raw_description}"
+    elif is_generic_mcp and connector_name:
+        tool_description = f"[MCP server: {connector_name}] {raw_description}"
+    else:
+        tool_description = raw_description
 
-    # Create dynamic input model from schema
-    input_model = _create_dynamic_input_model_from_schema(tool_name, input_schema)
+    logger.debug("MCP HTTP tool '%s' input schema: %s", exposed_name, input_schema)
+
+    input_model = _create_dynamic_input_model_from_schema(exposed_name, input_schema)
+
+    async def _do_mcp_call(
+        call_headers: dict[str, str],
+        call_kwargs: dict[str, Any],
+        timeout: float = 60.0,
+    ) -> str:
+        """Execute a single MCP HTTP call with the given headers."""
+        async with (
+            streamablehttp_client(url, headers=call_headers) as (read, write, _),
+            ClientSession(read, write) as session,
+        ):
+            await session.initialize()
+            response = await asyncio.wait_for(
+                session.call_tool(original_tool_name, arguments=call_kwargs),
+                timeout=timeout,
+            )
+
+            result = []
+            for content in response.content:
+                if hasattr(content, "text"):
+                    result.append(content.text)
+                elif hasattr(content, "data"):
+                    result.append(str(content.data))
+                else:
+                    result.append(str(content))
+
+            return "\n".join(result) if result else ""
 
     async def mcp_http_tool_call(**kwargs) -> str:
         """Execute the MCP tool call via HTTP transport."""
-        logger.info(f"MCP HTTP tool '{tool_name}' called with params: {kwargs}")
+        logger.debug("MCP HTTP tool '%s' called", exposed_name)
+
+        if is_readonly or bypass_internal_hitl:
+            call_kwargs = _unpack_synthetic_input_data(
+                {k: v for k, v in kwargs.items() if v is not None}
+            )
+        else:
+            hitl_result = request_approval(
+                action_type="mcp_tool_call",
+                tool_name=exposed_name,
+                params=kwargs,
+                context={
+                    "mcp_server": connector_name,
+                    "tool_description": raw_description,
+                    "mcp_transport": "http",
+                    "mcp_connector_id": connector_id,
+                },
+                trusted_tools=trusted_tools,
+            )
+            if hitl_result.rejected:
+                return "Tool call rejected by user."
+            call_kwargs = _unpack_synthetic_input_data(
+                {k: v for k, v in hitl_result.params.items() if v is not None}
+            )
 
         try:
-            async with (
-                streamablehttp_client(url, headers=headers) as (read, write, _),
-                ClientSession(read, write) as session,
-            ):
-                await session.initialize()
+            result_str = await _do_mcp_call(headers, call_kwargs)
+            logger.debug(
+                "MCP HTTP tool '%s' succeeded (len=%d)", exposed_name, len(result_str)
+            )
+            return result_str
 
-                # Call the tool
-                response = await session.call_tool(tool_name, arguments=kwargs)
+        except Exception as first_err:
+            if not _is_auth_error(first_err) or connector_id is None:
+                logger.exception(
+                    "MCP HTTP tool '%s' execution failed: %s", exposed_name, first_err
+                )
+                return f"Error: MCP HTTP tool '{exposed_name}' execution failed: {first_err!s}"
 
-                # Extract content from response
-                result = []
-                for content in response.content:
-                    if hasattr(content, "text"):
-                        result.append(content.text)
-                    elif hasattr(content, "data"):
-                        result.append(str(content.data))
-                    else:
-                        result.append(str(content))
+            logger.warning(
+                "MCP HTTP tool '%s' got 401 — attempting token refresh for connector %s",
+                exposed_name,
+                connector_id,
+            )
+            fresh_headers = await _force_refresh_and_get_headers(connector_id)
+            if fresh_headers is None:
+                await _mark_connector_auth_expired(connector_id)
+                return (
+                    f"Error: MCP tool '{exposed_name}' authentication expired. "
+                    "Please re-authenticate the connector in your settings."
+                )
 
-                result_str = "\n".join(result) if result else ""
+            try:
+                result_str = await _do_mcp_call(fresh_headers, call_kwargs)
                 logger.info(
-                    f"MCP HTTP tool '{tool_name}' succeeded: {result_str[:200]}"
+                    "MCP HTTP tool '%s' succeeded after 401 recovery",
+                    exposed_name,
                 )
                 return result_str
+            except Exception as retry_err:
+                logger.exception(
+                    "MCP HTTP tool '%s' still failing after token refresh: %s",
+                    exposed_name,
+                    retry_err,
+                )
+                if _is_auth_error(retry_err):
+                    await _mark_connector_auth_expired(connector_id)
+                    return (
+                        f"Error: MCP tool '{exposed_name}' authentication expired. "
+                        "Please re-authenticate the connector in your settings."
+                    )
+                return f"Error: MCP HTTP tool '{exposed_name}' execution failed: {retry_err!s}"
 
-        except Exception as e:
-            error_msg = f"MCP HTTP tool '{tool_name}' execution failed: {e!s}"
-            logger.exception(error_msg)
-            return f"Error: {error_msg}"
-
-    # Create StructuredTool
     tool = StructuredTool(
-        name=tool_name,
+        name=exposed_name,
         description=tool_description,
         coroutine=mcp_http_tool_call,
         args_schema=input_model,
@@ -219,10 +398,18 @@ async def _create_mcp_tool_from_definition_http(
             "mcp_input_schema": input_schema,
             "mcp_transport": "http",
             "mcp_url": url,
+            "mcp_connector_name": connector_name or None,
+            "mcp_is_generic": is_generic_mcp,
+            "hitl": not is_readonly,
+            # Full-args hash: shared identifiers (cloudId, workspaceId, …)
+            # would otherwise collapse legitimate batches.
+            "dedup_key": dedup_key_full_args,
+            "mcp_original_tool_name": original_tool_name,
+            "mcp_connector_id": connector_id,
         },
     )
 
-    logger.info(f"Created MCP tool (HTTP): '{tool_name}'")
+    logger.debug("Created MCP tool (HTTP): '%s'", exposed_name)
     return tool
 
 
@@ -230,64 +417,69 @@ async def _load_stdio_mcp_tools(
     connector_id: int,
     connector_name: str,
     server_config: dict[str, Any],
+    trusted_tools: list[str] | None = None,
+    *,
+    bypass_internal_hitl: bool = False,
 ) -> list[StructuredTool]:
-    """Load tools from a stdio-based MCP server.
-
-    Args:
-        connector_id: Connector ID for logging
-        connector_name: Connector name for logging
-        server_config: Server configuration with command, args, env
-
-    Returns:
-        List of tools from the MCP server
-    """
+    """Load tools from a stdio-based MCP server."""
     tools: list[StructuredTool] = []
 
-    # Validate required command field
     command = server_config.get("command")
     if not command or not isinstance(command, str):
         logger.warning(
-            f"MCP connector {connector_id} (name: '{connector_name}') missing or invalid command field, skipping"
+            "MCP connector %d (name: '%s') missing or invalid command field, skipping",
+            connector_id,
+            connector_name,
         )
         return tools
 
-    # Validate args field (must be list if present)
     args = server_config.get("args", [])
     if not isinstance(args, list):
         logger.warning(
-            f"MCP connector {connector_id} (name: '{connector_name}') has invalid args field (must be list), skipping"
+            "MCP connector %d (name: '%s') has invalid args field (must be list), skipping",
+            connector_id,
+            connector_name,
         )
         return tools
 
-    # Validate env field (must be dict if present)
     env = server_config.get("env", {})
     if not isinstance(env, dict):
         logger.warning(
-            f"MCP connector {connector_id} (name: '{connector_name}') has invalid env field (must be dict), skipping"
+            "MCP connector %d (name: '%s') has invalid env field (must be dict), skipping",
+            connector_id,
+            connector_name,
         )
         return tools
 
-    # Create MCP client
     mcp_client = MCPClient(command, args, env)
 
-    # Connect and discover tools
     async with mcp_client.connect():
         tool_definitions = await mcp_client.list_tools()
 
         logger.info(
-            f"Discovered {len(tool_definitions)} tools from stdio MCP server "
-            f"'{command}' (connector {connector_id})"
+            "Discovered %d tools from stdio MCP server '%s' (connector %d)",
+            len(tool_definitions),
+            command,
+            connector_id,
         )
 
-    # Create LangChain tools from definitions
     for tool_def in tool_definitions:
         try:
-            tool = await _create_mcp_tool_from_definition_stdio(tool_def, mcp_client)
+            tool = await _create_mcp_tool_from_definition_stdio(
+                tool_def,
+                mcp_client,
+                connector_name=connector_name,
+                connector_id=connector_id,
+                trusted_tools=trusted_tools,
+                bypass_internal_hitl=bypass_internal_hitl,
+            )
             tools.append(tool)
         except Exception as e:
             logger.exception(
-                f"Failed to create tool '{tool_def.get('name')}' "
-                f"from connector {connector_id}: {e!s}"
+                "Failed to create tool '%s' from connector %d: %s",
+                tool_def.get("name"),
+                connector_id,
+                e,
             )
 
     return tools
@@ -297,92 +489,450 @@ async def _load_http_mcp_tools(
     connector_id: int,
     connector_name: str,
     server_config: dict[str, Any],
+    trusted_tools: list[str] | None = None,
+    allowed_tools: list[str] | None = None,
+    readonly_tools: frozenset[str] | None = None,
+    tool_name_prefix: str | None = None,
+    is_generic_mcp: bool = False,
+    *,
+    bypass_internal_hitl: bool = False,
 ) -> list[StructuredTool]:
     """Load tools from an HTTP-based MCP server.
 
     Args:
-        connector_id: Connector ID for logging
-        connector_name: Connector name for logging
-        server_config: Server configuration with url, headers
-
-    Returns:
-        List of tools from the MCP server
+        allowed_tools: If non-empty, only tools whose names appear in this
+            list are loaded.  Empty/None means load everything (used for
+            user-managed generic MCP servers).
+        readonly_tools: Tool names that skip HITL approval (read-only operations).
+        tool_name_prefix: If set, each tool name is prefixed for multi-account
+            disambiguation (e.g. ``linear_25``).
     """
     tools: list[StructuredTool] = []
 
-    # Validate required url field
     url = server_config.get("url")
     if not url or not isinstance(url, str):
         logger.warning(
-            f"MCP connector {connector_id} (name: '{connector_name}') missing or invalid url field, skipping"
+            "MCP connector %d (name: '%s') missing or invalid url field, skipping",
+            connector_id,
+            connector_name,
         )
         return tools
 
-    # Validate headers field (must be dict if present)
     headers = server_config.get("headers", {})
     if not isinstance(headers, dict):
         logger.warning(
-            f"MCP connector {connector_id} (name: '{connector_name}') has invalid headers field (must be dict), skipping"
+            "MCP connector %d (name: '%s') has invalid headers field (must be dict), skipping",
+            connector_id,
+            connector_name,
         )
         return tools
 
-    # Connect and discover tools via HTTP
-    try:
+    allowed_set = set(allowed_tools) if allowed_tools else None
+
+    async def _discover(disc_headers: dict[str, str]) -> list[dict[str, Any]]:
+        """Connect, initialize, and list tools from the MCP server."""
         async with (
-            streamablehttp_client(url, headers=headers) as (read, write, _),
+            streamablehttp_client(url, headers=disc_headers) as (read, write, _),
             ClientSession(read, write) as session,
         ):
             await session.initialize()
-
-            # List available tools
             response = await session.list_tools()
-            tool_definitions = []
-            for tool in response.tools:
-                tool_definitions.append(
-                    {
-                        "name": tool.name,
-                        "description": tool.description or "",
-                        "input_schema": tool.inputSchema
-                        if hasattr(tool, "inputSchema")
-                        else {},
-                    }
-                )
+            return [
+                {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "input_schema": tool.inputSchema
+                    if hasattr(tool, "inputSchema")
+                    else {},
+                }
+                for tool in response.tools
+            ]
 
-            logger.info(
-                f"Discovered {len(tool_definitions)} tools from HTTP MCP server "
-                f"'{url}' (connector {connector_id})"
+    try:
+        tool_definitions = await _discover(headers)
+    except Exception as first_err:
+        if not _is_auth_error(first_err) or connector_id is None:
+            logger.exception(
+                "Failed to connect to HTTP MCP server at '%s' (connector %d): %s",
+                url,
+                connector_id,
+                first_err,
             )
+            return tools
 
-        # Create LangChain tools from definitions
-        for tool_def in tool_definitions:
-            try:
-                tool = await _create_mcp_tool_from_definition_http(
-                    tool_def, url, headers
-                )
-                tools.append(tool)
-            except Exception as e:
-                logger.exception(
-                    f"Failed to create HTTP tool '{tool_def.get('name')}' "
-                    f"from connector {connector_id}: {e!s}"
-                )
-
-    except Exception as e:
-        logger.exception(
-            f"Failed to connect to HTTP MCP server at '{url}' (connector {connector_id}): {e!s}"
+        logger.warning(
+            "HTTP MCP discovery for connector %d got 401 — attempting token refresh",
+            connector_id,
         )
+        fresh_headers = await _force_refresh_and_get_headers(connector_id)
+        if fresh_headers is None:
+            await _mark_connector_auth_expired(connector_id)
+            logger.error(
+                "HTTP MCP discovery for connector %d: token refresh failed, marking auth_expired",
+                connector_id,
+            )
+            return tools
+
+        try:
+            tool_definitions = await _discover(fresh_headers)
+            headers = fresh_headers
+            logger.info(
+                "HTTP MCP discovery for connector %d succeeded after 401 recovery",
+                connector_id,
+            )
+        except Exception as retry_err:
+            logger.exception(
+                "HTTP MCP discovery for connector %d still failing after refresh: %s",
+                connector_id,
+                retry_err,
+            )
+            if _is_auth_error(retry_err):
+                await _mark_connector_auth_expired(connector_id)
+            return tools
+
+    total_discovered = len(tool_definitions)
+
+    if allowed_set:
+        tool_definitions = [td for td in tool_definitions if td["name"] in allowed_set]
+        logger.info(
+            "HTTP MCP server '%s' (connector %d): %d/%d tools after allowlist filter",
+            url,
+            connector_id,
+            len(tool_definitions),
+            total_discovered,
+        )
+    else:
+        logger.info(
+            "Discovered %d tools from HTTP MCP server '%s' (connector %d) — no allowlist, loading all",
+            total_discovered,
+            url,
+            connector_id,
+        )
+
+    for tool_def in tool_definitions:
+        try:
+            tool = await _create_mcp_tool_from_definition_http(
+                tool_def,
+                url,
+                headers,
+                connector_name=connector_name,
+                connector_id=connector_id,
+                trusted_tools=trusted_tools,
+                readonly_tools=readonly_tools,
+                tool_name_prefix=tool_name_prefix,
+                is_generic_mcp=is_generic_mcp,
+                bypass_internal_hitl=bypass_internal_hitl,
+            )
+            tools.append(tool)
+        except Exception as e:
+            logger.exception(
+                "Failed to create HTTP tool '%s' from connector %d: %s",
+                tool_def.get("name"),
+                connector_id,
+                e,
+            )
 
     return tools
 
 
-def invalidate_mcp_tools_cache(search_space_id: int | None = None) -> None:
-    """Invalidate cached MCP tools.
+_TOKEN_REFRESH_BUFFER_SECONDS = 300  # refresh 5 min before expiry
 
-    Args:
-        search_space_id: If provided, only invalidate for this search space.
-                        If None, invalidate all cached MCP tools.
+_token_enc: TokenEncryption | None = None
+
+
+def _get_token_enc() -> TokenEncryption:
+    global _token_enc
+    if _token_enc is None:
+        from app.config import config as app_config
+        from app.utils.oauth_security import TokenEncryption
+
+        _token_enc = TokenEncryption(app_config.SECRET_KEY)
+    return _token_enc
+
+
+def _inject_oauth_headers(
+    cfg: dict[str, Any],
+    server_config: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Decrypt the MCP OAuth access token and inject it into server_config headers.
+
+    The DB never stores plaintext tokens in ``server_config.headers``.  This
+    function decrypts ``mcp_oauth.access_token`` at runtime and returns a
+    *copy* of ``server_config`` with the Authorization header set.
     """
+    mcp_oauth = cfg.get("mcp_oauth", {})
+    encrypted_token = mcp_oauth.get("access_token")
+    if not encrypted_token:
+        return server_config
+
+    try:
+        access_token = _get_token_enc().decrypt_token(encrypted_token)
+
+        result = dict(server_config)
+        result["headers"] = {
+            **server_config.get("headers", {}),
+            "Authorization": f"Bearer {access_token}",
+        }
+        return result
+    except Exception:
+        logger.error(
+            "Failed to decrypt MCP OAuth token — connector will be skipped",
+            exc_info=True,
+        )
+        return None
+
+
+async def _refresh_connector_token(
+    session: AsyncSession,
+    connector: SearchSourceConnector,
+) -> str | None:
+    """Refresh the OAuth token for an MCP connector and persist the result.
+
+    This is the shared core used by both proactive (pre-expiry) and reactive
+    (401 recovery) refresh paths.  It handles:
+    - Decrypting the current refresh token / client secret
+    - Calling the token endpoint
+    - Encrypting and persisting the new tokens
+    - Clearing ``auth_expired`` if it was set
+    - Invalidating the MCP tools cache
+
+    Returns the **plaintext** new access token on success, or ``None`` on
+    failure (no refresh token, IdP error, etc.).
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.services.mcp_oauth.discovery import refresh_access_token
+
+    cfg = connector.config or {}
+    mcp_oauth = cfg.get("mcp_oauth", {})
+
+    refresh_token = mcp_oauth.get("refresh_token")
+    if not refresh_token:
+        logger.warning(
+            "MCP connector %s: no refresh_token available",
+            connector.id,
+        )
+        return None
+
+    enc = _get_token_enc()
+    decrypted_refresh = enc.decrypt_token(refresh_token)
+    decrypted_secret = (
+        enc.decrypt_token(mcp_oauth["client_secret"])
+        if mcp_oauth.get("client_secret")
+        else ""
+    )
+
+    token_json = await refresh_access_token(
+        token_endpoint=mcp_oauth["token_endpoint"],
+        refresh_token=decrypted_refresh,
+        client_id=mcp_oauth["client_id"],
+        client_secret=decrypted_secret,
+    )
+
+    new_access = token_json.get("access_token")
+    if not new_access:
+        logger.warning(
+            "MCP connector %s: token refresh returned no access_token",
+            connector.id,
+        )
+        return None
+
+    new_expires_at = None
+    if token_json.get("expires_in"):
+        new_expires_at = datetime.now(UTC) + timedelta(
+            seconds=int(token_json["expires_in"])
+        )
+
+    updated_oauth = dict(mcp_oauth)
+    updated_oauth["access_token"] = enc.encrypt_token(new_access)
+    if token_json.get("refresh_token"):
+        updated_oauth["refresh_token"] = enc.encrypt_token(token_json["refresh_token"])
+    updated_oauth["expires_at"] = new_expires_at.isoformat() if new_expires_at else None
+
+    updated_cfg = {**cfg, "mcp_oauth": updated_oauth}
+    updated_cfg.pop("auth_expired", None)
+    connector.config = updated_cfg
+    flag_modified(connector, "config")
+    await session.commit()
+    await session.refresh(connector)
+
+    invalidate_mcp_tools_cache(connector.search_space_id)
+
+    return new_access
+
+
+async def _maybe_refresh_mcp_oauth_token(
+    session: AsyncSession,
+    connector: SearchSourceConnector,
+    cfg: dict[str, Any],
+    server_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Refresh the access token for an MCP OAuth connector if it is about to expire.
+
+    Returns the (possibly updated) ``server_config``.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    mcp_oauth = cfg.get("mcp_oauth", {})
+    expires_at_str = mcp_oauth.get("expires_at")
+    if not expires_at_str:
+        return server_config
+
+    try:
+        expires_at = datetime.fromisoformat(expires_at_str)
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+
+        if datetime.now(UTC) < expires_at - timedelta(
+            seconds=_TOKEN_REFRESH_BUFFER_SECONDS
+        ):
+            return server_config
+    except (ValueError, TypeError):
+        return server_config
+
+    try:
+        new_access = await _refresh_connector_token(session, connector)
+        if not new_access:
+            return server_config
+
+        logger.info(
+            "Proactively refreshed MCP OAuth token for connector %s", connector.id
+        )
+
+        refreshed_config = dict(server_config)
+        refreshed_config["headers"] = {
+            **server_config.get("headers", {}),
+            "Authorization": f"Bearer {new_access}",
+        }
+        return refreshed_config
+
+    except Exception:
+        logger.warning(
+            "Failed to refresh MCP OAuth token for connector %s",
+            connector.id,
+            exc_info=True,
+        )
+        return server_config
+
+
+# ---------------------------------------------------------------------------
+# Reactive 401 handling helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    """Check if an exception indicates an HTTP 401 authentication failure."""
+    try:
+        import httpx
+
+        if isinstance(exc, httpx.HTTPStatusError):
+            return exc.response.status_code == 401
+    except ImportError:
+        pass
+    err_str = str(exc).lower()
+    return "401" in err_str or "unauthorized" in err_str
+
+
+async def _force_refresh_and_get_headers(
+    connector_id: int,
+) -> dict[str, str] | None:
+    """Force-refresh OAuth token for a connector and return fresh HTTP headers.
+
+    Opens a **new** DB session so this can be called from inside tool closures
+    that don't have access to the original session.
+
+    Returns ``None`` when the connector is not OAuth-backed, has no
+    refresh token, or the refresh itself fails.
+    """
+    from app.db import async_session_maker
+
+    try:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(SearchSourceConnector).filter(
+                    SearchSourceConnector.id == connector_id,
+                )
+            )
+            connector = result.scalars().first()
+            if not connector:
+                return None
+
+            cfg = connector.config or {}
+            if not cfg.get("mcp_oauth"):
+                return None
+
+            server_config = cfg.get("server_config", {})
+
+            new_access = await _refresh_connector_token(session, connector)
+            if not new_access:
+                return None
+
+            logger.info(
+                "Force-refreshed MCP OAuth token for connector %s (401 recovery)",
+                connector_id,
+            )
+            return {
+                **server_config.get("headers", {}),
+                "Authorization": f"Bearer {new_access}",
+            }
+
+    except Exception:
+        logger.warning(
+            "Failed to force-refresh MCP OAuth token for connector %s",
+            connector_id,
+            exc_info=True,
+        )
+        return None
+
+
+async def _mark_connector_auth_expired(connector_id: int) -> None:
+    """Set ``config.auth_expired = True`` so the frontend shows re-auth UI."""
+    from app.db import async_session_maker
+
+    try:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(SearchSourceConnector).filter(
+                    SearchSourceConnector.id == connector_id,
+                )
+            )
+            connector = result.scalars().first()
+            if not connector:
+                return
+
+            cfg = dict(connector.config or {})
+            if cfg.get("auth_expired"):
+                return
+
+            cfg["auth_expired"] = True
+            connector.config = cfg
+
+            from sqlalchemy.orm.attributes import flag_modified
+
+            flag_modified(connector, "config")
+            await session.commit()
+
+            logger.info(
+                "Marked MCP connector %s as auth_expired after unrecoverable 401",
+                connector_id,
+            )
+            invalidate_mcp_tools_cache(connector.search_space_id)
+
+    except Exception:
+        logger.warning(
+            "Failed to mark connector %s as auth_expired",
+            connector_id,
+            exc_info=True,
+        )
+
+
+def invalidate_mcp_tools_cache(search_space_id: int | None = None) -> None:
+    """Invalidate cached MCP tools (both ``bypass_internal_hitl`` variants together)."""
     if search_space_id is not None:
-        _mcp_tools_cache.pop(search_space_id, None)
+        for key in [k for k in _mcp_tools_cache if k[0] == search_space_id]:
+            _mcp_tools_cache.pop(key, None)
     else:
         _mcp_tools_cache.clear()
 
@@ -390,86 +940,199 @@ def invalidate_mcp_tools_cache(search_space_id: int | None = None) -> None:
 async def load_mcp_tools(
     session: AsyncSession,
     search_space_id: int,
+    *,
+    bypass_internal_hitl: bool = False,
 ) -> list[StructuredTool]:
-    """Load all MCP tools from user's active MCP server connectors.
+    """Load all MCP tools from the user's active MCP server connectors.
 
-    This discovers tools dynamically from MCP servers using the protocol.
-    Supports both stdio (local process) and HTTP (remote server) transports.
-
-    Results are cached per search space for up to 5 minutes to avoid
-    re-spawning MCP server processes on every chat message.
-
-    Args:
-        session: Database session
-        search_space_id: User's search space ID
-
-    Returns:
-        List of LangChain StructuredTool instances
-
+    Results are cached per ``(search_space_id, bypass_internal_hitl)`` for up
+    to 5 minutes; bypass is keyed because each variant builds a different tool
+    closure (with vs. without the in-wrapper ``request_approval`` gate).
     """
     _evict_expired_mcp_cache()
 
     now = time.monotonic()
-    cached = _mcp_tools_cache.get(search_space_id)
+    cache_key: _MCPCacheKey = (search_space_id, bypass_internal_hitl)
+    cached = _mcp_tools_cache.get(cache_key)
     if cached is not None:
         cached_at, cached_tools = cached
         if now - cached_at < _MCP_CACHE_TTL_SECONDS:
             logger.info(
-                "Using cached MCP tools for search space %s (%d tools, age=%.0fs)",
+                "Using cached MCP tools for search space %s (%d tools, age=%.0fs, bypass_hitl=%s)",
                 search_space_id,
                 len(cached_tools),
                 now - cached_at,
+                bypass_internal_hitl,
             )
             return list(cached_tools)
 
     try:
+        # Find all connectors with MCP server config: generic MCP_CONNECTOR type
+        # and service-specific types (LINEAR_CONNECTOR, etc.) created via MCP OAuth.
+        # Cast JSON -> JSONB so we can use has_key to filter by the presence of "server_config".
         result = await session.execute(
             select(SearchSourceConnector).filter(
-                SearchSourceConnector.connector_type
-                == SearchSourceConnectorType.MCP_CONNECTOR,
                 SearchSourceConnector.search_space_id == search_space_id,
+                cast(SearchSourceConnector.config, JSONB).has_key("server_config"),
             ),
         )
 
-        tools: list[StructuredTool] = []
-        for connector in result.scalars():
+        connectors = list(result.scalars())
+
+        # Group connectors by type to detect multi-account scenarios.
+        # When >1 connector shares the same type, tool names would collide
+        # so we prefix them with "{service_key}_{connector_id}_".
+        type_groups: dict[str, list[SearchSourceConnector]] = defaultdict(list)
+        for connector in connectors:
+            ct = (
+                connector.connector_type.value
+                if hasattr(connector.connector_type, "value")
+                else str(connector.connector_type)
+            )
+            type_groups[ct].append(connector)
+
+        multi_account_types: set[str] = {
+            ct for ct, group in type_groups.items() if len(group) > 1
+        }
+        if multi_account_types:
+            logger.info(
+                "Multi-account detected for connector types: %s",
+                multi_account_types,
+            )
+
+        discovery_tasks: list[dict[str, Any]] = []
+        for connector in connectors:
             try:
-                config = connector.config or {}
-                server_config = config.get("server_config", {})
+                cfg = connector.config or {}
+                server_config = cfg.get("server_config", {})
 
                 if not server_config or not isinstance(server_config, dict):
                     logger.warning(
-                        f"MCP connector {connector.id} (name: '{connector.name}') has invalid or missing server_config, skipping"
+                        "MCP connector %d (name: '%s') has invalid or missing server_config, skipping",
+                        connector.id,
+                        connector.name,
                     )
                     continue
 
-                transport = server_config.get("transport", "stdio")
-
-                if transport in ("streamable-http", "http", "sse"):
-                    connector_tools = await _load_http_mcp_tools(
-                        connector.id, connector.name, server_config
+                if cfg.get("mcp_oauth"):
+                    server_config = await _maybe_refresh_mcp_oauth_token(
+                        session,
+                        connector,
+                        cfg,
+                        server_config,
                     )
-                else:
-                    connector_tools = await _load_stdio_mcp_tools(
-                        connector.id, connector.name, server_config
-                    )
+                    cfg = connector.config or {}
+                    server_config = _inject_oauth_headers(cfg, server_config)
+                    if server_config is None:
+                        logger.warning(
+                            "Skipping MCP connector %d — OAuth token decryption failed",
+                            connector.id,
+                        )
+                        await _mark_connector_auth_expired(connector.id)
+                        continue
 
-                tools.extend(connector_tools)
+                trusted_tools = cfg.get("trusted_tools", [])
+
+                ct = (
+                    connector.connector_type.value
+                    if hasattr(connector.connector_type, "value")
+                    else str(connector.connector_type)
+                )
+
+                svc_cfg = get_service_by_connector_type(ct)
+                allowed_tools = svc_cfg.allowed_tools if svc_cfg else []
+                readonly_tools = svc_cfg.readonly_tools if svc_cfg else frozenset()
+
+                tool_name_prefix: str | None = None
+                if ct in multi_account_types and svc_cfg:
+                    service_key = next(
+                        (k for k, v in MCP_SERVICES.items() if v is svc_cfg),
+                        None,
+                    )
+                    if service_key:
+                        tool_name_prefix = f"{service_key}_{connector.id}"
+
+                discovery_tasks.append(
+                    {
+                        "connector_id": connector.id,
+                        "connector_name": connector.name,
+                        "server_config": server_config,
+                        "trusted_tools": trusted_tools,
+                        "allowed_tools": allowed_tools,
+                        "readonly_tools": readonly_tools,
+                        "tool_name_prefix": tool_name_prefix,
+                        "transport": server_config.get("transport", "stdio"),
+                        "is_generic_mcp": svc_cfg is None,
+                    }
+                )
 
             except Exception as e:
                 logger.exception(
-                    f"Failed to load tools from MCP connector {connector.id}: {e!s}"
+                    "Failed to prepare MCP connector %d: %s",
+                    connector.id,
+                    e,
                 )
 
-        _mcp_tools_cache[search_space_id] = (now, tools)
+        async def _discover_one(task: dict[str, Any]) -> list[StructuredTool]:
+            try:
+                if task["transport"] in ("streamable-http", "http", "sse"):
+                    return await asyncio.wait_for(
+                        _load_http_mcp_tools(
+                            task["connector_id"],
+                            task["connector_name"],
+                            task["server_config"],
+                            trusted_tools=task["trusted_tools"],
+                            allowed_tools=task["allowed_tools"],
+                            readonly_tools=task["readonly_tools"],
+                            tool_name_prefix=task["tool_name_prefix"],
+                            is_generic_mcp=task.get("is_generic_mcp", False),
+                            bypass_internal_hitl=bypass_internal_hitl,
+                        ),
+                        timeout=_MCP_DISCOVERY_TIMEOUT_SECONDS,
+                    )
+                else:
+                    return await asyncio.wait_for(
+                        _load_stdio_mcp_tools(
+                            task["connector_id"],
+                            task["connector_name"],
+                            task["server_config"],
+                            trusted_tools=task["trusted_tools"],
+                            bypass_internal_hitl=bypass_internal_hitl,
+                        ),
+                        timeout=_MCP_DISCOVERY_TIMEOUT_SECONDS,
+                    )
+            except TimeoutError:
+                logger.error(
+                    "MCP connector %d timed out after %ds during discovery",
+                    task["connector_id"],
+                    _MCP_DISCOVERY_TIMEOUT_SECONDS,
+                )
+                return []
+            except Exception as e:
+                logger.exception(
+                    "Failed to load tools from MCP connector %d: %s",
+                    task["connector_id"],
+                    e,
+                )
+                return []
+
+        results = await asyncio.gather(*[_discover_one(t) for t in discovery_tasks])
+        tools: list[StructuredTool] = [tool for sublist in results for tool in sublist]
+
+        _mcp_tools_cache[cache_key] = (now, tools)
 
         if len(_mcp_tools_cache) > _MCP_CACHE_MAX_SIZE:
             oldest_key = min(_mcp_tools_cache, key=lambda k: _mcp_tools_cache[k][0])
             del _mcp_tools_cache[oldest_key]
 
-        logger.info(f"Loaded {len(tools)} MCP tools for search space {search_space_id}")
+        logger.info(
+            "Loaded %d MCP tools for search space %d (bypass_hitl=%s)",
+            len(tools),
+            search_space_id,
+            bypass_internal_hitl,
+        )
         return tools
 
     except Exception as e:
-        logger.exception(f"Failed to load MCP tools: {e!s}")
+        logger.exception("Failed to load MCP tools: %s", e)
         return []
