@@ -122,24 +122,30 @@ async def ensure_personal_litellm_keys(
     if not should_auto_provision(config):
         return False
 
-    # Lock the SearchSpace row for the duration of this transaction so two
-    # concurrent provisioning attempts (e.g. user opens two tabs during their
-    # first My Space load) serialize cleanly. The second waiter then sees
-    # the agent marker row committed by the first and short-circuits below,
-    # avoiding duplicate Askii keys + duplicate config rows.
+    # Double-checked locking. The lazy guard runs on EVERY owner
+    # `GET /searchspaces/{id}` when the feature is enabled, so the steady
+    # state (already provisioned) is the hot path — take no lock there.
+    #
+    # 1. Cheap SELECT first; if the marker row exists, short-circuit.
+    # 2. Only if missing do we acquire a row-level lock on the SearchSpace
+    #    row (serializes concurrent provisioning attempts) and re-SELECT
+    #    the marker inside the lock to catch the race window where another
+    #    worker provisioned between our two checks.
+    marker_query = select(NewLLMConfig).where(
+        NewLLMConfig.user_id == user.id,
+        NewLLMConfig.search_space_id == search_space.id,
+        NewLLMConfig.name == ROW_NAME_AGENT,
+    )
+    existing = await session.execute(marker_query)
+    if existing.scalar_one_or_none() is not None:
+        return True
+
     await session.execute(
         select(SearchSpace.id)
         .where(SearchSpace.id == search_space.id)
         .with_for_update()
     )
-
-    existing = await session.execute(
-        select(NewLLMConfig).where(
-            NewLLMConfig.user_id == user.id,
-            NewLLMConfig.search_space_id == search_space.id,
-            NewLLMConfig.name == ROW_NAME_AGENT,
-        )
-    )
+    existing = await session.execute(marker_query)
     if existing.scalar_one_or_none() is not None:
         return True
 

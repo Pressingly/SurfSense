@@ -76,7 +76,10 @@ dependencies = [
     "litellm>=1.83.7",
     "langchain-litellm>=0.6.4",
     "deepagents>=0.4.12,<0.5",
-    "askii @ git+https://github.com/Pressingly/askii-python.git@v0.1.0",
+    # askii v0.1.0 — pinned to immutable commit SHA (not the tag) so a
+    # future force-move of v0.1.0 cannot silently change what we install
+    # when uv lock is re-resolved.
+    "askii @ git+https://github.com/Pressingly/askii-python.git@eb7591d558d309f7d53161187d69df718b584751",
 ]
 
 [dependency-groups]
