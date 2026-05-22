@@ -207,6 +207,30 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
                 logger.info(
                     f"Created default search space (ID: {default_search_space.id}) for user {user.id}"
                 )
+
+                # Best-effort auto-provision the personal LiteLLM key + 4
+                # config rows (agent / doc-summary / image / vision), gated
+                # by AUTH_TYPE=SSO + AUTO_PROVISION_LITELLM_KEY=true. A
+                # failure here must NOT abort registration — the GET-my-space
+                # lazy guard in search_spaces_routes will retry next request.
+                if request is not None:
+                    try:
+                        from app.services.litellm_provisioning import (
+                            ensure_personal_litellm_keys,
+                        )
+
+                        await ensure_personal_litellm_keys(
+                            session=session,
+                            user=user,
+                            search_space=default_search_space,
+                            request=request,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Auto-provisioning LiteLLM keys failed for user %s — "
+                            "lazy guard on My Space load will retry",
+                            user.id,
+                        )
         except Exception as e:
             logger.error(
                 f"Failed to create default search space for user {user.id}: {e}"

@@ -650,6 +650,31 @@ class Config:
     AUTH_TYPE = os.getenv("AUTH_TYPE", "SSO")
     REGISTRATION_ENABLED = os.getenv("REGISTRATION_ENABLED", "TRUE").upper() == "TRUE"
 
+    # Auto-provisioning of a personal LiteLLM key via Askii on first SSO login.
+    # One Askii key is provisioned with access to all four model slots a
+    # search space needs (agent / document summary / image gen / vision),
+    # and four SurfSense config rows are inserted to point at them.
+    #
+    # Gated on top of AUTH_TYPE=SSO; both this flag and the three required
+    # model env vars (agent / image / vision) must be non-empty for the
+    # feature to fire. Doc-summary defaults to the agent model when blank.
+    AUTO_PROVISION_LITELLM_KEY = (
+        os.getenv("AUTO_PROVISION_LITELLM_KEY", "FALSE").upper() == "TRUE"
+    )
+    ASKII_BASE_URL = os.getenv("ASKII_BASE_URL", "https://api.askii.ai")
+    # Optional override for the LiteLLM proxy URL written into NewLLMConfig /
+    # ImageGenerationConfig / VisionLLMConfig rows. Blank ⇒ inherits
+    # ASKII_BASE_URL (typical case: the platform-key-management API and the
+    # LiteLLM proxy share a host). Set this only when they diverge.
+    ASKII_LITELLM_BASE_URL = os.getenv("ASKII_LITELLM_BASE_URL", "")
+    ASKII_AGENT_MODEL = os.getenv("ASKII_AGENT_MODEL", "")
+    ASKII_DOCUMENT_SUMMARY_MODEL = os.getenv("ASKII_DOCUMENT_SUMMARY_MODEL", "")
+    ASKII_IMAGE_GEN_MODEL = os.getenv("ASKII_IMAGE_GEN_MODEL", "")
+    ASKII_VISION_MODEL = os.getenv("ASKII_VISION_MODEL", "")
+    ASKII_LITELLM_KEY_DURATION_DAYS = int(
+        os.getenv("ASKII_LITELLM_KEY_DURATION_DAYS", "90")
+    )
+
     # Comma-separated path prefixes that bypass proxy auth (default: /health).
     MPASS_BYPASS_PATHS = os.getenv("MPASS_BYPASS_PATHS", None)
 
