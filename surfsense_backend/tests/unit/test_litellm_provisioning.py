@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.requests import Request as StarletteRequest
 
 from app.db import (
@@ -253,13 +254,17 @@ async def test_returns_false_when_auth_type_not_sso(
     user = _make_user()
     ss = _FakeSearchSpace(user_id=user.id)
 
-    ok = await ensure_personal_litellm_keys(
-        session=session,
-        user=user,
-        search_space=ss,
-        request=_make_request(access_token="jwt"),
-        http_client=_mock_transport(lambda r: httpx.Response(200, json={})),
-    )
+    client = _mock_transport(lambda r: httpx.Response(200, json={}))
+    try:
+        ok = await ensure_personal_litellm_keys(
+            session=session,
+            user=user,
+            search_space=ss,
+            request=_make_request(access_token="jwt"),
+            http_client=client,
+        )
+    finally:
+        await client.aclose()
     assert ok is False
     session.execute.assert_not_called()
 
@@ -633,3 +638,51 @@ async def test_validation_422_returns_false_no_rows(
 
     assert ok is False
     session.add.assert_not_called()
+
+
+async def test_db_write_failure_after_provision_rolls_back_and_returns_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the upstream Askii call succeeds but the DB write fails, the
+    service must rollback, log, and return False — not raise. Matches the
+    best-effort contract documented in the function docstring."""
+    _set_config(monkeypatch)
+    session = _make_session(existing_row=None)
+    # Override flush so the four-row insert blows up after the SDK call
+    # succeeded. The original `_make_session` flush populates `.id`; we
+    # short-circuit with a raise instead.
+    session.flush = AsyncMock(side_effect=SQLAlchemyError("flush failed"))
+    user = _make_user()
+    ss = _FakeSearchSpace(user_id=user.id, ss_id=9)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "api_key": "sk-after-flush-explodes",
+                "key_name": "k",
+                "user_id": "u",
+                "expires": None,
+            },
+        )
+
+    client = _mock_transport(handler)
+    try:
+        ok = await ensure_personal_litellm_keys(
+            session=session,
+            user=user,
+            search_space=ss,
+            request=_make_request(access_token="jwt"),
+            http_client=client,
+        )
+    finally:
+        await client.aclose()
+
+    assert ok is False
+    session.rollback.assert_awaited()
+    session.commit.assert_not_called()
+    # FKs must not be wired up when the write failed.
+    assert ss.agent_llm_id == 0
+    assert ss.document_summary_llm_id == 0
+    assert ss.image_generation_config_id == 0
+    assert ss.vision_llm_config_id == 0

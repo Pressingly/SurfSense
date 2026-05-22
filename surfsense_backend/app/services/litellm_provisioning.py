@@ -14,14 +14,16 @@ Fires from two places — single source of truth in
    when the user lands on My Space") is satisfied when the login-time
    attempt fails.
 
-Gated on ``AUTH_TYPE=SSO`` AND ``AUTO_PROVISION_LITELLM_KEY=true``, and
-requires ``ASKII_BASE_URL`` + the three required model env vars
-(``ASKII_AGENT_MODEL`` / ``ASKII_IMAGE_GEN_MODEL`` / ``ASKII_VISION_MODEL``)
-to be set so a half-configured deploy fails closed.
-``ASKII_DOCUMENT_SUMMARY_MODEL`` is optional — blank inherits the agent model.
-``ASKII_LITELLM_BASE_URL`` is also optional — blank inherits ``ASKII_BASE_URL``
-(typical case: the platform API and the LiteLLM proxy share one host); set
-it only when they diverge.
+Gated on ``AUTH_TYPE=SSO`` AND ``AUTO_PROVISION_LITELLM_KEY=true`` AND the
+three required model env vars (``ASKII_AGENT_MODEL`` / ``ASKII_IMAGE_GEN_MODEL``
+/ ``ASKII_VISION_MODEL``) being non-empty — those vars default to empty so
+a half-configured deploy fails closed at the gate. ``ASKII_BASE_URL`` is
+also checked for non-empty by the gate but defaults to ``https://api.askii.ai``
+(prod); override to a sandbox or self-hosted endpoint by setting it
+explicitly. ``ASKII_DOCUMENT_SUMMARY_MODEL`` is optional — blank inherits
+the agent model. ``ASKII_LITELLM_BASE_URL`` is also optional — blank
+inherits ``ASKII_BASE_URL`` (typical case: the platform API and the
+LiteLLM proxy share one host); set it only when they diverge.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from askii import AsyncAskii
+from askii import AskiiConfig, AsyncAskii
 from askii._errors import (
     AskiiAuthError,
     AskiiError,
@@ -40,12 +42,14 @@ from askii._errors import (
     AskiiValidationError,
 )
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.db import (
     ImageGenerationConfig,
     ImageGenProvider,
     LiteLLMProvider,
     NewLLMConfig,
+    SearchSpace,
     VisionLLMConfig,
     VisionProvider,
 )
@@ -56,7 +60,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
     from starlette.requests import Request
 
-    from app.db import SearchSpace, User
+    from app.db import User
 
 logger = logging.getLogger(__name__)
 
@@ -74,11 +78,14 @@ ROW_NAME_VISION = "FOSS Server - Vision"
 def should_auto_provision(cfg: Any) -> bool:
     """Return True iff the feature flag is on AND fully configured.
 
-    All four of ``AUTH_TYPE=="SSO"``, ``AUTO_PROVISION_LITELLM_KEY`` truthy,
-    ``ASKII_BASE_URL`` non-empty, and the three required model env
-    vars (agent / image / vision) non-empty must hold. Doc-summary and
-    LITELLM_BASE_URL are optional — blank inherits agent model and
-    ASKII_BASE_URL respectively at provisioning time.
+    All of ``AUTH_TYPE=="SSO"``, ``AUTO_PROVISION_LITELLM_KEY`` truthy, and
+    the three required model env vars (agent / image / vision) non-empty
+    must hold — those vars default to empty so the feature fails closed
+    unless an operator turns it on. ``ASKII_BASE_URL`` is checked for
+    non-empty for safety but defaults to prod (``https://api.askii.ai``);
+    override explicitly to point at sandbox / self-hosted. Doc-summary
+    and ``ASKII_LITELLM_BASE_URL`` are optional — blank inherits agent
+    model and ``ASKII_BASE_URL`` respectively at provisioning time.
     """
     return (
         getattr(cfg, "AUTH_TYPE", "") == "SSO"
@@ -115,6 +122,17 @@ async def ensure_personal_litellm_keys(
     if not should_auto_provision(config):
         return False
 
+    # Lock the SearchSpace row for the duration of this transaction so two
+    # concurrent provisioning attempts (e.g. user opens two tabs during their
+    # first My Space load) serialize cleanly. The second waiter then sees
+    # the agent marker row committed by the first and short-circuits below,
+    # avoiding duplicate Askii keys + duplicate config rows.
+    await session.execute(
+        select(SearchSpace.id)
+        .where(SearchSpace.id == search_space.id)
+        .with_for_update()
+    )
+
     existing = await session.execute(
         select(NewLLMConfig).where(
             NewLLMConfig.user_id == user.id,
@@ -145,6 +163,7 @@ async def ensure_personal_litellm_keys(
 
     response = await _provision_via_askii(
         access_token=access_token,
+        base_url=config.ASKII_BASE_URL,
         duration_days=config.ASKII_LITELLM_KEY_DURATION_DAYS,
         models=models_for_askii,
         default_model=agent_model,
@@ -208,16 +227,26 @@ async def ensure_personal_litellm_keys(
         user_id=user.id,
     )
 
-    for row in (agent_row, doc_summary_row, image_row, vision_row):
-        session.add(row)
-    await session.flush()  # populate .id on each
+    try:
+        for row in (agent_row, doc_summary_row, image_row, vision_row):
+            session.add(row)
+        await session.flush()  # populate .id on each
 
-    search_space.agent_llm_id = agent_row.id
-    search_space.document_summary_llm_id = doc_summary_row.id
-    search_space.image_generation_config_id = image_row.id
-    search_space.vision_llm_config_id = vision_row.id
+        search_space.agent_llm_id = agent_row.id
+        search_space.document_summary_llm_id = doc_summary_row.id
+        search_space.image_generation_config_id = image_row.id
+        search_space.vision_llm_config_id = vision_row.id
 
-    await session.commit()
+        await session.commit()
+    except SQLAlchemyError:
+        await session.rollback()
+        logger.exception(
+            "LiteLLM auto-provision DB write failed for user %s on search_space %s "
+            "(Askii key already provisioned; lazy guard will retry on next My Space load)",
+            user.id,
+            search_space.id,
+        )
+        return False
 
     logger.info(
         "Auto-provisioned LiteLLM key '%s' (key_name=%s) and 4 config rows "
@@ -233,6 +262,7 @@ async def ensure_personal_litellm_keys(
 async def _provision_via_askii(
     *,
     access_token: str,
+    base_url: str,
     duration_days: int,
     models: list[str],
     default_model: str,
@@ -244,9 +274,19 @@ async def _provision_via_askii(
     Auth / validation / not-found errors are non-retryable (logged at WARN
     or ERROR). Rate-limit / 5xx / transport errors are retryable (logged at
     INFO) — the lazy guard on the next My Space load will try again.
+
+    ``base_url`` is plumbed in explicitly (rather than relying on the SDK's
+    ``AskiiConfig.from_env()`` reading ``ASKII_BASE_URL`` independently) so
+    the SurfSense config is the single source of truth for the outbound
+    Askii endpoint, even if a future refactor moves it off env vars.
     """
+    askii_config = AskiiConfig.from_env(base_url=base_url)
     try:
-        async with AsyncAskii(token=access_token, http_client=http_client) as client:
+        async with AsyncAskii(
+            token=access_token,
+            config=askii_config,
+            http_client=http_client,
+        ) as client:
             return await client.keys.provision(
                 key_alias=LITELLM_KEY_ALIAS,
                 duration_days=duration_days,
