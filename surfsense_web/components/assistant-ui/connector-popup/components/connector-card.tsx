@@ -8,6 +8,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { EnumConnectorName } from "@/contracts/enums/connector";
 import { getConnectorIcon } from "@/contracts/enums/connectorIcons";
 import { cn } from "@/lib/utils";
+import { LIVE_CONNECTOR_TYPES } from "../constants/connector-constants";
 import { useConnectorStatus } from "../hooks/use-connector-status";
 import { ConnectorStatusBadge } from "./connector-status-badge";
 
@@ -55,6 +56,7 @@ export const ConnectorCard: FC<ConnectorCardProps> = ({
 	onManage,
 }) => {
 	const isMCP = connectorType === EnumConnectorName.MCP_CONNECTOR;
+	const isLive = !!connectorType && LIVE_CONNECTOR_TYPES.has(connectorType);
 	// Get connector status
 	const { getConnectorStatus, isConnectorEnabled, getConnectorStatusMessage, shouldShowWarnings } =
 		useConnectorStatus();
@@ -79,8 +81,8 @@ export const ConnectorCard: FC<ConnectorCardProps> = ({
 			className={cn(
 				"group relative flex items-center gap-4 p-4 rounded-xl text-left transition-all duration-200 w-full border",
 				status.status === "warning"
-					? "border-yellow-500/30 bg-slate-400/5 dark:bg-white/5 hover:bg-slate-400/10 dark:hover:bg-white/10"
-					: "border-border bg-slate-400/5 dark:bg-white/5 hover:bg-slate-400/10 dark:hover:bg-white/10"
+					? "border-yellow-500/30 bg-slate-400/5 dark:bg-white/5 hover:bg-accent hover:text-accent-foreground"
+					: "border-border bg-slate-400/5 dark:bg-white/5 hover:bg-accent hover:text-accent-foreground"
 			)}
 		>
 			<div
@@ -123,14 +125,14 @@ export const ConnectorCard: FC<ConnectorCardProps> = ({
 							</span>
 						) : (
 							<>
-								<span>{formatDocumentCount(documentCount)}</span>
+								{!isLive && <span>{formatDocumentCount(documentCount)}</span>}
+								{!isLive && accountCount !== undefined && accountCount > 0 && (
+									<span className="text-muted-foreground/50">•</span>
+								)}
 								{accountCount !== undefined && accountCount > 0 && (
-									<>
-										<span className="text-muted-foreground/50">•</span>
-										<span>
-											{accountCount} {accountCount === 1 ? "Account" : "Accounts"}
-										</span>
-									</>
+									<span>
+										{accountCount} {accountCount === 1 ? "Account" : "Accounts"}
+									</span>
 								)}
 							</>
 						)}
@@ -143,9 +145,9 @@ export const ConnectorCard: FC<ConnectorCardProps> = ({
 				size="sm"
 				variant={isConnected ? "secondary" : "default"}
 				className={cn(
-					"relative h-8 text-[11px] px-3 rounded-lg shrink-0 font-medium items-center justify-center",
+					"relative h-8 text-[11px] px-3 shrink-0 font-medium items-center justify-center",
 					isConnected &&
-						"bg-white text-slate-700 hover:bg-slate-50 border-0 shadow-xs dark:bg-secondary dark:text-secondary-foreground dark:hover:bg-secondary/80",
+						"bg-white text-slate-700 hover:bg-accent hover:text-accent-foreground border-0 shadow-xs dark:bg-secondary dark:text-secondary-foreground",
 					!isConnected && "shadow-xs"
 				)}
 				onClick={isConnected ? onManage : onConnect}

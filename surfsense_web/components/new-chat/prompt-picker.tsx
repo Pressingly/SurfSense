@@ -1,7 +1,8 @@
 "use client";
 
-import { useAtomValue, useSetAtom } from "jotai";
-import { Plus, Zap } from "lucide-react";
+import { useAtomValue } from "jotai";
+import { Plus, WandSparkles } from "lucide-react";
+import { useParams, useRouter } from "next/navigation";
 import {
 	forwardRef,
 	useCallback,
@@ -14,8 +15,8 @@ import {
 } from "react";
 
 import { promptsAtom } from "@/atoms/prompts/prompts-query.atoms";
-import { userSettingsDialogAtom } from "@/atoms/settings/settings-dialog.atoms";
-import { Spinner } from "@/components/ui/spinner";
+import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 
 export interface PromptPickerRef {
@@ -28,14 +29,14 @@ interface PromptPickerProps {
 	onSelect: (action: { name: string; prompt: string; mode: "transform" | "explore" }) => void;
 	onDone: () => void;
 	externalSearch?: string;
-	containerStyle?: React.CSSProperties;
 }
 
 export const PromptPicker = forwardRef<PromptPickerRef, PromptPickerProps>(function PromptPicker(
-	{ onSelect, onDone, externalSearch = "", containerStyle },
+	{ onSelect, onDone, externalSearch = "" },
 	ref
 ) {
-	const setUserSettingsDialog = useSetAtom(userSettingsDialogAtom);
+	const router = useRouter();
+	const params = useParams();
 	const { data: prompts, isLoading, isError } = useAtomValue(promptsAtom);
 	const [highlightedIndex, setHighlightedIndex] = useState(0);
 	const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -60,13 +61,26 @@ export const PromptPicker = forwardRef<PromptPickerRef, PromptPickerProps>(funct
 		}
 	}
 
+	const createPromptIndex = filtered.length;
+	const totalItems = filtered.length + 1;
+	const searchSpaceId = Array.isArray(params?.search_space_id)
+		? params.search_space_id[0]
+		: params?.search_space_id;
+
 	const handleSelect = useCallback(
 		(index: number) => {
+			if (index === createPromptIndex) {
+				onDone();
+				if (searchSpaceId) {
+					router.push(`/dashboard/${searchSpaceId}/user-settings/prompts`);
+				}
+				return;
+			}
 			const action = filtered[index];
 			if (!action) return;
 			onSelect({ name: action.name, prompt: action.prompt, mode: action.mode });
 		},
-		[filtered, onSelect]
+		[filtered, onSelect, createPromptIndex, onDone, router, searchSpaceId]
 	);
 
 	useEffect(() => {
@@ -93,69 +107,102 @@ export const PromptPicker = forwardRef<PromptPickerRef, PromptPickerProps>(funct
 		() => ({
 			selectHighlighted: () => handleSelect(highlightedIndex),
 			moveUp: () => {
-				if (filtered.length === 0) return;
 				shouldScrollRef.current = true;
-				setHighlightedIndex((prev) => (prev > 0 ? prev - 1 : filtered.length - 1));
+				setHighlightedIndex((prev) => (prev > 0 ? prev - 1 : totalItems - 1));
 			},
 			moveDown: () => {
-				if (filtered.length === 0) return;
 				shouldScrollRef.current = true;
-				setHighlightedIndex((prev) => (prev < filtered.length - 1 ? prev + 1 : 0));
+				setHighlightedIndex((prev) => (prev < totalItems - 1 ? prev + 1 : 0));
 			},
 		}),
-		[filtered.length, highlightedIndex, handleSelect]
+		[totalItems, highlightedIndex, handleSelect]
 	);
 
 	return (
-		<div
-			className="w-64 rounded-lg border bg-popover shadow-lg overflow-hidden"
-			style={containerStyle}
-		>
-			<div ref={scrollContainerRef} className="max-h-48 overflow-y-auto py-1">
+		<div className="shadow-2xl rounded-lg overflow-hidden bg-popover text-popover-foreground flex flex-col w-[280px] sm:w-[320px] select-none">
+			<div ref={scrollContainerRef} className="max-h-[180px] sm:max-h-[280px] overflow-y-auto">
 				{isLoading ? (
-					<div className="flex items-center justify-center py-3">
-						<Spinner className="size-4" />
+					<div className="py-1 px-2">
+						<div className="px-3 py-2">
+							<Skeleton className="h-[16px] w-24" />
+						</div>
+						{["a", "b", "c", "d", "e"].map((id, i) => (
+							<div
+								key={id}
+								className={cn(
+									"w-full flex items-center gap-2 px-3 py-2 text-left rounded-md",
+									i >= 3 && "hidden sm:flex"
+								)}
+							>
+								<span className="shrink-0">
+									<Skeleton className="h-4 w-4" />
+								</span>
+								<span className="flex-1 text-sm">
+									<Skeleton className="h-[20px]" style={{ width: `${60 + ((i * 7) % 30)}%` }} />
+								</span>
+							</div>
+						))}
 					</div>
 				) : isError ? (
-					<p className="px-3 py-2 text-xs text-destructive">Failed to load prompts</p>
+					<div className="py-1 px-2">
+						<p className="px-3 py-2 text-xs text-destructive">Failed to load prompts</p>
+					</div>
 				) : filtered.length === 0 ? (
-					<p className="px-3 py-2 text-xs text-muted-foreground">No matching prompts</p>
+					<div className="py-1 px-2">
+						<p className="px-3 py-2 text-xs text-muted-foreground">No matching prompts</p>
+					</div>
 				) : (
-					filtered.map((action, index) => (
-						<button
-							key={action.id}
+					<div className="py-1 px-2">
+						<div className="px-3 py-2 text-xs font-bold text-muted-foreground/55">
+							Saved Prompts
+						</div>
+						{filtered.map((action, index) => (
+							<Button
+								key={action.id}
+								ref={(el) => {
+									if (el) itemRefs.current.set(index, el);
+									else itemRefs.current.delete(index);
+								}}
+								type="button"
+								variant="ghost"
+								onClick={() => handleSelect(index)}
+								onMouseEnter={() => setHighlightedIndex(index)}
+								className={cn(
+									"h-auto w-full justify-start gap-2 rounded-md px-3 py-2 text-left text-sm font-normal transition-colors",
+									index === highlightedIndex && "bg-accent text-accent-foreground"
+								)}
+							>
+								<span className="shrink-0 text-muted-foreground">
+									<WandSparkles className="size-4" />
+								</span>
+								<span className="flex-1 text-sm truncate">{action.name}</span>
+							</Button>
+						))}
+
+						<div className="mx-2 my-1 border-t border-popover-border" />
+						<Button
 							ref={(el) => {
-								if (el) itemRefs.current.set(index, el);
-								else itemRefs.current.delete(index);
+								if (el) itemRefs.current.set(createPromptIndex, el);
+								else itemRefs.current.delete(createPromptIndex);
 							}}
 							type="button"
-							onClick={() => handleSelect(index)}
-							onMouseEnter={() => setHighlightedIndex(index)}
+							variant="ghost"
+							onClick={() => handleSelect(createPromptIndex)}
+							onMouseEnter={() => setHighlightedIndex(createPromptIndex)}
 							className={cn(
-								"flex w-full items-center gap-2 px-3 py-1.5 text-sm cursor-pointer",
-								index === highlightedIndex ? "bg-accent" : "hover:bg-accent/50"
+								"h-auto w-full justify-start gap-2 rounded-md px-3 py-2 text-left text-sm font-normal text-muted-foreground transition-colors",
+								highlightedIndex === createPromptIndex
+									? "bg-accent text-accent-foreground"
+									: "hover:text-accent-foreground hover:bg-accent"
 							)}
 						>
-							<span className="text-muted-foreground">
-								<Zap className="size-3.5" />
+							<span className="shrink-0">
+								<Plus className="size-4" />
 							</span>
-							<span className="truncate">{action.name}</span>
-						</button>
-					))
+							<span>Create prompt</span>
+						</Button>
+					</div>
 				)}
-
-				<div className="my-1 h-px bg-border mx-2" />
-				<button
-					type="button"
-					onClick={() => {
-						onDone();
-						setUserSettingsDialog({ open: true, initialTab: "prompts" });
-					}}
-					className="flex w-full items-center gap-2 px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground hover:bg-accent/50 cursor-pointer"
-				>
-					<Plus className="size-3.5" />
-					<span>Create prompt</span>
-				</button>
 			</div>
 		</div>
 	);

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 import litellm
@@ -15,6 +16,8 @@ from app.services.llm_router_service import (
     get_auto_mode_llm,
     is_auto_mode,
 )
+from app.services.provider_api_base import resolve_api_base
+from app.services.token_tracking_service import token_tracker
 
 # Configure litellm to automatically drop unsupported parameters
 litellm.drop_params = True
@@ -22,11 +25,45 @@ litellm.drop_params = True
 # Memory controls: prevent unbounded internal accumulation
 litellm.telemetry = False
 litellm.cache = None
-litellm.success_callback = []
 litellm.failure_callback = []
 litellm.input_callback = []
 
+litellm.callbacks = [token_tracker]
+
 logger = logging.getLogger(__name__)
+
+
+# Providers that require an interactive OAuth / device-flow login before
+# issuing any completion. LiteLLM implements these with blocking sync polling
+# (requests + time.sleep), which would freeze the FastAPI event loop if
+# invoked from validation. They are never usable from a headless backend,
+# so we reject them at the edge.
+_INTERACTIVE_AUTH_PROVIDERS: frozenset[str] = frozenset(
+    {
+        "github_copilot",
+        "github-copilot",
+        "githubcopilot",
+        "copilot",
+    }
+)
+
+# Hard upper bound for a single validation call. Must exceed the ChatLiteLLM
+# request timeout (30s) by a small margin so a well-behaved provider never
+# trips the watchdog, while any pathological/blocking provider is killed.
+_VALIDATION_TIMEOUT_SECONDS: float = 35.0
+
+
+def _is_interactive_auth_provider(
+    provider: str | None, custom_provider: str | None
+) -> bool:
+    """Return True if the given provider triggers interactive OAuth in LiteLLM."""
+    for raw in (custom_provider, provider):
+        if not raw:
+            continue
+        normalized = raw.strip().lower().replace(" ", "_")
+        if normalized in _INTERACTIVE_AUTH_PROVIDERS:
+            return True
+    return False
 
 
 class LLMRole:
@@ -90,6 +127,25 @@ async def validate_llm_config(
         - is_valid: True if config works, False otherwise
         - error_message: Empty string if valid, error description if invalid
     """
+    # Reject providers that require interactive OAuth/device-flow auth.
+    # LiteLLM's github_copilot provider (and similar) uses a blocking sync
+    # Authenticator that polls GitHub for up to several minutes and prints a
+    # device code to stdout. Running it on the FastAPI event loop will freeze
+    # the entire backend, so we refuse them up front.
+    if _is_interactive_auth_provider(provider, custom_provider):
+        msg = (
+            "Provider requires interactive OAuth/device-flow authentication "
+            "(e.g. github_copilot) and cannot be used in a hosted backend. "
+            "Please choose a provider that authenticates via API key."
+        )
+        logger.warning(
+            "Rejected LLM config validation for interactive-auth provider "
+            "(provider=%r, custom_provider=%r)",
+            provider,
+            custom_provider,
+        )
+        return False, msg
+
     try:
         # Build the model string for litellm
         if custom_provider:
@@ -148,11 +204,34 @@ async def validate_llm_config(
         if litellm_params:
             litellm_kwargs.update(litellm_params)
 
-        llm = ChatLiteLLM(**litellm_kwargs)
+        from app.agents.new_chat.llm_config import SanitizedChatLiteLLM
 
-        # Make a simple test call
+        llm = SanitizedChatLiteLLM(**litellm_kwargs)
+
+        # Run the test call in a worker thread with a hard timeout. Some
+        # LiteLLM providers have synchronous blocking code paths (e.g. OAuth
+        # authenticators that call time.sleep and requests.post) that would
+        # otherwise freeze the asyncio event loop. Offloading to a thread and
+        # bounding the wait keeps the server responsive even if a provider
+        # misbehaves.
         test_message = HumanMessage(content="Hello")
-        response = await llm.ainvoke([test_message])
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(llm.invoke, [test_message]),
+                timeout=_VALIDATION_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning(
+                "LLM config validation timed out after %ss for model: %s",
+                _VALIDATION_TIMEOUT_SECONDS,
+                model_string,
+            )
+            return (
+                False,
+                f"Validation timed out after {int(_VALIDATION_TIMEOUT_SECONDS)}s. "
+                "The provider is unreachable or requires interactive "
+                "authentication that is not supported by the backend.",
+            )
 
         # If we got here without exception, the config is valid
         if response and response.content:
@@ -300,7 +379,9 @@ async def get_search_space_llm_instance(
             if disable_streaming:
                 litellm_kwargs["disable_streaming"] = True
 
-            return ChatLiteLLM(**litellm_kwargs)
+            from app.agents.new_chat.llm_config import SanitizedChatLiteLLM
+
+            return SanitizedChatLiteLLM(**litellm_kwargs)
 
         # Get the LLM configuration from database (NewLLMConfig)
         result = await session.execute(
@@ -377,7 +458,9 @@ async def get_search_space_llm_instance(
         if disable_streaming:
             litellm_kwargs["disable_streaming"] = True
 
-        return ChatLiteLLM(**litellm_kwargs)
+        from app.agents.new_chat.llm_config import SanitizedChatLiteLLM
+
+        return SanitizedChatLiteLLM(**litellm_kwargs)
 
     except Exception as e:
         logger.error(
@@ -414,8 +497,14 @@ async def get_vision_llm(
     - Auto mode (ID 0): VisionLLMRouterService
     - Global (negative ID): YAML configs
     - DB (positive ID): VisionLLMConfig table
+
+    Premium global configs are wrapped in :class:`QuotaCheckedVisionLLM`
+    so each ``ainvoke`` debits the search-space owner's premium credit
+    pool. User-owned BYOK configs and free global configs are returned
+    unwrapped — they don't consume premium credit (issue M).
     """
     from app.db import VisionLLMConfig
+    from app.services.quota_checked_vision_llm import QuotaCheckedVisionLLM
     from app.services.vision_llm_router_service import (
         VISION_PROVIDER_MAP,
         VisionLLMRouterService,
@@ -437,6 +526,8 @@ async def get_vision_llm(
             logger.error(f"No vision LLM configured for search space {search_space_id}")
             return None
 
+        owner_user_id = search_space.user_id
+
         if is_vision_auto_mode(config_id):
             if not VisionLLMRouterService.is_initialized():
                 logger.error(
@@ -444,6 +535,13 @@ async def get_vision_llm(
                 )
                 return None
             try:
+                # Auto mode is currently treated as free at the wrapper
+                # level — the underlying router can dispatch to either
+                # premium or free YAML configs but routing decisions are
+                # opaque. If/when we want to bill Auto-routed vision
+                # calls we'd need to thread the resolved deployment's
+                # billing_tier back from the router. For now we keep
+                # parity with chat Auto, which also doesn't pre-classify.
                 return ChatLiteLLMRouter(
                     router=VisionLLMRouterService.get_router(),
                     streaming=True,
@@ -459,27 +557,46 @@ async def get_vision_llm(
                 return None
 
             if global_cfg.get("custom_provider"):
-                model_string = (
-                    f"{global_cfg['custom_provider']}/{global_cfg['model_name']}"
-                )
+                provider_prefix = global_cfg["custom_provider"]
+                model_string = f"{provider_prefix}/{global_cfg['model_name']}"
             else:
-                prefix = VISION_PROVIDER_MAP.get(
+                provider_prefix = VISION_PROVIDER_MAP.get(
                     global_cfg["provider"].upper(),
                     global_cfg["provider"].lower(),
                 )
-                model_string = f"{prefix}/{global_cfg['model_name']}"
+                model_string = f"{provider_prefix}/{global_cfg['model_name']}"
 
             litellm_kwargs = {
                 "model": model_string,
                 "api_key": global_cfg["api_key"],
             }
-            if global_cfg.get("api_base"):
-                litellm_kwargs["api_base"] = global_cfg["api_base"]
+            api_base = resolve_api_base(
+                provider=global_cfg.get("provider"),
+                provider_prefix=provider_prefix,
+                config_api_base=global_cfg.get("api_base"),
+            )
+            if api_base:
+                litellm_kwargs["api_base"] = api_base
             if global_cfg.get("litellm_params"):
                 litellm_kwargs.update(global_cfg["litellm_params"])
 
-            return ChatLiteLLM(**litellm_kwargs)
+            from app.agents.new_chat.llm_config import SanitizedChatLiteLLM
 
+            inner_llm = SanitizedChatLiteLLM(**litellm_kwargs)
+
+            billing_tier = str(global_cfg.get("billing_tier", "free")).lower()
+            if billing_tier == "premium":
+                return QuotaCheckedVisionLLM(
+                    inner_llm,
+                    user_id=owner_user_id,
+                    search_space_id=search_space_id,
+                    billing_tier=billing_tier,
+                    base_model=model_string,
+                    quota_reserve_tokens=global_cfg.get("quota_reserve_tokens"),
+                )
+            return inner_llm
+
+        # User-owned (positive ID) BYOK configs — always free.
         result = await session.execute(
             select(VisionLLMConfig).where(
                 VisionLLMConfig.id == config_id,
@@ -494,24 +611,32 @@ async def get_vision_llm(
             return None
 
         if vision_cfg.custom_provider:
-            model_string = f"{vision_cfg.custom_provider}/{vision_cfg.model_name}"
+            provider_prefix = vision_cfg.custom_provider
+            model_string = f"{provider_prefix}/{vision_cfg.model_name}"
         else:
-            prefix = VISION_PROVIDER_MAP.get(
+            provider_prefix = VISION_PROVIDER_MAP.get(
                 vision_cfg.provider.value.upper(),
                 vision_cfg.provider.value.lower(),
             )
-            model_string = f"{prefix}/{vision_cfg.model_name}"
+            model_string = f"{provider_prefix}/{vision_cfg.model_name}"
 
         litellm_kwargs = {
             "model": model_string,
             "api_key": vision_cfg.api_key,
         }
-        if vision_cfg.api_base:
-            litellm_kwargs["api_base"] = vision_cfg.api_base
+        api_base = resolve_api_base(
+            provider=vision_cfg.provider.value,
+            provider_prefix=provider_prefix,
+            config_api_base=vision_cfg.api_base,
+        )
+        if api_base:
+            litellm_kwargs["api_base"] = api_base
         if vision_cfg.litellm_params:
             litellm_kwargs.update(vision_cfg.litellm_params)
 
-        return ChatLiteLLM(**litellm_kwargs)
+        from app.agents.new_chat.llm_config import SanitizedChatLiteLLM
+
+        return SanitizedChatLiteLLM(**litellm_kwargs)
 
     except Exception as e:
         logger.error(

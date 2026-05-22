@@ -2,10 +2,8 @@
 
 import type { ToolCallMessagePartProps } from "@assistant-ui/react";
 import { useSetAtom } from "jotai";
-import { CornerDownLeftIcon, Pen, UserIcon, UsersIcon } from "lucide-react";
+import { CornerDownLeftIcon, Pencil, UserIcon, UsersIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { ExtraField } from "@/atoms/chat/hitl-edit-panel.atom";
-import { openHitlEditPanelAtom } from "@/atoms/chat/hitl-edit-panel.atom";
 import { PlateEditor } from "@/components/editor/plate-editor";
 import { TextShimmerLoader } from "@/components/prompt-kit/loader";
 import { Button } from "@/components/ui/button";
@@ -16,7 +14,13 @@ import {
 	SelectTrigger,
 	SelectValue,
 } from "@/components/ui/select";
-import { useHitlPhase } from "@/hooks/use-hitl-phase";
+import type { ExtraField, HitlDecision, InterruptResult } from "@/features/chat-messages/hitl";
+import {
+	isInterruptResult,
+	openHitlEditPanelAtom,
+	useHitlDecision,
+	useHitlPhase,
+} from "@/features/chat-messages/hitl";
 
 interface GmailAccount {
 	id: number;
@@ -25,23 +29,10 @@ interface GmailAccount {
 	auth_expired?: boolean;
 }
 
-interface InterruptResult {
-	__interrupt__: true;
-	__decided__?: "approve" | "reject" | "edit";
-	__completed__?: boolean;
-	action_requests: Array<{
-		name: string;
-		args: Record<string, unknown>;
-	}>;
-	review_configs: Array<{
-		action_name: string;
-		allowed_decisions: Array<"approve" | "edit" | "reject">;
-	}>;
-	context?: {
-		accounts?: GmailAccount[];
-		error?: string;
-	};
-}
+type GmailCreateDraftContext = {
+	accounts?: GmailAccount[];
+	error?: string;
+};
 
 interface SuccessResult {
 	status: "success";
@@ -68,20 +59,11 @@ interface InsufficientPermissionsResult {
 }
 
 type CreateGmailDraftResult =
-	| InterruptResult
+	| InterruptResult<GmailCreateDraftContext>
 	| SuccessResult
 	| ErrorResult
 	| InsufficientPermissionsResult
 	| AuthErrorResult;
-
-function isInterruptResult(result: unknown): result is InterruptResult {
-	return (
-		typeof result === "object" &&
-		result !== null &&
-		"__interrupt__" in result &&
-		(result as InterruptResult).__interrupt__ === true
-	);
-}
 
 function isErrorResult(result: unknown): result is ErrorResult {
 	return (
@@ -116,12 +98,8 @@ function ApprovalCard({
 	onDecision,
 }: {
 	args: { to: string; subject: string; body: string; cc?: string; bcc?: string };
-	interruptData: InterruptResult;
-	onDecision: (decision: {
-		type: "approve" | "reject" | "edit";
-		message?: string;
-		edited_action?: { name: string; args: Record<string, unknown> };
-	}) => void;
+	interruptData: InterruptResult<GmailCreateDraftContext>;
+	onDecision: (decision: HitlDecision) => void;
 }) {
 	const { phase, setProcessing, setRejected } = useHitlPhase(interruptData);
 	const [isPanelOpen, setIsPanelOpen] = useState(false);
@@ -275,7 +253,7 @@ function ApprovalCard({
 							});
 						}}
 					>
-						<Pen className="size-3.5" />
+						<Pencil className="size-3.5" />
 						Edit
 					</Button>
 				)}
@@ -473,18 +451,16 @@ export const CreateGmailDraftToolUI = ({
 	{ to: string; subject: string; body: string; cc?: string; bcc?: string },
 	CreateGmailDraftResult
 >) => {
+	const { dispatch } = useHitlDecision();
+
 	if (!result) return null;
 
 	if (isInterruptResult(result)) {
 		return (
 			<ApprovalCard
 				args={args}
-				interruptData={result}
-				onDecision={(decision) => {
-					window.dispatchEvent(
-						new CustomEvent("hitl-decision", { detail: { decisions: [decision] } })
-					);
-				}}
+				interruptData={result as InterruptResult<GmailCreateDraftContext>}
+				onDecision={(decision) => dispatch([decision])}
 			/>
 		);
 	}

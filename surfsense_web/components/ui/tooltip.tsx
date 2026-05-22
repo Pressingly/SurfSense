@@ -6,20 +6,19 @@ import { useEffect, useState } from "react";
 
 import { cn } from "@/lib/utils";
 
-const MOBILE_BREAKPOINT = 768;
-
-function useIsTouchDevice() {
-	const [isTouch, setIsTouch] = useState(false);
+function useCanHover() {
+	const [canHover, setCanHover] = useState(false);
 
 	useEffect(() => {
-		const mql = window.matchMedia(`(max-width: ${MOBILE_BREAKPOINT - 1}px)`);
-		const update = () => setIsTouch(mql.matches);
+		// Hover-capable pointers are a better cross-platform signal than viewport width.
+		const mql = window.matchMedia("(hover: hover) and (pointer: fine)");
+		const update = () => setCanHover(mql.matches);
 		update();
 		mql.addEventListener("change", update);
 		return () => mql.removeEventListener("change", update);
 	}, []);
 
-	return isTouch;
+	return canHover;
 }
 
 function TooltipProvider({
@@ -42,14 +41,14 @@ function Tooltip({
 	onOpenChange,
 	...props
 }: React.ComponentProps<typeof TooltipPrimitive.Root>) {
-	const isMobile = useIsTouchDevice();
+	const canHover = useCanHover();
 
 	return (
 		<TooltipProvider>
 			<TooltipPrimitive.Root
 				data-slot="tooltip"
-				open={isMobile ? false : open}
-				onOpenChange={isMobile ? undefined : onOpenChange}
+				open={canHover ? open : false}
+				onOpenChange={canHover ? onOpenChange : undefined}
 				{...props}
 			/>
 		</TooltipProvider>
@@ -72,7 +71,7 @@ function TooltipContent({
 				data-slot="tooltip-content"
 				sideOffset={sideOffset}
 				className={cn(
-					"bg-black text-white font-medium shadow-xl px-3 py-1.5 dark:bg-zinc-800 dark:text-zinc-50 border-none animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 z-50 w-fit rounded-md text-xs text-pretty pointer-events-none select-none",
+					"bg-neutral-950 text-white font-medium px-3 py-1.5 dark:bg-neutral-950 dark:text-white border-none animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 z-50 w-fit rounded-md text-xs text-pretty pointer-events-none select-none",
 					className
 				)}
 				{...props}

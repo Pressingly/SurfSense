@@ -1,16 +1,25 @@
 import { app, BrowserWindow, shell, session } from 'electron';
 import path from 'path';
+import { trackEvent } from './analytics';
 import { showErrorDialog } from './errors';
 import { getServerPort } from './server';
 import { setActiveSearchSpaceId } from './active-search-space';
 
 const isDev = !app.isPackaged;
 const HOSTED_FRONTEND_URL = process.env.HOSTED_FRONTEND_URL as string;
+const isMac = process.platform === 'darwin';
 
 let mainWindow: BrowserWindow | null = null;
+let isQuitting = false;
 
 export function getMainWindow(): BrowserWindow | null {
   return mainWindow;
+}
+
+// Called from main.ts on `before-quit` so the close-to-tray handler knows
+// to actually let the window die instead of hiding it.
+export function markQuitting(): void {
+  isQuitting = true;
 }
 
 export function createMainWindow(initialPath = '/dashboard'): BrowserWindow {
@@ -27,7 +36,12 @@ export function createMainWindow(initialPath = '/dashboard'): BrowserWindow {
       webviewTag: false,
     },
     show: false,
-    titleBarStyle: 'hiddenInset',
+    ...(isMac
+      ? {
+          titleBarStyle: 'hidden' as const,
+          trafficLightPosition: { x: 12, y: 10 },
+        }
+      : {}),
   });
 
   mainWindow.once('ready-to-show', () => {
@@ -70,9 +84,31 @@ export function createMainWindow(initialPath = '/dashboard'): BrowserWindow {
     mainWindow.webContents.openDevTools();
   }
 
+  // Hide-to-tray on close (don't actually destroy the window unless the
+  // user really is quitting). Applies to every instance — including the one
+  // created lazily after a launch-at-login boot.
+  mainWindow.on('close', (e) => {
+    if (!isQuitting && mainWindow) {
+      e.preventDefault();
+      mainWindow.hide();
+    }
+  });
+
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
 
   return mainWindow;
+}
+
+export function showMainWindow(source: 'tray_click' | 'tray_menu' | 'shortcut' = 'tray_click'): void {
+  const existing = getMainWindow();
+  const reopened = !existing || existing.isDestroyed();
+  if (reopened) {
+    createMainWindow('/dashboard');
+  } else {
+    existing.show();
+    existing.focus();
+  }
+  trackEvent('desktop_main_window_shown', { source, reopened });
 }

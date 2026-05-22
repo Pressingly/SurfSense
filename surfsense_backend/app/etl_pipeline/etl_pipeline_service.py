@@ -15,6 +15,9 @@ from app.etl_pipeline.parsers.plaintext import read_plaintext
 class EtlPipelineService:
     """Single pipeline for extracting markdown from files. All callers use this."""
 
+    def __init__(self, *, vision_llm=None):
+        self._vision_llm = vision_llm
+
     async def extract(self, request: EtlRequest) -> EtlResult:
         category = classify_file(request.filename)
 
@@ -47,7 +50,57 @@ class EtlPipelineService:
                 content_type="audio",
             )
 
+        if category == FileCategory.IMAGE:
+            return await self._extract_image(request)
+
         return await self._extract_document(request)
+
+    async def _extract_image(self, request: EtlRequest) -> EtlResult:
+        if self._vision_llm:
+            try:
+                from app.etl_pipeline.parsers.vision_llm import parse_with_vision_llm
+
+                content = await parse_with_vision_llm(
+                    request.file_path, request.filename, self._vision_llm
+                )
+                return EtlResult(
+                    markdown_content=content,
+                    etl_service="VISION_LLM",
+                    content_type="image",
+                )
+            except Exception as exc:
+                # Special-case quota exhaustion so we log a clearer message
+                # — the vision LLM didn't "fail", the user just ran out of
+                # premium credit. Falling through to the document parser
+                # is a graceful degradation: OCR/Unstructured still
+                # extracts text from the image without burning credit.
+                from app.services.billable_calls import QuotaInsufficientError
+
+                if isinstance(exc, QuotaInsufficientError):
+                    logging.info(
+                        "Vision LLM quota exhausted for %s; falling back to document parser",
+                        request.filename,
+                    )
+                else:
+                    logging.warning(
+                        "Vision LLM failed for %s, falling back to document parser",
+                        request.filename,
+                        exc_info=True,
+                    )
+        else:
+            logging.info(
+                "No vision LLM provided, falling back to document parser for %s",
+                request.filename,
+            )
+
+        try:
+            return await self._extract_document(request)
+        except (EtlUnsupportedFileError, EtlServiceUnavailableError):
+            raise EtlUnsupportedFileError(
+                f"Cannot process image {request.filename}: vision LLM "
+                f"{'failed' if self._vision_llm else 'not configured'} and "
+                f"document parser does not support this format"
+            ) from None
 
     async def _extract_document(self, request: EtlRequest) -> EtlResult:
         from pathlib import PurePosixPath
@@ -81,11 +134,89 @@ class EtlPipelineService:
         else:
             raise EtlServiceUnavailableError(f"Unknown ETL_SERVICE: {etl_service}")
 
+        # When the operator opts into vision-LLM at ingest, walk the
+        # original file's embedded images and append a structured
+        # "Image Content" section. The parser's own OCR (Docling
+        # do_ocr=True, Azure DI prebuilt-read, etc.) handles text-in-
+        # image; this side handles the *visual* description which the
+        # parsers all drop today.
+        content = await self._maybe_append_picture_descriptions(request, content)
+
         return EtlResult(
             markdown_content=content,
             etl_service=etl_service,
             content_type="document",
         )
+
+    async def _maybe_append_picture_descriptions(
+        self, request: EtlRequest, markdown: str
+    ) -> str:
+        if self._vision_llm is None:
+            return markdown
+
+        from app.etl_pipeline.picture_describer import (
+            describe_pictures,
+            merge_descriptions_into_markdown,
+        )
+
+        # Per-image OCR runner: re-feed each extracted image through
+        # the ETL pipeline *as a standalone image* (no vision LLM, so
+        # the IMAGE branch falls through to the document parser, which
+        # OCRs the image with the configured backend -- Docling /
+        # Azure DI / LlamaCloud). This gives us per-image OCR text
+        # attached to the inline image block, in addition to the
+        # page-level OCR that the parser already merges into the main
+        # markdown stream. The fresh sub-service gets vision_llm=None
+        # so this call cannot recurse back into picture_describer.
+        async def _ocr_image(image_path: str, image_name: str) -> str:
+            try:
+                sub = EtlPipelineService(vision_llm=None)
+                ocr_result = await sub.extract(
+                    EtlRequest(file_path=image_path, filename=image_name)
+                )
+            except (
+                EtlUnsupportedFileError,
+                EtlServiceUnavailableError,
+            ) as exc:
+                # Common case: the configured ETL service can't OCR
+                # this image format (or no service is configured at
+                # all). Don't spam warnings -- just no OCR for it.
+                logging.debug("Skipping per-image OCR for %s: %s", image_name, exc)
+                return ""
+            return ocr_result.markdown_content
+
+        try:
+            result = await describe_pictures(
+                request.file_path,
+                request.filename,
+                self._vision_llm,
+                ocr_runner=_ocr_image,
+            )
+        except Exception:
+            # Picture description is additive; never let it fail an
+            # otherwise-successful document extraction.
+            logging.warning(
+                "Picture description failed for %s, returning parser output unchanged",
+                request.filename,
+                exc_info=True,
+            )
+            return markdown
+
+        if not result.descriptions:
+            return markdown
+
+        merged = merge_descriptions_into_markdown(markdown, result)
+        logging.info(
+            "Vision LLM described %d image(s) in %s "
+            "(skipped: %d small / %d large / %d duplicate, %d failed)",
+            len(result.descriptions),
+            request.filename,
+            result.skipped_too_small,
+            result.skipped_too_large,
+            result.skipped_duplicate,
+            result.failed,
+        )
+        return merged
 
     async def _extract_with_llamacloud(self, request: EtlRequest) -> str:
         """Try Azure Document Intelligence first (when configured) then LlamaCloud.
@@ -105,13 +236,17 @@ class EtlPipelineService:
             and getattr(app_config, "AZURE_DI_KEY", None)
         )
 
+        mode_value = request.processing_mode.value
+
         if azure_configured and ext in AZURE_DI_DOCUMENT_EXTENSIONS:
             try:
                 from app.etl_pipeline.parsers.azure_doc_intelligence import (
                     parse_with_azure_doc_intelligence,
                 )
 
-                return await parse_with_azure_doc_intelligence(request.file_path)
+                return await parse_with_azure_doc_intelligence(
+                    request.file_path, processing_mode=mode_value
+                )
             except Exception:
                 logging.warning(
                     "Azure Document Intelligence failed for %s, "
@@ -122,4 +257,6 @@ class EtlPipelineService:
 
         from app.etl_pipeline.parsers.llamacloud import parse_with_llamacloud
 
-        return await parse_with_llamacloud(request.file_path, request.estimated_pages)
+        return await parse_with_llamacloud(
+            request.file_path, request.estimated_pages, processing_mode=mode_value
+        )

@@ -1,7 +1,7 @@
 "use client";
 
 import { useAtomValue, useSetAtom } from "jotai";
-import { ChevronDownIcon, XIcon } from "lucide-react";
+import { Check, ChevronDownIcon, Copy, Download, Pencil, XIcon } from "lucide-react";
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
@@ -18,14 +18,45 @@ import {
 	DropdownMenuItem,
 	DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Skeleton } from "@/components/ui/skeleton";
+import { Spinner } from "@/components/ui/spinner";
 import { useMediaQuery } from "@/hooks/use-media-query";
 import { baseApiService } from "@/lib/apis/base-api.service";
 import { authenticatedFetch } from "@/lib/auth-utils";
 
+function ReportPanelSkeleton() {
+	return (
+		<div className="space-y-6 p-6">
+			<div className="h-6 w-3/4 rounded-md bg-muted/60 animate-pulse" />
+			<div className="space-y-2.5">
+				<div className="h-3 w-full rounded-md bg-muted/60 animate-pulse" />
+				<div className="h-3 w-[95%] rounded-md bg-muted/60 animate-pulse [animation-delay:100ms]" />
+				<div className="h-3 w-[88%] rounded-md bg-muted/60 animate-pulse [animation-delay:200ms]" />
+				<div className="h-3 w-[60%] rounded-md bg-muted/60 animate-pulse [animation-delay:300ms]" />
+			</div>
+			<div className="h-5 w-2/5 rounded-md bg-muted/60 animate-pulse [animation-delay:400ms]" />
+			<div className="space-y-2.5">
+				<div className="h-3 w-full rounded-md bg-muted/60 animate-pulse [animation-delay:500ms]" />
+				<div className="h-3 w-[92%] rounded-md bg-muted/60 animate-pulse [animation-delay:600ms]" />
+				<div className="h-3 w-[97%] rounded-md bg-muted/60 animate-pulse [animation-delay:700ms]" />
+			</div>
+			<div className="h-5 w-1/3 rounded-md bg-muted/60 animate-pulse [animation-delay:800ms]" />
+			<div className="space-y-2.5">
+				<div className="h-3 w-[90%] rounded-md bg-muted/60 animate-pulse [animation-delay:900ms]" />
+				<div className="h-3 w-full rounded-md bg-muted/60 animate-pulse [animation-delay:1000ms]" />
+				<div className="h-3 w-[75%] rounded-md bg-muted/60 animate-pulse [animation-delay:1100ms]" />
+			</div>
+		</div>
+	);
+}
+
 const PlateEditor = dynamic(
 	() => import("@/components/editor/plate-editor").then((m) => ({ default: m.PlateEditor })),
-	{ ssr: false, loading: () => <Skeleton className="h-64 w-full" /> }
+	{ ssr: false, loading: () => <ReportPanelSkeleton /> }
+);
+
+const PdfViewer = dynamic(
+	() => import("@/components/report-panel/pdf-viewer").then((m) => ({ default: m.PdfViewer })),
+	{ ssr: false, loading: () => <ReportPanelSkeleton /> }
 );
 
 /**
@@ -43,6 +74,7 @@ const ReportContentResponseSchema = z.object({
 	id: z.number(),
 	title: z.string(),
 	content: z.string().nullish(),
+	content_type: z.string().default("markdown"),
 	report_metadata: z
 		.object({
 			status: z.enum(["ready", "failed"]).nullish(),
@@ -58,46 +90,6 @@ const ReportContentResponseSchema = z.object({
 
 type ReportContentResponse = z.infer<typeof ReportContentResponseSchema>;
 type VersionInfo = z.infer<typeof VersionInfoSchema>;
-
-/**
- * Shimmer loading skeleton for report panel
- */
-function ReportPanelSkeleton() {
-	return (
-		<div className="space-y-6 p-6">
-			{/* Title skeleton */}
-			<div className="h-6 w-3/4 rounded-md bg-muted/60 animate-pulse" />
-
-			{/* Paragraph 1 */}
-			<div className="space-y-2.5">
-				<div className="h-3 w-full rounded-md bg-muted/60 animate-pulse" />
-				<div className="h-3 w-[95%] rounded-md bg-muted/60 animate-pulse [animation-delay:100ms]" />
-				<div className="h-3 w-[88%] rounded-md bg-muted/60 animate-pulse [animation-delay:200ms]" />
-				<div className="h-3 w-[60%] rounded-md bg-muted/60 animate-pulse [animation-delay:300ms]" />
-			</div>
-
-			{/* Heading */}
-			<div className="h-5 w-2/5 rounded-md bg-muted/60 animate-pulse [animation-delay:400ms]" />
-
-			{/* Paragraph 2 */}
-			<div className="space-y-2.5">
-				<div className="h-3 w-full rounded-md bg-muted/60 animate-pulse [animation-delay:500ms]" />
-				<div className="h-3 w-[92%] rounded-md bg-muted/60 animate-pulse [animation-delay:600ms]" />
-				<div className="h-3 w-[97%] rounded-md bg-muted/60 animate-pulse [animation-delay:700ms]" />
-			</div>
-
-			{/* Heading */}
-			<div className="h-5 w-1/3 rounded-md bg-muted/60 animate-pulse [animation-delay:800ms]" />
-
-			{/* Paragraph 3 */}
-			<div className="space-y-2.5">
-				<div className="h-3 w-[90%] rounded-md bg-muted/60 animate-pulse [animation-delay:900ms]" />
-				<div className="h-3 w-full rounded-md bg-muted/60 animate-pulse [animation-delay:1000ms]" />
-				<div className="h-3 w-[75%] rounded-md bg-muted/60 animate-pulse [animation-delay:1100ms]" />
-			</div>
-		</div>
-	);
-}
 
 /**
  * Inner content component used by desktop panel, mobile drawer, and the layout right panel
@@ -124,6 +116,7 @@ export function ReportPanelContent({
 	const [exporting, setExporting] = useState<string | null>(null);
 	const [saving, setSaving] = useState(false);
 	const copyTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+	const changeCountRef = useRef(0);
 
 	useEffect(() => {
 		return () => {
@@ -133,6 +126,7 @@ export function ReportPanelContent({
 
 	// Editor state — tracks the latest markdown from the Plate editor
 	const [editedMarkdown, setEditedMarkdown] = useState<string | null>(null);
+	const [isEditing, setIsEditing] = useState(false);
 
 	// Read-only when public (shareToken) OR shared (SEARCH_SPACE visibility)
 	const currentThreadState = useAtomValue(currentThreadAtom);
@@ -196,7 +190,21 @@ export function ReportPanelContent({
 	// Reset edited markdown when switching versions or reports
 	useEffect(() => {
 		setEditedMarkdown(null);
+		setIsEditing(false);
+		changeCountRef.current = 0;
 	}, [activeReportId]);
+
+	const handleReportMarkdownChange = useCallback(
+		(nextMarkdown: string) => {
+			if (!isEditing) return;
+			changeCountRef.current += 1;
+			// Plate may emit an initial normalize/serialize change on mount.
+			if (changeCountRef.current <= 1) return;
+			const savedMarkdown = reportContent?.content ?? "";
+			setEditedMarkdown(nextMarkdown === savedMarkdown ? null : nextMarkdown);
+		},
+		[isEditing, reportContent?.content]
+	);
 
 	// Copy markdown content (uses latest editor content)
 	const handleCopy = useCallback(async () => {
@@ -265,7 +273,7 @@ export function ReportPanelContent({
 
 	// Save edited report content
 	const handleSave = useCallback(async () => {
-		if (!currentMarkdown || !activeReportId) return;
+		if (!currentMarkdown || !activeReportId) return false;
 		setSaving(true);
 		try {
 			const response = await authenticatedFetch(
@@ -286,123 +294,247 @@ export function ReportPanelContent({
 			setReportContent((prev) => (prev ? { ...prev, content: currentMarkdown } : prev));
 			setEditedMarkdown(null);
 			toast.success("Report saved successfully");
+			return true;
 		} catch (err) {
 			console.error("Error saving report:", err);
 			toast.error(err instanceof Error ? err.message : "Failed to save report");
+			return false;
 		} finally {
 			setSaving(false);
 		}
 	}, [activeReportId, currentMarkdown]);
 
 	const activeVersionIndex = versions.findIndex((v) => v.id === activeReportId);
+	const isPublic = !!shareToken;
+	const isResume = reportContent?.content_type === "typst";
+	const showReportEditingTier = !isResume;
+	const hasUnsavedChanges = editedMarkdown !== null;
+	const showDesktopHeader = !!onClose;
+
+	const handleCancelEditing = useCallback(() => {
+		setEditedMarkdown(null);
+		changeCountRef.current = 0;
+		setIsEditing(false);
+	}, []);
+
+	const exportButton =
+		!isEditing &&
+		(isResume ? (
+			<Button
+				variant="ghost"
+				size="icon"
+				className="size-6"
+				onClick={() => handleExport("pdf")}
+				disabled={isLoading || !reportContent?.content || exporting !== null}
+			>
+				{exporting === "pdf" ? <Spinner size="xs" /> : <Download className="size-3.5" />}
+				<span className="sr-only">Download report</span>
+			</Button>
+		) : (
+			<DropdownMenu modal={insideDrawer ? false : undefined}>
+				<DropdownMenuTrigger asChild>
+					<Button
+						variant="ghost"
+						size="icon"
+						className="size-6"
+						disabled={isLoading || !reportContent?.content}
+					>
+						<Download className="size-3.5" />
+						<span className="sr-only">Export report</span>
+					</Button>
+				</DropdownMenuTrigger>
+				<DropdownMenuContent
+					align="end"
+					className={`min-w-[200px] select-none${insideDrawer ? " z-[100]" : ""}`}
+				>
+					<ExportDropdownItems
+						onExport={handleExport}
+						exporting={exporting}
+						showAllFormats={!shareToken}
+					/>
+				</DropdownMenuContent>
+			</DropdownMenu>
+		));
+
+	const versionSwitcher = !isEditing && versions.length > 1 && (
+		<DropdownMenu modal={insideDrawer ? false : undefined}>
+			<DropdownMenuTrigger asChild>
+				<Button variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-xs">
+					v{activeVersionIndex + 1}
+					<ChevronDownIcon className="size-3" />
+				</Button>
+			</DropdownMenuTrigger>
+			<DropdownMenuContent
+				align="end"
+				className={`min-w-[120px] select-none${insideDrawer ? " z-[100]" : ""}`}
+			>
+				{versions.map((v, i) => (
+					<DropdownMenuItem
+						key={v.id}
+						onClick={() => setActiveReportId(v.id)}
+						className={v.id === activeReportId ? "bg-accent font-medium" : ""}
+					>
+						Version {i + 1}
+					</DropdownMenuItem>
+				))}
+			</DropdownMenuContent>
+		</DropdownMenu>
+	);
+
+	const copyButton = !isEditing && showReportEditingTier && (
+		<Button
+			variant="ghost"
+			size="icon"
+			className="size-6"
+			onClick={() => {
+				void handleCopy();
+			}}
+			disabled={isLoading || !reportContent?.content}
+		>
+			{copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+			<span className="sr-only">{copied ? "Copied report content" : "Copy report content"}</span>
+		</Button>
+	);
+
+	const editingActions =
+		showReportEditingTier &&
+		!isReadOnly &&
+		(isEditing ? (
+			<>
+				<Button
+					variant="ghost"
+					size="sm"
+					className="h-6 px-2 text-xs"
+					onClick={handleCancelEditing}
+					disabled={saving}
+				>
+					Cancel
+				</Button>
+				<Button
+					variant="secondary"
+					size="sm"
+					className="relative h-6 w-[56px] px-0 text-xs"
+					onClick={async () => {
+						const saveSucceeded = await handleSave();
+						if (saveSucceeded) setIsEditing(false);
+					}}
+					disabled={saving || !hasUnsavedChanges}
+				>
+					<span className={saving ? "opacity-0" : ""}>Save</span>
+					{saving && <Spinner size="xs" className="absolute" />}
+				</Button>
+			</>
+		) : (
+			<Button
+				variant="ghost"
+				size="icon"
+				className="size-6"
+				onClick={() => {
+					setEditedMarkdown(null);
+					changeCountRef.current = 0;
+					setIsEditing(true);
+				}}
+			>
+				<Pencil className="size-3.5" />
+				<span className="sr-only">Edit report</span>
+			</Button>
+		));
 
 	return (
 		<>
-			{/* Action bar — always visible; buttons are disabled while loading */}
-			<div className="flex items-center justify-between px-4 py-2 shrink-0">
-				<div className="flex items-center gap-2">
-					{/* Copy button */}
-					<Button
-						variant="outline"
-						size="sm"
-						onClick={handleCopy}
-						disabled={isLoading || !reportContent?.content}
-						className="h-8 min-w-[80px] px-3.5 py-4 text-[15px] bg-sidebar select-none"
-					>
-						{copied ? "Copied" : "Copy"}
-					</Button>
-
-					{/* Export dropdown */}
-					<DropdownMenu modal={insideDrawer ? false : undefined}>
-						<DropdownMenuTrigger asChild>
+			{showDesktopHeader ? (
+				<>
+					{/* Header — matches the Documents panel header pattern */}
+					<div className="shrink-0 flex h-12 items-center justify-between px-3 border-b">
+						<h2 className="select-none text-lg font-semibold">{isResume ? "Resume" : "Report"}</h2>
+						{onClose && (
 							<Button
-								variant="outline"
-								size="sm"
-								disabled={isLoading || !reportContent?.content}
-								className="h-8 px-3.5 py-4 text-[15px] gap-1.5 bg-sidebar select-none"
+								variant="ghost"
+								size="icon"
+								onClick={onClose}
+								className="h-8 w-8 rounded-full shrink-0 text-muted-foreground hover:text-accent-foreground"
 							>
-								Export
-								<ChevronDownIcon className="size-3" />
+								<XIcon className="h-4 w-4" />
+								<span className="sr-only">Close report panel</span>
 							</Button>
-						</DropdownMenuTrigger>
-						<DropdownMenuContent
-							align="start"
-							className={`min-w-[200px] select-none${insideDrawer ? " z-[100]" : ""}`}
-						>
-							<ExportDropdownItems
-								onExport={handleExport}
-								exporting={exporting}
-								showAllFormats={!shareToken}
-							/>
-						</DropdownMenuContent>
-					</DropdownMenu>
+						)}
+					</div>
 
-					{/* Version switcher — only shown when multiple versions exist */}
-					{versions.length > 1 && (
-						<DropdownMenu modal={insideDrawer ? false : undefined}>
-							<DropdownMenuTrigger asChild>
-								<Button
-									variant="outline"
-									size="sm"
-									className="h-8 px-3.5 py-4 text-[15px] gap-1.5 bg-sidebar select-none"
-								>
-									v{activeVersionIndex + 1}
-									<ChevronDownIcon className="size-3" />
-								</Button>
-							</DropdownMenuTrigger>
-							<DropdownMenuContent
-								align="start"
-								className={`min-w-[120px] select-none${insideDrawer ? " z-[100]" : ""}`}
-							>
-								{versions.map((v, i) => (
-									<DropdownMenuItem
-										key={v.id}
-										onClick={() => setActiveReportId(v.id)}
-										className={v.id === activeReportId ? "bg-accent font-medium" : ""}
-									>
-										Version {i + 1}
-									</DropdownMenuItem>
-								))}
-							</DropdownMenuContent>
-						</DropdownMenu>
+					{!isResume && (
+						<div className="flex h-10 items-center justify-between gap-2 border-b px-4 shrink-0">
+							<div className="min-w-0 flex-1">
+								<p className="truncate text-sm text-muted-foreground">
+									{reportContent?.title || title}
+								</p>
+							</div>
+							<div className="flex items-center gap-1 shrink-0">
+								{versionSwitcher}
+								{exportButton}
+								{copyButton}
+								{editingActions}
+							</div>
+						</div>
 					)}
-				</div>
-				{onClose && (
-					<Button variant="ghost" size="icon" onClick={onClose} className="size-7 shrink-0">
-						<XIcon className="size-4" />
-						<span className="sr-only">Close report panel</span>
-					</Button>
-				)}
-			</div>
+				</>
+			) : (
+				!isResume && (
+					<div className="flex h-14 items-center justify-between border-b px-4 shrink-0">
+						<div className="flex-1 min-w-0">
+							<h2 className="text-sm font-semibold truncate">{reportContent?.title || title}</h2>
+						</div>
+						<div className="flex items-center gap-1 shrink-0">
+							{versionSwitcher}
+							{exportButton}
+							{copyButton}
+							{editingActions}
+						</div>
+					</div>
+				)
+			)}
 
 			{/* Report content — skeleton/error/viewer/editor shown only in this area */}
 			<div className="flex-1 overflow-hidden">
 				{isLoading ? (
 					<ReportPanelSkeleton />
 				) : error || !reportContent ? (
-					<div className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
+					<div className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center select-none">
 						<div>
 							<p className="font-medium text-foreground">Failed to load report</p>
 							<p className="text-sm text-red-500 mt-1">{error || "An unknown error occurred"}</p>
 						</div>
 					</div>
+				) : reportContent.content_type === "typst" ? (
+					<PdfViewer
+						pdfUrl={`${process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL}${shareToken ? `/api/v1/public/${shareToken}/reports/${activeReportId}/preview` : `/api/v1/reports/${activeReportId}/preview`}`}
+						isPublic={isPublic}
+						toolbarActions={
+							<>
+								{versionSwitcher}
+								{exportButton}
+							</>
+						}
+					/>
 				) : reportContent.content ? (
 					isReadOnly ? (
 						<div className="h-full overflow-y-auto px-5 py-4">
-							<MarkdownViewer content={reportContent.content} />
+							<MarkdownViewer content={reportContent.content} enableCitations />
 						</div>
 					) : (
 						<PlateEditor
+							key={`report-${activeReportId}-${isEditing ? "editing" : "viewing"}`}
 							preset="full"
 							markdown={reportContent.content}
-							onMarkdownChange={setEditedMarkdown}
-							readOnly={false}
+							onMarkdownChange={handleReportMarkdownChange}
+							readOnly={!isEditing}
 							placeholder="Report content..."
 							editorVariant="default"
-							onSave={handleSave}
-							hasUnsavedChanges={editedMarkdown !== null}
-							isSaving={saving}
+							allowModeToggle={false}
+							reserveToolbarSpace={isEditing}
+							defaultEditing={isEditing}
 							className="[&_[role=toolbar]]:!bg-sidebar"
+							// Show citation badges in view mode; raw `[citation:N]`
+							// text in edit mode so users can edit/delete tokens.
+							enableCitations={!isEditing}
 						/>
 					)
 				) : (
@@ -436,10 +568,12 @@ function DesktopReportPanel() {
 
 	if (!panelState.isOpen || !panelState.reportId) return null;
 
+	const isPublic = !!panelState.shareToken;
+
 	return (
 		<div
 			ref={panelRef}
-			className="flex w-[50%] max-w-[700px] min-w-[380px] flex-col border-l bg-sidebar text-sidebar-foreground animate-in slide-in-from-right-4 duration-300 ease-out"
+			className={`flex w-[50%] max-w-[700px] min-w-[380px] flex-col border-l animate-in slide-in-from-right-4 duration-300 ease-out ${isPublic ? "bg-main-panel text-foreground" : "bg-sidebar text-sidebar-foreground"}`}
 		>
 			<ReportPanelContent
 				reportId={panelState.reportId}
@@ -460,6 +594,8 @@ function MobileReportDrawer() {
 
 	if (!panelState.reportId) return null;
 
+	const isPublic = !!panelState.shareToken;
+
 	return (
 		<Drawer
 			open={panelState.isOpen}
@@ -469,7 +605,7 @@ function MobileReportDrawer() {
 			shouldScaleBackground={false}
 		>
 			<DrawerContent
-				className="h-[90vh] max-h-[90vh] z-80 bg-sidebar overflow-hidden"
+				className={`h-[90vh] max-h-[90vh] z-80 overflow-hidden ${isPublic ? "bg-main-panel" : "bg-sidebar"}`}
 				overlayClassName="z-80"
 			>
 				<DrawerHandle />

@@ -4,13 +4,14 @@ import asyncio
 import contextlib
 import logging
 import os
+import time
 from uuid import UUID
 
 from app.celery_app import celery_app
 from app.config import config
 from app.services.notification_service import NotificationService
 from app.services.task_logging_service import TaskLoggingService
-from app.tasks.celery_tasks import get_celery_session_maker
+from app.tasks.celery_tasks import get_celery_session_maker, run_async_celery_task
 from app.tasks.connector_indexers.local_folder_indexer import (
     index_local_folder,
     index_uploaded_files,
@@ -104,12 +105,7 @@ async def _run_heartbeat_loop(notification_id: int):
 )
 def delete_document_task(self, document_id: int):
     """Celery task to delete a document and its chunks in batches."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(_delete_document_background(document_id))
-    finally:
-        loop.close()
+    return run_async_celery_task(lambda: _delete_document_background(document_id))
 
 
 async def _delete_document_background(document_id: int) -> None:
@@ -152,14 +148,9 @@ def delete_folder_documents_task(
     folder_subtree_ids: list[int] | None = None,
 ):
     """Celery task to delete documents first, then the folder rows."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(
-            _delete_folder_documents(document_ids, folder_subtree_ids)
-        )
-    finally:
-        loop.close()
+    return run_async_celery_task(
+        lambda: _delete_folder_documents(document_ids, folder_subtree_ids)
+    )
 
 
 async def _delete_folder_documents(
@@ -208,12 +199,9 @@ async def _delete_folder_documents(
 )
 def delete_search_space_task(self, search_space_id: int):
     """Celery task to delete a search space and heavy child rows in batches."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(_delete_search_space_background(search_space_id))
-    finally:
-        loop.close()
+    return run_async_celery_task(
+        lambda: _delete_search_space_background(search_space_id)
+    )
 
 
 async def _delete_search_space_background(search_space_id: int) -> None:
@@ -268,18 +256,11 @@ def process_extension_document_task(
         search_space_id: ID of the search space
         user_id: ID of the user
     """
-    # Create a new event loop for this task
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    try:
-        loop.run_until_complete(
-            _process_extension_document(
-                individual_document_dict, search_space_id, user_id
-            )
+    return run_async_celery_task(
+        lambda: _process_extension_document(
+            individual_document_dict, search_space_id, user_id
         )
-    finally:
-        loop.close()
+    )
 
 
 async def _process_extension_document(
@@ -418,13 +399,9 @@ def process_youtube_video_task(self, url: str, search_space_id: int, user_id: st
         search_space_id: ID of the search space
         user_id: ID of the user
     """
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    try:
-        loop.run_until_complete(_process_youtube_video(url, search_space_id, user_id))
-    finally:
-        loop.close()
+    return run_async_celery_task(
+        lambda: _process_youtube_video(url, search_space_id, user_id)
+    )
 
 
 async def _process_youtube_video(url: str, search_space_id: int, user_id: str):
@@ -572,12 +549,9 @@ def process_file_upload_task(
     except Exception as e:
         logger.warning(f"[process_file_upload] Could not get file size: {e}")
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     try:
-        loop.run_until_complete(
-            _process_file_upload(file_path, filename, search_space_id, user_id)
+        run_async_celery_task(
+            lambda: _process_file_upload(file_path, filename, search_space_id, user_id)
         )
         logger.info(
             f"[process_file_upload] Task completed successfully for: {filename}"
@@ -588,8 +562,6 @@ def process_file_upload_task(
             f"Traceback:\n{traceback.format_exc()}"
         )
         raise
-    finally:
-        loop.close()
 
 
 async def _process_file_upload(
@@ -778,6 +750,8 @@ def process_file_upload_with_document_task(
     search_space_id: int,
     user_id: str,
     should_summarize: bool = False,
+    use_vision_llm: bool = False,
+    processing_mode: str = "basic",
 ):
     """
     Celery task to process uploaded file with existing pending document.
@@ -808,31 +782,25 @@ def process_file_upload_with_document_task(
             "File may have been removed before syncing could start."
         )
         # Mark document as failed since file is missing
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(
-                _mark_document_failed(
-                    document_id,
-                    "File not found. Please re-upload the file.",
-                )
+        run_async_celery_task(
+            lambda: _mark_document_failed(
+                document_id,
+                "File not found. Please re-upload the file.",
             )
-        finally:
-            loop.close()
+        )
         return
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     try:
-        loop.run_until_complete(
-            _process_file_with_document(
+        run_async_celery_task(
+            lambda: _process_file_with_document(
                 document_id,
                 temp_path,
                 filename,
                 search_space_id,
                 user_id,
                 should_summarize=should_summarize,
+                use_vision_llm=use_vision_llm,
+                processing_mode=processing_mode,
             )
         )
         logger.info(
@@ -844,8 +812,6 @@ def process_file_upload_with_document_task(
             f"Traceback:\n{traceback.format_exc()}"
         )
         raise
-    finally:
-        loop.close()
 
 
 async def _mark_document_failed(document_id: int, reason: str):
@@ -869,6 +835,8 @@ async def _process_file_with_document(
     search_space_id: int,
     user_id: str,
     should_summarize: bool = False,
+    use_vision_llm: bool = False,
+    processing_mode: str = "basic",
 ):
     """
     Process file and update existing pending document status.
@@ -971,6 +939,8 @@ async def _process_file_with_document(
                 log_entry=log_entry,
                 notification=notification,
                 should_summarize=should_summarize,
+                use_vision_llm=use_vision_llm,
+                processing_mode=processing_mode,
             )
 
             # Update notification on success
@@ -1110,22 +1080,16 @@ def process_circleback_meeting_task(
         search_space_id: ID of the search space
         connector_id: ID of the Circleback connector (for deletion support)
     """
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    try:
-        loop.run_until_complete(
-            _process_circleback_meeting(
-                meeting_id,
-                meeting_name,
-                markdown_content,
-                metadata,
-                search_space_id,
-                connector_id,
-            )
+    return run_async_celery_task(
+        lambda: _process_circleback_meeting(
+            meeting_id,
+            meeting_name,
+            markdown_content,
+            metadata,
+            search_space_id,
+            connector_id,
         )
-    finally:
-        loop.close()
+    )
 
 
 async def _process_circleback_meeting(
@@ -1282,25 +1246,19 @@ def index_local_folder_task(
     target_file_paths: list[str] | None = None,
 ):
     """Celery task to index a local folder. Config is passed directly — no connector row."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    try:
-        loop.run_until_complete(
-            _index_local_folder_async(
-                search_space_id=search_space_id,
-                user_id=user_id,
-                folder_path=folder_path,
-                folder_name=folder_name,
-                exclude_patterns=exclude_patterns,
-                file_extensions=file_extensions,
-                root_folder_id=root_folder_id,
-                enable_summary=enable_summary,
-                target_file_paths=target_file_paths,
-            )
+    return run_async_celery_task(
+        lambda: _index_local_folder_async(
+            search_space_id=search_space_id,
+            user_id=user_id,
+            folder_path=folder_path,
+            folder_name=folder_name,
+            exclude_patterns=exclude_patterns,
+            file_extensions=file_extensions,
+            root_folder_id=root_folder_id,
+            enable_summary=enable_summary,
+            target_file_paths=target_file_paths,
         )
-    finally:
-        loop.close()
+    )
 
 
 async def _index_local_folder_async(
@@ -1428,23 +1386,22 @@ def index_uploaded_folder_files_task(
     root_folder_id: int,
     enable_summary: bool,
     file_mappings: list[dict],
+    use_vision_llm: bool = False,
+    processing_mode: str = "basic",
 ):
     """Celery task to index files uploaded from the desktop app."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(
-            _index_uploaded_folder_files_async(
-                search_space_id=search_space_id,
-                user_id=user_id,
-                folder_name=folder_name,
-                root_folder_id=root_folder_id,
-                enable_summary=enable_summary,
-                file_mappings=file_mappings,
-            )
+    return run_async_celery_task(
+        lambda: _index_uploaded_folder_files_async(
+            search_space_id=search_space_id,
+            user_id=user_id,
+            folder_name=folder_name,
+            root_folder_id=root_folder_id,
+            enable_summary=enable_summary,
+            file_mappings=file_mappings,
+            use_vision_llm=use_vision_llm,
+            processing_mode=processing_mode,
         )
-    finally:
-        loop.close()
+    )
 
 
 async def _index_uploaded_folder_files_async(
@@ -1454,6 +1411,8 @@ async def _index_uploaded_folder_files_async(
     root_folder_id: int,
     enable_summary: bool,
     file_mappings: list[dict],
+    use_vision_llm: bool = False,
+    processing_mode: str = "basic",
 ):
     """Run upload-based folder indexing with notification + heartbeat."""
     file_count = len(file_mappings)
@@ -1503,6 +1462,8 @@ async def _index_uploaded_folder_files_async(
                 enable_summary=enable_summary,
                 file_mappings=file_mappings,
                 on_heartbeat_callback=_heartbeat_progress,
+                use_vision_llm=use_vision_llm,
+                processing_mode=processing_mode,
             )
 
             if notification:
@@ -1543,3 +1504,113 @@ async def _index_uploaded_folder_files_async(
                 heartbeat_task.cancel()
             if notification_id is not None:
                 _stop_heartbeat(notification_id)
+
+
+# ===== AI File Sort tasks =====
+
+AI_SORT_LOCK_TTL_SECONDS = 600  # 10 minutes
+_ai_sort_redis = None
+
+
+def _get_ai_sort_redis():
+    import redis
+
+    global _ai_sort_redis
+    if _ai_sort_redis is None:
+        _ai_sort_redis = redis.from_url(config.REDIS_APP_URL, decode_responses=True)
+    return _ai_sort_redis
+
+
+def _ai_sort_lock_key(search_space_id: int) -> str:
+    return f"ai_sort:search_space:{search_space_id}:lock"
+
+
+@celery_app.task(name="ai_sort_search_space", bind=True, max_retries=1)
+def ai_sort_search_space_task(self, search_space_id: int, user_id: str):
+    """Full AI sort for all documents in a search space."""
+    return run_async_celery_task(
+        lambda: _ai_sort_search_space_async(search_space_id, user_id)
+    )
+
+
+async def _ai_sort_search_space_async(search_space_id: int, user_id: str):
+    r = _get_ai_sort_redis()
+    lock_key = _ai_sort_lock_key(search_space_id)
+
+    if not r.set(lock_key, "running", nx=True, ex=AI_SORT_LOCK_TTL_SECONDS):
+        logger.info(
+            "AI sort already running for search_space=%d, skipping",
+            search_space_id,
+        )
+        return
+
+    t_start = time.perf_counter()
+    try:
+        from app.services.ai_file_sort_service import ai_sort_all_documents
+        from app.services.llm_service import get_document_summary_llm
+
+        async with get_celery_session_maker()() as session:
+            llm = await get_document_summary_llm(
+                session, search_space_id, disable_streaming=True
+            )
+            if llm is None:
+                logger.warning(
+                    "No LLM configured for search_space=%d, skipping AI sort",
+                    search_space_id,
+                )
+                return
+
+            sorted_count, failed_count = await ai_sort_all_documents(
+                session, search_space_id, llm
+            )
+            elapsed = time.perf_counter() - t_start
+            logger.info(
+                "AI sort search_space=%d done in %.1fs: sorted=%d failed=%d",
+                search_space_id,
+                elapsed,
+                sorted_count,
+                failed_count,
+            )
+    finally:
+        r.delete(lock_key)
+
+
+@celery_app.task(
+    name="ai_sort_document", bind=True, max_retries=2, default_retry_delay=10
+)
+def ai_sort_document_task(self, search_space_id: int, user_id: str, document_id: int):
+    """Incremental AI sort for a single document after indexing."""
+    return run_async_celery_task(
+        lambda: _ai_sort_document_async(search_space_id, user_id, document_id)
+    )
+
+
+async def _ai_sort_document_async(search_space_id: int, user_id: str, document_id: int):
+    from app.db import Document
+    from app.services.ai_file_sort_service import ai_sort_document
+    from app.services.llm_service import get_document_summary_llm
+
+    async with get_celery_session_maker()() as session:
+        document = await session.get(Document, document_id)
+        if document is None:
+            logger.warning("Document %d not found, skipping AI sort", document_id)
+            return
+
+        llm = await get_document_summary_llm(
+            session, search_space_id, disable_streaming=True
+        )
+        if llm is None:
+            logger.warning(
+                "No LLM for search_space=%d, skipping AI sort of doc=%d",
+                search_space_id,
+                document_id,
+            )
+            return
+
+        await ai_sort_document(session, document, llm)
+        await session.commit()
+        logger.info(
+            "AI sorted document=%d into search_space=%d",
+            document_id,
+            search_space_id,
+        )

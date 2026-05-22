@@ -1,6 +1,6 @@
 "use client";
 
-import { ChevronDown, ChevronRight, MessageSquare } from "lucide-react";
+import { ChevronDown, ChevronRight, MessageCircleReply } from "lucide-react";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { CommentComposer } from "../comment-composer/comment-composer";
@@ -92,7 +92,7 @@ export function CommentThread({
 							<Button
 								variant="ghost"
 								size="sm"
-								className="h-6 px-2 text-xs text-muted-foreground hover:text-foreground"
+								className="h-6 px-2 text-xs text-muted-foreground hover:text-accent-foreground"
 								onClick={() => setIsRepliesExpanded((prev) => !prev)}
 							>
 								{isRepliesExpanded ? (
@@ -143,7 +143,7 @@ export function CommentThread({
 							</div>
 						) : (
 							<Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={handleReply}>
-								<MessageSquare className="mr-1 size-3" />
+								<MessageCircleReply className="mr-1 size-3" />
 								Reply
 							</Button>
 						)}
@@ -155,7 +155,7 @@ export function CommentThread({
 			{!hasReplies && !isReplyComposerOpen && (
 				<div className="ml-7 mt-1">
 					<Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={handleReply}>
-						<MessageSquare className="mr-1 size-3" />
+						<MessageCircleReply className="mr-1 size-3" />
 						Reply
 					</Button>
 				</div>

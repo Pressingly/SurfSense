@@ -1,6 +1,6 @@
 "use client";
 
-import { ArchiveIcon, MoreHorizontal, PenLine, RotateCcwIcon, Trash2 } from "lucide-react";
+import { ArchiveIcon, MoreHorizontal, Pencil, RotateCcwIcon, Trash2 } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { useCallback, useState } from "react";
 import { Button } from "@/components/ui/button";
@@ -56,19 +56,20 @@ export function ChatListItem({
 
 	return (
 		<div className="group/item relative w-full">
-			<button
+			<Button
 				type="button"
+				variant="ghost"
 				onClick={handleClick}
 				{...(isMobile ? longPressHandlers : {})}
 				className={cn(
-					"flex w-full items-center gap-2 overflow-hidden rounded-md p-2 text-sm text-left",
+					"h-auto w-full justify-start gap-2 overflow-hidden px-2 py-1.5 text-left font-normal",
 					"group-hover/item:bg-accent group-hover/item:text-accent-foreground",
 					"focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
 					isActive && "bg-accent text-accent-foreground"
 				)}
 			>
 				<span className="truncate">{animatedName}</span>
-			</button>
+			</Button>
 
 			{/* Actions dropdown - trigger hidden on mobile, long-press opens it instead */}
 			<div
@@ -106,7 +107,7 @@ export function ChatListItem({
 									onRename();
 								}}
 							>
-								<PenLine className="mr-2 h-4 w-4" />
+								<Pencil className="mr-2 h-4 w-4" />
 								<span>{t("rename") || "Rename"}</span>
 							</DropdownMenuItem>
 						)}

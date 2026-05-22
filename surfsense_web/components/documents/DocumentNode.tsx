@@ -8,7 +8,7 @@ import {
 	History,
 	MoreHorizontal,
 	Move,
-	PenLine,
+	Pencil,
 	Trash2,
 } from "lucide-react";
 import React, { useCallback, useRef, useState } from "react";
@@ -82,11 +82,11 @@ export const DocumentNode = React.memo(function DocumentNode({
 	onContextMenuOpenChange,
 }: DocumentNodeProps) {
 	const statusState = doc.status?.state ?? "ready";
-	const isSelectable = statusState !== "pending" && statusState !== "processing";
-	const isEditable =
-		EDITABLE_DOCUMENT_TYPES.has(doc.document_type) &&
-		statusState !== "pending" &&
-		statusState !== "processing";
+	const isFailed = statusState === "failed";
+	const isProcessing = statusState === "pending" || statusState === "processing";
+	const isUnavailable = isProcessing || isFailed;
+	const isSelectable = !isUnavailable;
+	const isEditable = EDITABLE_DOCUMENT_TYPES.has(doc.document_type) && !isUnavailable;
 
 	const handleCheckChange = useCallback(() => {
 		if (isSelectable) {
@@ -103,7 +103,6 @@ export const DocumentNode = React.memo(function DocumentNode({
 		[doc.id]
 	);
 
-	const isProcessing = statusState === "pending" || statusState === "processing";
 	const [dropdownOpen, setDropdownOpen] = useState(false);
 	const [exporting, setExporting] = useState<string | null>(null);
 	const [titleTooltipOpen, setTitleTooltipOpen] = useState(false);
@@ -139,24 +138,14 @@ export const DocumentNode = React.memo(function DocumentNode({
 	return (
 		<ContextMenu onOpenChange={onContextMenuOpenChange}>
 			<ContextMenuTrigger asChild>
-				{/* biome-ignore lint/a11y/useSemanticElements: contains nested interactive children (Checkbox) that render as <button>, making a semantic <button> wrapper invalid */}
 				<div
-					role="button"
-					tabIndex={0}
 					ref={attachRef}
 					className={cn(
-						"group flex h-8 w-full items-center gap-2.5 rounded-md px-1 text-sm hover:bg-accent/50 cursor-pointer select-none text-left",
-						isMentioned && "bg-accent/30",
+						"group flex h-8 w-full items-center gap-2.5 rounded-md px-1 text-sm hover:bg-accent hover:text-accent-foreground cursor-pointer select-none text-left",
+						isMentioned && "bg-accent text-accent-foreground",
 						isDragging && "opacity-40"
 					)}
 					style={{ paddingLeft: `${depth * 16 + 4}px` }}
-					onClick={handleCheckChange}
-					onKeyDown={(e) => {
-						if (e.key === "Enter" || e.key === " ") {
-							e.preventDefault();
-							handleCheckChange();
-						}
-					}}
 				>
 					{(() => {
 						if (statusState === "pending") {
@@ -213,9 +202,17 @@ export const DocumentNode = React.memo(function DocumentNode({
 						onOpenChange={handleTitleTooltipOpenChange}
 					>
 						<TooltipTrigger asChild>
-							<span ref={titleRef} className="flex-1 min-w-0 truncate">
-								{doc.title}
-							</span>
+							<Button
+								type="button"
+								variant="ghost"
+								aria-disabled={!isSelectable}
+								onClick={handleCheckChange}
+								className="h-full min-w-0 flex-1 justify-start bg-transparent px-0 py-0 text-left font-normal text-inherit hover:bg-transparent hover:text-inherit"
+							>
+								<span ref={titleRef} className="min-w-0 flex-1 truncate">
+									{doc.title}
+								</span>
+							</Button>
 						</TooltipTrigger>
 						<TooltipContent side="bottom" className="max-w-xs break-words">
 							{doc.title}
@@ -261,13 +258,13 @@ export const DocumentNode = React.memo(function DocumentNode({
 								className="w-40"
 								onClick={(e) => e.stopPropagation()}
 							>
-								<DropdownMenuItem onClick={() => onPreview(doc)} disabled={isProcessing}>
+								<DropdownMenuItem onClick={() => onPreview(doc)} disabled={isUnavailable}>
 									<Eye className="mr-2 h-4 w-4" />
 									Open
 								</DropdownMenuItem>
 								{isEditable && (
 									<DropdownMenuItem onClick={() => onEdit(doc)}>
-										<PenLine className="mr-2 h-4 w-4" />
+										<Pencil className="mr-2 h-4 w-4" />
 										Edit
 									</DropdownMenuItem>
 								)}
@@ -277,7 +274,7 @@ export const DocumentNode = React.memo(function DocumentNode({
 								</DropdownMenuItem>
 								{onExport && (
 									<DropdownMenuSub>
-										<DropdownMenuSubTrigger disabled={isProcessing}>
+										<DropdownMenuSubTrigger disabled={isUnavailable}>
 											<Download className="mr-2 h-4 w-4" />
 											Export
 										</DropdownMenuSubTrigger>
@@ -287,7 +284,7 @@ export const DocumentNode = React.memo(function DocumentNode({
 									</DropdownMenuSub>
 								)}
 								{onVersionHistory && isVersionableType(doc.document_type) && (
-									<DropdownMenuItem disabled={isProcessing} onClick={() => onVersionHistory(doc)}>
+									<DropdownMenuItem disabled={isUnavailable} onClick={() => onVersionHistory(doc)}>
 										<History className="mr-2 h-4 w-4" />
 										Versions
 									</DropdownMenuItem>
@@ -304,13 +301,13 @@ export const DocumentNode = React.memo(function DocumentNode({
 
 			{contextMenuOpen && (
 				<ContextMenuContent className="w-40" onClick={(e) => e.stopPropagation()}>
-					<ContextMenuItem onClick={() => onPreview(doc)} disabled={isProcessing}>
+					<ContextMenuItem onClick={() => onPreview(doc)} disabled={isUnavailable}>
 						<Eye className="mr-2 h-4 w-4" />
 						Open
 					</ContextMenuItem>
 					{isEditable && (
 						<ContextMenuItem onClick={() => onEdit(doc)}>
-							<PenLine className="mr-2 h-4 w-4" />
+							<Pencil className="mr-2 h-4 w-4" />
 							Edit
 						</ContextMenuItem>
 					)}
@@ -320,7 +317,7 @@ export const DocumentNode = React.memo(function DocumentNode({
 					</ContextMenuItem>
 					{onExport && (
 						<ContextMenuSub>
-							<ContextMenuSubTrigger disabled={isProcessing}>
+							<ContextMenuSubTrigger disabled={isUnavailable}>
 								<Download className="mr-2 h-4 w-4" />
 								Export
 							</ContextMenuSubTrigger>
@@ -330,7 +327,7 @@ export const DocumentNode = React.memo(function DocumentNode({
 						</ContextMenuSub>
 					)}
 					{onVersionHistory && isVersionableType(doc.document_type) && (
-						<ContextMenuItem disabled={isProcessing} onClick={() => onVersionHistory(doc)}>
+						<ContextMenuItem disabled={isUnavailable} onClick={() => onVersionHistory(doc)}>
 							<History className="mr-2 h-4 w-4" />
 							Versions
 						</ContextMenuItem>

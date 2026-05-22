@@ -1,6 +1,6 @@
 "use client";
 
-import { CheckCircle2, ChevronDown, ChevronUp, Server, XCircle } from "lucide-react";
+import { CheckCircle2, ChevronDown, ChevronUp, Loader2, Server, XCircle } from "lucide-react";
 import { type FC, useRef, useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -155,7 +155,7 @@ export const MCPConnectForm: FC<ConnectFormProps> = ({ onSubmit, isSubmitting })
 										type="button"
 										variant="ghost"
 										size="sm"
-										className="h-6 px-2 text-xs text-muted-foreground hover:text-foreground"
+										className="h-6 px-2 text-xs text-muted-foreground hover:text-accent-foreground"
 										onClick={() => handleConfigChange(DEFAULT_STDIO_CONFIG)}
 									>
 										Local Example
@@ -164,7 +164,7 @@ export const MCPConnectForm: FC<ConnectFormProps> = ({ onSubmit, isSubmitting })
 										type="button"
 										variant="ghost"
 										size="sm"
-										className="h-6 px-2 text-xs text-muted-foreground hover:text-foreground"
+										className="h-6 px-2 text-xs text-muted-foreground hover:text-accent-foreground"
 										onClick={() => handleConfigChange(DEFAULT_HTTP_CONFIG)}
 									>
 										Remote Example
@@ -210,9 +210,16 @@ export const MCPConnectForm: FC<ConnectFormProps> = ({ onSubmit, isSubmitting })
 							onClick={handleTestConnection}
 							disabled={isTesting}
 							variant="secondary"
-							className="w-full h-8 text-[13px] px-3 rounded-lg font-medium bg-white text-slate-700 hover:bg-slate-50 border-0 shadow-xs dark:bg-secondary dark:text-secondary-foreground dark:hover:bg-secondary/80"
+							className="w-full h-8 text-[13px] px-3 font-medium bg-white text-slate-700 hover:bg-accent hover:text-accent-foreground border-0 shadow-xs dark:bg-secondary dark:text-secondary-foreground"
 						>
-							{isTesting ? "Testing Connection" : "Test Connection"}
+							{isTesting ? (
+								<>
+									<Loader2 className="h-3.5 w-3.5 animate-spin" />
+									Testing Connection...
+								</>
+							) : (
+								"Test Connection"
+							)}
 						</Button>
 					</div>
 

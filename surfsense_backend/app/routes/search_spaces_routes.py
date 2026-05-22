@@ -1,13 +1,21 @@
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func
+from langchain_core.messages import HumanMessage
+from pydantic import BaseModel as PydanticBaseModel
+from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
+from app.agents.new_chat.llm_config import (
+    create_chat_litellm_from_agent_config,
+    load_agent_llm_config_for_search_space,
+)
+from app.agents.new_chat.tools.update_memory import MEMORY_HARD_LIMIT, _save_memory
 from app.config import config
 from app.db import (
     ImageGenerationConfig,
+    NewChatThread,
     NewLLMConfig,
     Permission,
     SearchSpace,
@@ -27,11 +35,40 @@ from app.schemas import (
     SearchSpaceWithStats,
 )
 from app.users import current_active_user
+from app.utils.content_utils import extract_text_content
 from app.utils.rbac import check_permission, check_search_space_access
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+class _TeamMemoryEditRequest(PydanticBaseModel):
+    query: str
+
+
+_TEAM_MEMORY_EDIT_PROMPT = """\
+You are a memory editor for a team workspace. The user wants to modify the \
+team's shared memory document. Apply the user's instruction to the existing \
+memory document and output the FULL updated document.
+
+RULES:
+1. If the instruction asks to add something, add it with format: \
+- (YYYY-MM-DD) [fact] text, under an existing or new ## heading. \
+Heading names should be descriptive, not generic categories.
+2. If the instruction asks to remove something, remove the matching entry.
+3. If the instruction asks to change something, update the matching entry.
+4. Preserve existing ## headings and all other entries.
+5. NEVER use [pref] or [instr] markers. Team memory uses [fact] only.
+6. Output ONLY the updated markdown — no explanations, no wrapping.
+
+<current_memory>
+{current_memory}
+</current_memory>
+
+<user_instruction>
+{instruction}
+</user_instruction>"""
 
 
 async def create_default_roles_and_membership(
@@ -181,6 +218,7 @@ async def read_search_spaces(
                     user_id=space.user_id,
                     citations_enabled=space.citations_enabled,
                     qna_custom_instructions=space.qna_custom_instructions,
+                    ai_file_sort_enabled=space.ai_file_sort_enabled,
                     member_count=member_count,
                     is_owner=is_owner,
                 )
@@ -255,6 +293,16 @@ async def update_search_space(
             raise HTTPException(status_code=404, detail="Search space not found")
 
         update_data = search_space_update.model_dump(exclude_unset=True)
+
+        if (
+            "shared_memory_md" in update_data
+            and len(update_data["shared_memory_md"] or "") > MEMORY_HARD_LIMIT
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Team memory exceeds {MEMORY_HARD_LIMIT:,} character limit.",
+            )
+
         for key, value in update_data.items():
             setattr(db_search_space, key, value)
         await session.commit()
@@ -266,6 +314,108 @@ async def update_search_space(
         await session.rollback()
         raise HTTPException(
             status_code=500, detail=f"Failed to update search space: {e!s}"
+        ) from e
+
+
+@router.post(
+    "/searchspaces/{search_space_id}/memory/edit",
+    response_model=SearchSpaceRead,
+)
+async def edit_team_memory(
+    search_space_id: int,
+    body: _TeamMemoryEditRequest,
+    session: AsyncSession = Depends(get_async_session),
+    user: User = Depends(current_active_user),
+):
+    """Apply a natural language edit to the team memory via LLM."""
+    await check_search_space_access(session, user, search_space_id)
+
+    agent_config = await load_agent_llm_config_for_search_space(
+        session, search_space_id
+    )
+    if not agent_config:
+        raise HTTPException(status_code=500, detail="No LLM configuration available.")
+    llm = create_chat_litellm_from_agent_config(agent_config)
+    if not llm:
+        raise HTTPException(status_code=500, detail="Failed to create LLM instance.")
+
+    result = await session.execute(
+        select(SearchSpace).filter(SearchSpace.id == search_space_id)
+    )
+    db_search_space = result.scalars().first()
+    if not db_search_space:
+        raise HTTPException(status_code=404, detail="Search space not found")
+
+    current_memory = db_search_space.shared_memory_md or ""
+
+    prompt = _TEAM_MEMORY_EDIT_PROMPT.format(
+        current_memory=current_memory or "(empty)",
+        instruction=body.query,
+    )
+    try:
+        response = await llm.ainvoke(
+            [HumanMessage(content=prompt)],
+            config={"tags": ["surfsense:internal", "memory-edit"]},
+        )
+        updated = extract_text_content(response.content).strip()
+    except Exception as e:
+        logger.exception("Team memory edit LLM call failed: %s", e)
+        raise HTTPException(status_code=500, detail="Team memory edit failed.") from e
+
+    if not updated:
+        raise HTTPException(status_code=400, detail="LLM returned empty result.")
+
+    save_result = await _save_memory(
+        updated_memory=updated,
+        old_memory=current_memory,
+        llm=llm,
+        apply_fn=lambda content: setattr(db_search_space, "shared_memory_md", content),
+        commit_fn=session.commit,
+        rollback_fn=session.rollback,
+        label="team memory",
+        scope="team",
+    )
+
+    if save_result.get("status") == "error":
+        raise HTTPException(status_code=400, detail=save_result["message"])
+
+    await session.refresh(db_search_space)
+    return db_search_space
+
+
+@router.post("/searchspaces/{search_space_id}/ai-sort")
+async def trigger_ai_sort(
+    search_space_id: int,
+    session: AsyncSession = Depends(get_async_session),
+    user: User = Depends(current_active_user),
+):
+    """Trigger a full AI file sort for all documents in the search space."""
+    try:
+        await check_permission(
+            session,
+            user,
+            search_space_id,
+            Permission.SETTINGS_UPDATE.value,
+            "You don't have permission to trigger AI sort on this search space",
+        )
+
+        result = await session.execute(
+            select(SearchSpace).filter(SearchSpace.id == search_space_id)
+        )
+        db_search_space = result.scalars().first()
+        if not db_search_space:
+            raise HTTPException(status_code=404, detail="Search space not found")
+
+        from app.tasks.celery_tasks.document_tasks import ai_sort_search_space_task
+
+        ai_sort_search_space_task.delay(search_space_id, str(user.id))
+        return {"message": "AI sort started"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to trigger AI sort: {e!s}", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail=f"Failed to trigger AI sort: {e!s}"
         ) from e
 
 
@@ -441,6 +591,7 @@ async def _get_image_gen_config_by_id(
             "model_name": "auto",
             "is_global": True,
             "is_auto_mode": True,
+            "billing_tier": "free",
         }
 
     if config_id < 0:
@@ -457,6 +608,7 @@ async def _get_image_gen_config_by_id(
                     "api_version": cfg.get("api_version") or None,
                     "litellm_params": cfg.get("litellm_params", {}),
                     "is_global": True,
+                    "billing_tier": cfg.get("billing_tier", "free"),
                 }
         return None
 
@@ -499,6 +651,7 @@ async def _get_vision_llm_config_by_id(
             "model_name": "auto",
             "is_global": True,
             "is_auto_mode": True,
+            "billing_tier": "free",
         }
 
     if config_id < 0:
@@ -515,6 +668,7 @@ async def _get_vision_llm_config_by_id(
                     "api_version": cfg.get("api_version") or None,
                     "litellm_params": cfg.get("litellm_params", {}),
                     "is_global": True,
+                    "billing_tier": cfg.get("billing_tier", "free"),
                 }
         return None
 
@@ -638,8 +792,26 @@ async def update_llm_preferences(
 
         # Update preferences
         update_data = preferences.model_dump(exclude_unset=True)
+        previous_agent_llm_id = search_space.agent_llm_id
         for key, value in update_data.items():
             setattr(search_space, key, value)
+
+        agent_llm_changed = (
+            "agent_llm_id" in update_data
+            and update_data["agent_llm_id"] != previous_agent_llm_id
+        )
+        if agent_llm_changed:
+            await session.execute(
+                update(NewChatThread)
+                .where(NewChatThread.search_space_id == search_space_id)
+                .values(pinned_llm_config_id=None)
+            )
+            logger.info(
+                "Cleared auto model pins for search_space_id=%s after agent_llm_id change (%s -> %s)",
+                search_space_id,
+                previous_agent_llm_id,
+                update_data["agent_llm_id"],
+            )
 
         await session.commit()
         await session.refresh(search_space)

@@ -1,7 +1,7 @@
 "use client";
 
 import { useAtomValue } from "jotai";
-import { AlertCircle, Dot, Edit3, Info, RefreshCw, Trash2, Wand2 } from "lucide-react";
+import { AlertCircle, Dot, Info, Pencil, RefreshCw, Trash2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { deleteImageGenConfigMutationAtom } from "@/atoms/image-gen-config/image-gen-config-mutation.atoms";
 import {
@@ -22,8 +22,10 @@ import {
 	AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -116,8 +118,8 @@ export function ImageModelManager({ searchSpaceId }: ImageModelManagerProps) {
 
 	return (
 		<div className="space-y-4 md:space-y-6">
-			{/* Header */}
-			<div className="flex flex-col space-y-4 sm:flex-row sm:items-center sm:justify-between sm:space-y-0">
+			{/* Header actions */}
+			<div className="flex items-center justify-between">
 				<Button
 					variant="secondary"
 					size="sm"
@@ -132,7 +134,7 @@ export function ImageModelManager({ searchSpaceId }: ImageModelManagerProps) {
 					<Button
 						variant="outline"
 						onClick={openNewDialog}
-						className="gap-2 bg-white text-black hover:bg-neutral-100 dark:bg-white dark:text-black dark:hover:bg-neutral-200"
+						className="gap-2 border-transparent bg-white text-[#1f1f1f] font-medium hover:bg-zinc-100 hover:text-[#1f1f1f] dark:border-transparent dark:bg-white dark:text-[#1f1f1f]"
 					>
 						Add Image Model
 					</Button>
@@ -152,78 +154,159 @@ export function ImageModelManager({ searchSpaceId }: ImageModelManagerProps) {
 			{/* Read-only / Limited permissions notice */}
 			{access && !isLoading && isReadOnly && (
 				<div>
-					<Alert className="bg-muted/50 py-3 md:py-4">
-						<Info className="h-3 w-3 md:h-4 md:w-4 shrink-0" />
-						<AlertDescription className="text-xs md:text-sm">
-							You have <span className="font-medium">read-only</span> access to image generation
-							configurations. Contact a space owner to request additional permissions.
+					<Alert>
+						<Info />
+						<AlertDescription>
+							<p>
+								You have <span className="font-medium">read-only</span> access to image generation
+								configurations. Contact a space owner to request additional permissions.
+							</p>
 						</AlertDescription>
 					</Alert>
 				</div>
 			)}
 			{access && !isLoading && !isReadOnly && (!canCreate || !canDelete) && (
 				<div>
-					<Alert className="bg-muted/50 py-3 md:py-4">
-						<Info className="h-3 w-3 md:h-4 md:w-4 shrink-0" />
-						<AlertDescription className="text-xs md:text-sm">
-							You can{" "}
-							{[canCreate && "create and edit", canDelete && "delete"]
-								.filter(Boolean)
-								.join(" and ")}{" "}
-							image model configurations
-							{!canDelete && ", but cannot delete them"}.
+					<Alert>
+						<Info />
+						<AlertDescription>
+							<p>
+								You can{" "}
+								{[canCreate && "create and edit", canDelete && "delete"]
+									.filter(Boolean)
+									.join(" and ")}{" "}
+								image model configurations
+								{!canDelete && ", but cannot delete them"}.
+							</p>
 						</AlertDescription>
 					</Alert>
 				</div>
 			)}
 
 			{/* Global info */}
-			{globalConfigs.filter((g) => !("is_auto_mode" in g && g.is_auto_mode)).length > 0 && (
-				<Alert className="bg-muted/50 py-3">
-					<Info className="h-3 w-3 md:h-4 md:w-4 shrink-0" />
-					<AlertDescription className="text-xs md:text-sm">
-						<p>
-							<span className="font-medium">
-								{globalConfigs.filter((g) => !("is_auto_mode" in g && g.is_auto_mode)).length}{" "}
-								global image{" "}
-								{globalConfigs.filter((g) => !("is_auto_mode" in g && g.is_auto_mode)).length === 1
-									? "model"
-									: "models"}
-							</span>{" "}
-							available from your administrator. Use the model selector to view and select them.
-						</p>
+			{(isLoading ||
+				globalConfigs.filter((g) => !("is_auto_mode" in g && g.is_auto_mode)).length > 0) && (
+				<Alert>
+					<Info />
+					<AlertDescription>
+						{isLoading ? (
+							<div className="flex min-h-[1.625em] items-center">
+								<Skeleton className="h-4 w-60 bg-accent-foreground/15" />
+							</div>
+						) : (
+							<p>
+								<span className="font-medium">
+									{globalConfigs.filter((g) => !("is_auto_mode" in g && g.is_auto_mode)).length}{" "}
+									global image{" "}
+									{globalConfigs.filter((g) => !("is_auto_mode" in g && g.is_auto_mode)).length ===
+									1
+										? "model"
+										: "models"}
+								</span>{" "}
+								available from your administrator. {(() => {
+									const nonAuto = globalConfigs.filter(
+										(g) => !("is_auto_mode" in g && g.is_auto_mode)
+									);
+									const premium = nonAuto.filter(
+										(g) =>
+											"billing_tier" in g &&
+											(g as { billing_tier?: string }).billing_tier === "premium"
+									).length;
+									const free = nonAuto.length - premium;
+									if (premium > 0 && free > 0) {
+										return `${premium} premium, ${free} free.`;
+									}
+									if (premium > 0) {
+										return `All ${premium} premium — debits your shared credit pool.`;
+									}
+									return `All ${free} free.`;
+								})()}
+							</p>
+						)}
 					</AlertDescription>
 				</Alert>
 			)}
+
+			{/* Global Image Models — read-only cards with per-model Free/Premium
+			    badges. Mirrors the badge palette used by the chat role selector
+			    (`llm-role-manager.tsx`) so the meaning is consistent across
+			    every model-configuration surface (chat / image / vision). */}
+			{!isLoading &&
+				globalConfigs.filter((g) => !("is_auto_mode" in g && g.is_auto_mode)).length > 0 && (
+					<div className="space-y-3">
+						<div className="grid gap-3 grid-cols-1 sm:grid-cols-2 xl:grid-cols-3">
+							{globalConfigs
+								.filter((g) => !("is_auto_mode" in g && g.is_auto_mode))
+								.map((cfg) => {
+									const billingTier =
+										("billing_tier" in cfg &&
+											typeof (cfg as { billing_tier?: string }).billing_tier === "string" &&
+											(cfg as { billing_tier?: string }).billing_tier) ||
+										"free";
+									const isPremium = billingTier === "premium";
+									return (
+										<Card
+											key={cfg.id}
+											className="group relative overflow-hidden transition-all duration-200 border-accent bg-accent/20 hover:shadow-md h-full"
+										>
+											<CardContent className="p-4 flex flex-col gap-3 h-full">
+												<div className="flex items-center gap-2 min-w-0">
+													<div className="shrink-0">
+														{getProviderIcon(cfg.provider, { className: "size-4" })}
+													</div>
+													<div className="min-w-0 flex-1 flex items-center gap-1.5">
+														<h4 className="text-sm font-semibold tracking-tight truncate">
+															{cfg.name}
+														</h4>
+														{isPremium ? (
+															<Badge
+																variant="secondary"
+																className="text-[8px] md:text-[9px] shrink-0 bg-purple-100 text-purple-700 dark:bg-purple-900/50 dark:text-purple-300 border-0"
+															>
+																Premium
+															</Badge>
+														) : (
+															<Badge
+																variant="secondary"
+																className="text-[8px] md:text-[9px] shrink-0 bg-emerald-100 text-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-300 border-0"
+															>
+																Free
+															</Badge>
+														)}
+													</div>
+												</div>
+												{cfg.description && (
+													<p className="text-[11px] text-muted-foreground/70 line-clamp-2">
+														{cfg.description}
+													</p>
+												)}
+												<div className="mt-auto space-y-2">
+													<Separator className="bg-accent" />
+													<div className="flex items-center">
+														<span className="text-[11px] text-muted-foreground/60 truncate">
+															{cfg.model_name}
+														</span>
+													</div>
+												</div>
+											</CardContent>
+										</Card>
+									);
+								})}
+						</div>
+					</div>
+				)}
 
 			{/* Loading Skeleton */}
 			{isLoading && (
 				<div className="space-y-4 md:space-y-6">
 					<div className="space-y-4">
-						<div className="flex items-center justify-between">
-							<Skeleton className="h-6 md:h-7 w-40 md:w-48" />
-							<Skeleton className="h-8 md:h-9 w-32 md:w-36 rounded-md" />
-						</div>
-
 						<div className="grid gap-3 grid-cols-1 sm:grid-cols-2 xl:grid-cols-3">
 							{["skeleton-a", "skeleton-b", "skeleton-c"].map((key) => (
-								<Card key={key} className="border-border/60">
-									<CardContent className="p-4 flex flex-col gap-3">
-										<div className="flex items-start justify-between gap-2">
-											<div className="space-y-1.5 flex-1 min-w-0">
-												<Skeleton className="h-4 w-28 md:w-32" />
-												<Skeleton className="h-3 w-40 md:w-48" />
-											</div>
-										</div>
-										<div className="flex items-center gap-2">
-											<Skeleton className="h-5 w-16 rounded-full" />
-											<Skeleton className="h-5 w-24 rounded-md" />
-										</div>
-										<div className="flex items-center gap-2 pt-2 border-t border-border/40">
-											<Skeleton className="h-3 w-20" />
-											<Skeleton className="h-4 w-4 rounded-full" />
-											<Skeleton className="h-3 w-16" />
-										</div>
+								<Card key={key} className="border-accent bg-accent/20">
+									<CardContent className="p-4 flex flex-col gap-3 min-h-32">
+										<Skeleton className="h-4 w-32 md:w-40 bg-accent" />
+										<Skeleton className="h-3 w-full bg-accent" />
+										<Skeleton className="h-3 w-24 md:w-28 bg-accent mt-auto" />
 									</CardContent>
 								</Card>
 							))}
@@ -253,22 +336,27 @@ export function ImageModelManager({ searchSpaceId }: ImageModelManagerProps) {
 
 								return (
 									<div key={config.id}>
-										<Card className="group relative overflow-hidden transition-all duration-200 border-border/60 hover:shadow-md h-full">
+										<Card className="group relative overflow-hidden transition-all duration-200 border-accent bg-accent/20 hover:shadow-md h-full">
 											<CardContent className="p-4 flex flex-col gap-3 h-full">
-												{/* Header: Name + Actions */}
-												<div className="flex items-start justify-between gap-2">
-													<div className="min-w-0 flex-1">
-														<h4 className="text-sm font-semibold tracking-tight truncate">
-															{config.name}
-														</h4>
-														{config.description && (
-															<p className="text-[11px] text-muted-foreground/70 truncate mt-0.5">
-																{config.description}
-															</p>
-														)}
+												{/* Header: Icon + Name + Actions */}
+												<div className="flex items-center justify-between gap-2">
+													<div className="flex items-center gap-2.5 min-w-0 flex-1">
+														<div className="shrink-0">
+															{getProviderIcon(config.provider, { className: "size-4" })}
+														</div>
+														<div className="min-w-0 flex-1">
+															<h4 className="text-sm font-semibold tracking-tight truncate">
+																{config.name}
+															</h4>
+															{config.description && (
+																<p className="text-[11px] text-muted-foreground/70 truncate mt-0.5">
+																	{config.description}
+																</p>
+															)}
+														</div>
 													</div>
 													{(canUpdate || canDelete) && (
-														<div className="flex items-center gap-0.5 shrink-0 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity duration-150">
+														<div className="flex items-center gap-1 shrink-0 sm:w-0 sm:overflow-hidden sm:group-hover:w-auto sm:opacity-0 sm:group-hover:opacity-100 transition-all duration-150">
 															{canUpdate && (
 																<TooltipProvider>
 																	<Tooltip open={isDesktop ? undefined : false}>
@@ -277,9 +365,9 @@ export function ImageModelManager({ searchSpaceId }: ImageModelManagerProps) {
 																				variant="ghost"
 																				size="icon"
 																				onClick={() => openEditDialog(config)}
-																				className="h-7 w-7 text-muted-foreground hover:text-foreground"
+																				className="h-7 w-7 rounded-lg text-muted-foreground hover:text-accent-foreground"
 																			>
-																				<Edit3 className="h-3 w-3" />
+																				<Pencil className="h-3 w-3" />
 																			</Button>
 																		</TooltipTrigger>
 																		<TooltipContent>Edit</TooltipContent>
@@ -294,7 +382,7 @@ export function ImageModelManager({ searchSpaceId }: ImageModelManagerProps) {
 																				variant="ghost"
 																				size="icon"
 																				onClick={() => setConfigToDelete(config)}
-																				className="h-7 w-7 text-muted-foreground hover:text-destructive"
+																				className="h-7 w-7 rounded-lg text-muted-foreground hover:text-destructive"
 																			>
 																				<Trash2 className="h-3 w-3" />
 																			</Button>
@@ -307,50 +395,45 @@ export function ImageModelManager({ searchSpaceId }: ImageModelManagerProps) {
 													)}
 												</div>
 
-												{/* Provider + Model */}
-												<div className="flex items-center gap-2 flex-wrap">
-													{getProviderIcon(config.provider, { className: "size-3.5 shrink-0" })}
-													<code className="text-[11px] font-mono text-muted-foreground bg-muted/60 px-2 py-0.5 rounded-md truncate max-w-[160px]">
-														{config.model_name}
-													</code>
-												</div>
-
 												{/* Footer: Date + Creator */}
-												<div className="flex items-center gap-2 pt-2 border-t border-border/40 mt-auto">
-													<span className="text-[11px] text-muted-foreground/60">
-														{new Date(config.created_at).toLocaleDateString(undefined, {
-															year: "numeric",
-															month: "short",
-															day: "numeric",
-														})}
-													</span>
-													{member && (
-														<>
-															<Dot className="h-4 w-4 text-muted-foreground/30" />
-															<TooltipProvider>
-																<Tooltip open={isDesktop ? undefined : false}>
-																	<TooltipTrigger asChild>
-																		<div className="flex items-center gap-1.5 cursor-default">
-																			<Avatar className="size-4.5 shrink-0">
-																				{member.avatarUrl && (
-																					<AvatarImage src={member.avatarUrl} alt={member.name} />
-																				)}
-																				<AvatarFallback className="text-[9px]">
-																					{getInitials(member.name)}
-																				</AvatarFallback>
-																			</Avatar>
-																			<span className="text-[11px] text-muted-foreground/60 truncate max-w-[120px]">
-																				{member.name}
-																			</span>
-																		</div>
-																	</TooltipTrigger>
-																	<TooltipContent side="bottom">
-																		{member.email || member.name}
-																	</TooltipContent>
-																</Tooltip>
-															</TooltipProvider>
-														</>
-													)}
+												<div className="mt-auto space-y-2">
+													<Separator className="bg-accent" />
+													<div className="flex items-center">
+														<span className="shrink-0 text-[11px] text-muted-foreground/60 whitespace-nowrap">
+															{new Date(config.created_at).toLocaleDateString(undefined, {
+																year: "numeric",
+																month: "short",
+																day: "numeric",
+															})}
+														</span>
+														{member && (
+															<>
+																<Dot className="h-4 w-4 text-muted-foreground/30 shrink-0" />
+																<TooltipProvider>
+																	<Tooltip open={isDesktop ? undefined : false}>
+																		<TooltipTrigger asChild>
+																			<div className="min-w-0 flex items-center gap-1.5 cursor-default">
+																				<Avatar className="size-4.5 shrink-0">
+																					{member.avatarUrl && (
+																						<AvatarImage src={member.avatarUrl} alt={member.name} />
+																					)}
+																					<AvatarFallback className="text-[9px]">
+																						{getInitials(member.name)}
+																					</AvatarFallback>
+																				</Avatar>
+																				<span className="text-[11px] text-muted-foreground/60 truncate">
+																					{member.name}
+																				</span>
+																			</div>
+																		</TooltipTrigger>
+																		<TooltipContent side="bottom">
+																			{member.email || member.name}
+																		</TooltipContent>
+																	</Tooltip>
+																</TooltipProvider>
+															</>
+														)}
+													</div>
 												</div>
 											</CardContent>
 										</Card>

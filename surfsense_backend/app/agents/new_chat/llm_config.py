@@ -10,58 +10,98 @@ It also provides utilities for creating ChatLiteLLM instances and
 managing prompt configurations.
 """
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import yaml
+from langchain_core.callbacks import (
+    AsyncCallbackManagerForLLMRun,
+    CallbackManagerForLLMRun,
+)
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.outputs import ChatGenerationChunk, ChatResult
 from langchain_litellm import ChatLiteLLM
 from litellm import get_model_info
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.new_chat.prompt_caching import apply_litellm_prompt_caching
 from app.services.llm_router_service import (
     AUTO_MODE_ID,
     ChatLiteLLMRouter,
     LLMRouterService,
+    _sanitize_content,
     get_auto_mode_llm,
     is_auto_mode,
 )
 
-# Provider mapping for LiteLLM model string construction
-PROVIDER_MAP = {
-    "OPENAI": "openai",
-    "ANTHROPIC": "anthropic",
-    "GROQ": "groq",
-    "COHERE": "cohere",
-    "GOOGLE": "gemini",
-    "OLLAMA": "ollama_chat",
-    "MISTRAL": "mistral",
-    "AZURE_OPENAI": "azure",
-    "OPENROUTER": "openrouter",
-    "XAI": "xai",
-    "BEDROCK": "bedrock",
-    "VERTEX_AI": "vertex_ai",
-    "TOGETHER_AI": "together_ai",
-    "FIREWORKS_AI": "fireworks_ai",
-    "DEEPSEEK": "openai",
-    "ALIBABA_QWEN": "openai",
-    "MOONSHOT": "openai",
-    "ZHIPU": "openai",
-    "GITHUB_MODELS": "github",
-    "REPLICATE": "replicate",
-    "PERPLEXITY": "perplexity",
-    "ANYSCALE": "anyscale",
-    "DEEPINFRA": "deepinfra",
-    "CEREBRAS": "cerebras",
-    "SAMBANOVA": "sambanova",
-    "AI21": "ai21",
-    "CLOUDFLARE": "cloudflare",
-    "DATABRICKS": "databricks",
-    "COMETAPI": "cometapi",
-    "HUGGINGFACE": "huggingface",
-    "MINIMAX": "openai",
-    "CUSTOM": "custom",
-}
+
+def _sanitize_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Sanitize content on every message so it is safe for any provider.
+
+    Handles three cross-provider incompatibilities:
+    - List content with provider-specific blocks (e.g. ``thinking``)
+    - List content with bare strings or empty text blocks
+    - AI messages with empty content + tool calls: some providers (Bedrock)
+      convert ``""`` to ``[{"type":"text","text":""}]`` server-side then
+      reject the blank text.  The OpenAI spec says ``content`` should be
+      ``null`` when an assistant message only carries tool calls.
+    """
+    for msg in messages:
+        if isinstance(msg.content, list):
+            msg.content = _sanitize_content(msg.content)
+        if (
+            isinstance(msg, AIMessage)
+            and (not msg.content or msg.content == "")
+            and getattr(msg, "tool_calls", None)
+        ):
+            msg.content = None  # type: ignore[assignment]
+    return messages
+
+
+class SanitizedChatLiteLLM(ChatLiteLLM):
+    """ChatLiteLLM subclass that strips provider-specific content blocks
+    (e.g. ``thinking`` from reasoning models) and normalises bare strings
+    in content arrays before forwarding to the underlying provider."""
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        return super()._generate(
+            _sanitize_messages(messages), stop, run_manager, **kwargs
+        )
+
+    async def _astream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        async for chunk in super()._astream(
+            _sanitize_messages(messages), stop, run_manager, **kwargs
+        ):
+            yield chunk
+
+
+# Provider mapping for LiteLLM model string construction.
+#
+# Single source of truth lives in
+# :mod:`app.services.provider_capabilities` so the YAML loader (which
+# runs during ``app.config`` class-body init) can resolve provider
+# prefixes without dragging the agent / tools tree into module load
+# order. Re-exported here under the historical ``PROVIDER_MAP`` name
+# so existing callers (``llm_router_service``, ``image_gen_router_service``,
+# tests) keep working unchanged.
+from app.services.provider_capabilities import (  # noqa: E402
+    _PROVIDER_PREFIX_MAP as PROVIDER_MAP,
+)
 
 
 def _attach_model_profile(llm: ChatLiteLLM, model_string: str) -> None:
@@ -109,6 +149,23 @@ class AgentConfig:
     # Auto mode flag
     is_auto_mode: bool = False
 
+    # Token quota and policy
+    billing_tier: str = "free"
+    is_premium: bool = False
+    anonymous_enabled: bool = False
+    quota_reserve_tokens: int | None = None
+
+    # Capability flag: best-effort True for the chat selector / catalog.
+    # Resolved via :func:`provider_capabilities.derive_supports_image_input`
+    # which prefers OpenRouter's ``architecture.input_modalities`` and
+    # otherwise consults LiteLLM's authoritative model map. Default True
+    # is the conservative-allow stance — the streaming-task safety net
+    # (``is_known_text_only_chat_model``) is the *only* place a False
+    # actually blocks a request. Setting this to False here without an
+    # authoritative source would silently hide vision-capable models
+    # (the regression we're fixing).
+    supports_image_input: bool = True
+
     @classmethod
     def from_auto_mode(cls) -> "AgentConfig":
         """
@@ -130,6 +187,16 @@ class AgentConfig:
             config_id=AUTO_MODE_ID,
             config_name="Auto (Fastest)",
             is_auto_mode=True,
+            billing_tier="free",
+            is_premium=False,
+            anonymous_enabled=False,
+            quota_reserve_tokens=None,
+            # Auto routes across the configured pool, which usually
+            # contains at least one vision-capable deployment; the router
+            # will surface a 404 from a non-vision deployment as a normal
+            # ``allowed_fails`` event and fail over rather than blocking
+            # the request outright.
+            supports_image_input=True,
         )
 
     @classmethod
@@ -143,10 +210,24 @@ class AgentConfig:
         Returns:
             AgentConfig instance
         """
-        return cls(
-            provider=config.provider.value
+        # Lazy import to avoid pulling provider_capabilities (and its
+        # transitive litellm import) into module-init order.
+        from app.services.provider_capabilities import derive_supports_image_input
+
+        provider_value = (
+            config.provider.value
             if hasattr(config.provider, "value")
-            else str(config.provider),
+            else str(config.provider)
+        )
+        litellm_params = config.litellm_params or {}
+        base_model = (
+            litellm_params.get("base_model")
+            if isinstance(litellm_params, dict)
+            else None
+        )
+
+        return cls(
+            provider=provider_value,
             model_name=config.model_name,
             api_key=config.api_key,
             api_base=config.api_base,
@@ -158,6 +239,20 @@ class AgentConfig:
             config_id=config.id,
             config_name=config.name,
             is_auto_mode=False,
+            billing_tier="free",
+            is_premium=False,
+            anonymous_enabled=False,
+            quota_reserve_tokens=None,
+            # BYOK rows have no operator-curated capability flag, so we
+            # ask LiteLLM (default-allow on unknown). The streaming
+            # safety net still blocks if the model is *explicitly*
+            # marked text-only.
+            supports_image_input=derive_supports_image_input(
+                provider=provider_value,
+                model_name=config.model_name,
+                base_model=base_model,
+                custom_provider=config.custom_provider,
+            ),
         )
 
     @classmethod
@@ -176,15 +271,46 @@ class AgentConfig:
         Returns:
             AgentConfig instance
         """
+        # Lazy import to avoid pulling provider_capabilities (and its
+        # transitive litellm import) into module-init order.
+        from app.services.provider_capabilities import derive_supports_image_input
+
         # Get system instructions from YAML, default to empty string
         system_instructions = yaml_config.get("system_instructions", "")
 
+        provider = yaml_config.get("provider", "").upper()
+        model_name = yaml_config.get("model_name", "")
+        custom_provider = yaml_config.get("custom_provider")
+        litellm_params = yaml_config.get("litellm_params") or {}
+        base_model = (
+            litellm_params.get("base_model")
+            if isinstance(litellm_params, dict)
+            else None
+        )
+
+        # Explicit YAML override wins; otherwise derive from LiteLLM /
+        # OpenRouter modalities. The YAML loader already populates this
+        # field, but this method is also called from
+        # ``load_global_llm_config_by_id``'s file fallback (hot reload),
+        # so we re-derive here for safety. The bool() coercion preserves
+        # the loader's behaviour for explicit ``true`` / ``false``
+        # strings that PyYAML may surface.
+        if "supports_image_input" in yaml_config:
+            supports_image_input = bool(yaml_config.get("supports_image_input"))
+        else:
+            supports_image_input = derive_supports_image_input(
+                provider=provider,
+                model_name=model_name,
+                base_model=base_model,
+                custom_provider=custom_provider,
+            )
+
         return cls(
-            provider=yaml_config.get("provider", "").upper(),
-            model_name=yaml_config.get("model_name", ""),
+            provider=provider,
+            model_name=model_name,
             api_key=yaml_config.get("api_key", ""),
             api_base=yaml_config.get("api_base"),
-            custom_provider=yaml_config.get("custom_provider"),
+            custom_provider=custom_provider,
             litellm_params=yaml_config.get("litellm_params"),
             # Prompt configuration from YAML (with defaults for backwards compatibility)
             system_instructions=system_instructions if system_instructions else None,
@@ -195,6 +321,11 @@ class AgentConfig:
             config_id=yaml_config.get("id"),
             config_name=yaml_config.get("name"),
             is_auto_mode=False,
+            billing_tier=yaml_config.get("billing_tier", "free"),
+            is_premium=yaml_config.get("billing_tier", "free") == "premium",
+            anonymous_enabled=yaml_config.get("anonymous_enabled", False),
+            quota_reserve_tokens=yaml_config.get("quota_reserve_tokens"),
+            supports_image_input=supports_image_input,
         )
 
 
@@ -232,6 +363,28 @@ def load_llm_config_from_yaml(llm_config_id: int = -1) -> dict | None:
     except Exception as e:
         print(f"Error loading config: {e}")
         return None
+
+
+def load_global_llm_config_by_id(llm_config_id: int) -> dict | None:
+    """
+    Load a global LLM config by ID, checking in-memory configs first.
+
+    This handles both static YAML configs and dynamically injected configs
+    (e.g. OpenRouter integration models that only exist in memory).
+
+    Args:
+        llm_config_id: The negative ID of the global config to load
+
+    Returns:
+        LLM config dict or None if not found
+    """
+    from app.config import config as app_config
+
+    for cfg in app_config.GLOBAL_LLM_CONFIGS:
+        if cfg.get("id") == llm_config_id:
+            return cfg
+    # Fallback to YAML file read (covers edge cases like hot-reload)
+    return load_llm_config_from_yaml(llm_config_id)
 
 
 async def load_new_llm_config_from_db(
@@ -341,7 +494,13 @@ async def load_agent_config(
         return AgentConfig.from_auto_mode()
 
     if config_id < 0:
-        # Load from YAML (global configs have negative IDs)
+        # Check in-memory configs first (includes static YAML + dynamic OpenRouter)
+        from app.config import config as app_config
+
+        for cfg in app_config.GLOBAL_LLM_CONFIGS:
+            if cfg.get("id") == config_id:
+                return AgentConfig.from_yaml_config(cfg)
+        # Fallback to YAML file read for safety
         yaml_config = load_llm_config_from_yaml(config_id)
         if yaml_config:
             return AgentConfig.from_yaml_config(yaml_config)
@@ -384,8 +543,13 @@ def create_chat_litellm_from_config(llm_config: dict) -> ChatLiteLLM | None:
     if llm_config.get("litellm_params"):
         litellm_kwargs.update(llm_config["litellm_params"])
 
-    llm = ChatLiteLLM(**litellm_kwargs)
+    llm = SanitizedChatLiteLLM(**litellm_kwargs)
     _attach_model_profile(llm, model_string)
+    # Configure LiteLLM-native prompt caching (cache_control_injection_points
+    # for Anthropic/Bedrock/Vertex/Gemini/Azure-AI/OpenRouter/Databricks/etc.).
+    # ``agent_config=None`` here — the YAML path doesn't have provider intent
+    # in a structured form, so we set only the universal injection points.
+    apply_litellm_prompt_caching(llm)
     return llm
 
 
@@ -410,7 +574,16 @@ def create_chat_litellm_from_agent_config(
             print("Error: Auto mode requested but LLM Router not initialized")
             return None
         try:
-            return get_auto_mode_llm()
+            router_llm = get_auto_mode_llm()
+            if router_llm is not None:
+                # Universal cache_control_injection_points only — auto-mode
+                # fans out across providers, so OpenAI-only kwargs (e.g.
+                # ``prompt_cache_key``) are left off here. ``drop_params``
+                # would strip them at the provider boundary anyway, but
+                # there's no point setting them when we don't know the
+                # destination.
+                apply_litellm_prompt_caching(router_llm, agent_config=agent_config)
+            return router_llm
         except Exception as e:
             print(f"Error creating ChatLiteLLMRouter: {e}")
             return None
@@ -439,6 +612,11 @@ def create_chat_litellm_from_agent_config(
     if agent_config.litellm_params:
         litellm_kwargs.update(agent_config.litellm_params)
 
-    llm = ChatLiteLLM(**litellm_kwargs)
+    llm = SanitizedChatLiteLLM(**litellm_kwargs)
     _attach_model_profile(llm, model_string)
+    # Build-time prompt caching: sets ``cache_control_injection_points`` for
+    # all providers and (for OpenAI/DeepSeek/xAI) ``prompt_cache_retention``.
+    # Per-thread ``prompt_cache_key`` is layered on later in
+    # ``create_surfsense_deep_agent`` once ``thread_id`` is known.
+    apply_litellm_prompt_caching(llm, agent_config=agent_config)
     return llm
