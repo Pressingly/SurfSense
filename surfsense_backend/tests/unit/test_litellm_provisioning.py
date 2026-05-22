@@ -686,3 +686,120 @@ async def test_db_write_failure_after_provision_rolls_back_and_returns_false(
     assert ss.document_summary_llm_id == 0
     assert ss.image_generation_config_id == 0
     assert ss.vision_llm_config_id == 0
+
+
+async def test_race_loss_inside_lock_returns_true_without_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the cheap pre-lock SELECT misses but the inside-lock re-SELECT
+    finds the marker (another worker provisioned during our Askii call),
+    return True without writing rows — the upstream Askii key we just
+    provisioned is orphaned and will self-expire."""
+    _set_config(monkeypatch)
+    user = _make_user()
+    ss = _FakeSearchSpace(user_id=user.id, ss_id=13)
+
+    # Build a session whose successive `execute()` calls return:
+    #   1. cheap check → None (no marker yet)
+    #   2. SELECT FOR UPDATE on SearchSpace → not inspected
+    #   3. re-check inside lock → an existing NewLLMConfig (race lost)
+    existing_marker = NewLLMConfig(
+        name=ROW_NAME_AGENT,
+        provider=LiteLLMProvider.OPENAI,
+        model_name="gpt-5.4-mini",
+        api_key="sk-from-other-worker",
+        search_space_id=ss.id,
+        user_id=user.id,
+    )
+
+    cheap_result = MagicMock()
+    cheap_result.scalar_one_or_none.return_value = None
+    lock_result = MagicMock()
+    recheck_result = MagicMock()
+    recheck_result.scalar_one_or_none.return_value = existing_marker
+
+    session = AsyncMock()
+    session.execute = AsyncMock(side_effect=[cheap_result, lock_result, recheck_result])
+    session.add = MagicMock()
+    session.flush = AsyncMock()
+    session.commit = AsyncMock()
+
+    sdk_called = False
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal sdk_called
+        sdk_called = True
+        return httpx.Response(
+            200,
+            json={
+                "api_key": "sk-we-just-wasted",
+                "key_name": "orphan-key",
+                "user_id": "u",
+                "expires": None,
+            },
+        )
+
+    client = _mock_transport(handler)
+    try:
+        ok = await ensure_personal_litellm_keys(
+            session=session,
+            user=user,
+            search_space=ss,
+            request=_make_request(access_token="jwt"),
+            http_client=client,
+        )
+    finally:
+        await client.aclose()
+
+    assert ok is True  # caller's perspective: provisioning succeeded
+    assert sdk_called is True  # we did pay the Askii cost
+    session.add.assert_not_called()  # but we did not insert duplicate rows
+    session.commit.assert_not_called()
+    session.rollback.assert_awaited()  # lock released promptly
+    assert ss.agent_llm_id == 0
+    assert ss.document_summary_llm_id == 0
+    assert ss.image_generation_config_id == 0
+    assert ss.vision_llm_config_id == 0
+
+
+async def test_unexpected_exception_caught_and_rolled_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Any exception escaping the inner handlers (e.g. lock acquisition
+    timeout, unexpected ORM error) must be caught by the outer best-effort
+    `except Exception` — rollback called, return False, no raise."""
+    _set_config(monkeypatch)
+    user = _make_user()
+    ss = _FakeSearchSpace(user_id=user.id)
+
+    session = AsyncMock()
+    # First `execute()` (the cheap marker SELECT) raises an unexpected error.
+    session.execute = AsyncMock(side_effect=RuntimeError("connection lost"))
+    session.add = MagicMock()
+    session.flush = AsyncMock()
+    session.commit = AsyncMock()
+
+    sdk_called = False
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal sdk_called
+        sdk_called = True
+        return httpx.Response(200, json={})
+
+    client = _mock_transport(handler)
+    try:
+        ok = await ensure_personal_litellm_keys(
+            session=session,
+            user=user,
+            search_space=ss,
+            request=_make_request(access_token="jwt"),
+            http_client=client,
+        )
+    finally:
+        await client.aclose()
+
+    assert ok is False
+    assert sdk_called is False  # we never got past the cheap SELECT
+    session.rollback.assert_awaited()
+    session.add.assert_not_called()
+    session.commit.assert_not_called()

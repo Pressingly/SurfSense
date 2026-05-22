@@ -111,8 +111,22 @@ async def ensure_personal_litellm_keys(
     exists. On a successful provision, inserts four rows (agent +
     doc-summary as ``NewLLMConfig``, image as ``ImageGenerationConfig``,
     vision as ``VisionLLMConfig``) and points all four
-    ``search_space.*_id`` FKs at them. Failures are caught and logged;
-    we never raise out of this function.
+    ``search_space.*_id`` FKs at them.
+
+    Best-effort contract: this function never raises. Any unexpected error
+    triggers a rollback (to release any row lock held by an in-progress
+    transaction) and returns ``False``. The lazy guard on the next
+    ``GET /searchspaces/{id}`` will retry.
+
+    Locking: a ``SELECT ... FOR UPDATE`` on the SearchSpace row wraps ONLY
+    the DB write window — outbound Askii calls happen *without* a lock held
+    so slow upstream cannot stall every concurrent tab on the same row.
+    The trade-off is that on a rare race-loss (two tabs hit My Space at the
+    exact same moment on first login), both workers call Askii; only one
+    wins the lock-+-re-check and writes config rows. The losing worker's
+    upstream Askii key is orphaned (no SurfSense row references it) but
+    auto-expires at ``ASKII_LITELLM_KEY_DURATION_DAYS`` — no user-visible
+    damage on this side.
 
     ``http_client`` is for tests (inject an ``httpx.MockTransport`` backed
     client); production callers leave it as ``None``.
@@ -122,147 +136,185 @@ async def ensure_personal_litellm_keys(
     if not should_auto_provision(config):
         return False
 
-    # Double-checked locking. The lazy guard runs on EVERY owner
-    # `GET /searchspaces/{id}` when the feature is enabled, so the steady
-    # state (already provisioned) is the hot path — take no lock there.
-    #
-    # 1. Cheap SELECT first; if the marker row exists, short-circuit.
-    # 2. Only if missing do we acquire a row-level lock on the SearchSpace
-    #    row (serializes concurrent provisioning attempts) and re-SELECT
-    #    the marker inside the lock to catch the race window where another
-    #    worker provisioned between our two checks.
     marker_query = select(NewLLMConfig).where(
         NewLLMConfig.user_id == user.id,
         NewLLMConfig.search_space_id == search_space.id,
         NewLLMConfig.name == ROW_NAME_AGENT,
     )
-    existing = await session.execute(marker_query)
-    if existing.scalar_one_or_none() is not None:
-        return True
-
-    await session.execute(
-        select(SearchSpace.id)
-        .where(SearchSpace.id == search_space.id)
-        .with_for_update()
-    )
-    existing = await session.execute(marker_query)
-    if existing.scalar_one_or_none() is not None:
-        return True
-
-    access_token = (request.headers.get("x-auth-request-access-token") or "").strip()
-    if not access_token:
-        logger.warning(
-            "LiteLLM auto-provision skipped: missing X-Auth-Request-Access-Token "
-            "for user %s on search_space %s",
-            user.id,
-            search_space.id,
-        )
-        return False
-
-    agent_model: str = config.ASKII_AGENT_MODEL
-    doc_summary_model: str = config.ASKII_DOCUMENT_SUMMARY_MODEL or agent_model
-    image_model: str = config.ASKII_IMAGE_GEN_MODEL
-    vision_model: str = config.ASKII_VISION_MODEL
-    models_for_askii = sorted(
-        {agent_model, doc_summary_model, image_model, vision_model}
-    )
-
-    response = await _provision_via_askii(
-        access_token=access_token,
-        base_url=config.ASKII_BASE_URL,
-        duration_days=config.ASKII_LITELLM_KEY_DURATION_DAYS,
-        models=models_for_askii,
-        default_model=agent_model,
-        user_id=user.id,
-        http_client=http_client,
-    )
-    if response is None:
-        return False
-
-    api_key = response.api_key.get_secret_value()
-    api_base = config.ASKII_LITELLM_BASE_URL or config.ASKII_BASE_URL
-
-    agent_row = NewLLMConfig(
-        name=ROW_NAME_AGENT,
-        description="Auto-provisioned LLM (Askii)",
-        provider=LiteLLMProvider.OPENAI,
-        model_name=agent_model,
-        api_key=api_key,
-        api_base=api_base,
-        litellm_params={},
-        system_instructions="",
-        use_default_system_instructions=True,
-        citations_enabled=True,
-        search_space_id=search_space.id,
-        user_id=user.id,
-    )
-    doc_summary_row = NewLLMConfig(
-        name=ROW_NAME_DOC_SUMMARY,
-        description="Auto-provisioned document-summary LLM (Askii)",
-        provider=LiteLLMProvider.OPENAI,
-        model_name=doc_summary_model,
-        api_key=api_key,
-        api_base=api_base,
-        litellm_params={},
-        system_instructions="",
-        use_default_system_instructions=True,
-        citations_enabled=True,
-        search_space_id=search_space.id,
-        user_id=user.id,
-    )
-    image_row = ImageGenerationConfig(
-        name=ROW_NAME_IMAGE,
-        description="Auto-provisioned image-gen (Askii)",
-        provider=ImageGenProvider.OPENAI,
-        model_name=image_model,
-        api_key=api_key,
-        api_base=api_base,
-        litellm_params={},
-        search_space_id=search_space.id,
-        user_id=user.id,
-    )
-    vision_row = VisionLLMConfig(
-        name=ROW_NAME_VISION,
-        description="Auto-provisioned vision (Askii)",
-        provider=VisionProvider.OPENAI,
-        model_name=vision_model,
-        api_key=api_key,
-        api_base=api_base,
-        litellm_params={},
-        search_space_id=search_space.id,
-        user_id=user.id,
-    )
 
     try:
-        for row in (agent_row, doc_summary_row, image_row, vision_row):
-            session.add(row)
-        await session.flush()  # populate .id on each
+        # Cheap check (no lock) — for already-provisioned users on every
+        # owner /searchspaces/{id} load, short-circuit immediately. This is
+        # the hot path; the steady state must not take a row lock.
+        existing = await session.execute(marker_query)
+        if existing.scalar_one_or_none() is not None:
+            return True
 
-        search_space.agent_llm_id = agent_row.id
-        search_space.document_summary_llm_id = doc_summary_row.id
-        search_space.image_generation_config_id = image_row.id
-        search_space.vision_llm_config_id = vision_row.id
+        access_token = (
+            request.headers.get("x-auth-request-access-token") or ""
+        ).strip()
+        if not access_token:
+            logger.warning(
+                "LiteLLM auto-provision skipped: missing X-Auth-Request-Access-Token "
+                "for user %s on search_space %s",
+                user.id,
+                search_space.id,
+            )
+            return False
 
-        await session.commit()
-    except SQLAlchemyError:
-        await session.rollback()
+        agent_model: str = config.ASKII_AGENT_MODEL
+        doc_summary_model: str = (
+            config.ASKII_DOCUMENT_SUMMARY_MODEL or agent_model
+        )
+        image_model: str = config.ASKII_IMAGE_GEN_MODEL
+        vision_model: str = config.ASKII_VISION_MODEL
+        models_for_askii = sorted(
+            {agent_model, doc_summary_model, image_model, vision_model}
+        )
+
+        # Outbound Askii call happens BEFORE taking the lock so a slow or
+        # broken upstream doesn't block every other request touching this
+        # SearchSpace row.
+        response = await _provision_via_askii(
+            access_token=access_token,
+            base_url=config.ASKII_BASE_URL,
+            duration_days=config.ASKII_LITELLM_KEY_DURATION_DAYS,
+            models=models_for_askii,
+            default_model=agent_model,
+            user_id=user.id,
+            http_client=http_client,
+        )
+        if response is None:
+            return False
+
+        api_key = response.api_key.get_secret_value()
+        api_base = config.ASKII_LITELLM_BASE_URL or config.ASKII_BASE_URL
+
+        agent_row = NewLLMConfig(
+            name=ROW_NAME_AGENT,
+            description="Auto-provisioned LLM (Askii)",
+            provider=LiteLLMProvider.OPENAI,
+            model_name=agent_model,
+            api_key=api_key,
+            api_base=api_base,
+            litellm_params={},
+            system_instructions="",
+            use_default_system_instructions=True,
+            citations_enabled=True,
+            search_space_id=search_space.id,
+            user_id=user.id,
+        )
+        doc_summary_row = NewLLMConfig(
+            name=ROW_NAME_DOC_SUMMARY,
+            description="Auto-provisioned document-summary LLM (Askii)",
+            provider=LiteLLMProvider.OPENAI,
+            model_name=doc_summary_model,
+            api_key=api_key,
+            api_base=api_base,
+            litellm_params={},
+            system_instructions="",
+            use_default_system_instructions=True,
+            citations_enabled=True,
+            search_space_id=search_space.id,
+            user_id=user.id,
+        )
+        image_row = ImageGenerationConfig(
+            name=ROW_NAME_IMAGE,
+            description="Auto-provisioned image-gen (Askii)",
+            provider=ImageGenProvider.OPENAI,
+            model_name=image_model,
+            api_key=api_key,
+            api_base=api_base,
+            litellm_params={},
+            search_space_id=search_space.id,
+            user_id=user.id,
+        )
+        vision_row = VisionLLMConfig(
+            name=ROW_NAME_VISION,
+            description="Auto-provisioned vision (Askii)",
+            provider=VisionProvider.OPENAI,
+            model_name=vision_model,
+            api_key=api_key,
+            api_base=api_base,
+            litellm_params={},
+            search_space_id=search_space.id,
+            user_id=user.id,
+        )
+
+        # Take the SearchSpace row lock only to wrap the brief DB-write
+        # window. Re-SELECT the marker inside the lock to detect a concurrent
+        # provision; if we lost the race, rollback to release the lock and
+        # return True with the (now orphaned upstream) Askii key.
+        await session.execute(
+            select(SearchSpace.id)
+            .where(SearchSpace.id == search_space.id)
+            .with_for_update()
+        )
+        existing = await session.execute(marker_query)
+        if existing.scalar_one_or_none() is not None:
+            await session.rollback()
+            logger.info(
+                "LiteLLM auto-provision lost a race for user %s on search_space %s "
+                "— upstream Askii key '%s' is orphaned (auto-expires)",
+                user.id,
+                search_space.id,
+                response.key_name,
+            )
+            return True
+
+        try:
+            for row in (agent_row, doc_summary_row, image_row, vision_row):
+                session.add(row)
+            await session.flush()  # populate .id on each
+
+            search_space.agent_llm_id = agent_row.id
+            search_space.document_summary_llm_id = doc_summary_row.id
+            search_space.image_generation_config_id = image_row.id
+            search_space.vision_llm_config_id = vision_row.id
+
+            await session.commit()
+        except SQLAlchemyError:
+            await session.rollback()
+            logger.exception(
+                "LiteLLM auto-provision DB write failed for user %s on search_space %s "
+                "(Askii key already provisioned; lazy guard will retry on next My Space load)",
+                user.id,
+                search_space.id,
+            )
+            return False
+
+        logger.info(
+            "Auto-provisioned LiteLLM key '%s' (key_name=%s) and 4 config rows "
+            "for user %s on search_space %s",
+            LITELLM_KEY_ALIAS,
+            response.key_name,
+            user.id,
+            search_space.id,
+        )
+        return True
+
+    except Exception:
+        # Best-effort contract: swallow anything that escaped the inner
+        # handlers (e.g. lock-acquisition timeout, unexpected ORM error from
+        # the cheap SELECT, unforeseen SDK error not classified by
+        # _provision_via_askii). Roll back to release any held lock and
+        # leave the session in a clean state for the caller.
+        try:
+            await session.rollback()
+        except Exception:
+            logger.exception(
+                "LiteLLM auto-provision: rollback after unexpected error also failed "
+                "for user %s on search_space %s",
+                user.id,
+                search_space.id,
+            )
         logger.exception(
-            "LiteLLM auto-provision DB write failed for user %s on search_space %s "
-            "(Askii key already provisioned; lazy guard will retry on next My Space load)",
+            "LiteLLM auto-provision unexpectedly raised for user %s on search_space %s "
+            "— swallowed per best-effort contract; lazy guard will retry",
             user.id,
             search_space.id,
         )
         return False
-
-    logger.info(
-        "Auto-provisioned LiteLLM key '%s' (key_name=%s) and 4 config rows "
-        "for user %s on search_space %s",
-        LITELLM_KEY_ALIAS,
-        response.key_name,
-        user.id,
-        search_space.id,
-    )
-    return True
 
 
 async def _provision_via_askii(
