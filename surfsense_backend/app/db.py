@@ -2170,6 +2170,14 @@ if config.AUTH_TYPE == "GOOGLE":
 
         last_login = Column(TIMESTAMP(timezone=True), nullable=True)
 
+        # One-shot marker for Askii LiteLLM auto-provisioning
+        # (app.services.litellm_provisioning). NULL = eligible; non-NULL =
+        # provisioned once at this time and permanently ineligible, even if the
+        # generated config rows are later deleted.
+        litellm_auto_provisioned_at = Column(
+            TIMESTAMP(timezone=True), nullable=True
+        )
+
         memory_md = Column(Text, nullable=True, server_default="")
 
         # Refresh tokens for this user
@@ -2301,6 +2309,14 @@ else:
         avatar_url = Column(String, nullable=True)
 
         last_login = Column(TIMESTAMP(timezone=True), nullable=True)
+
+        # One-shot marker for Askii LiteLLM auto-provisioning
+        # (app.services.litellm_provisioning). NULL = eligible; non-NULL =
+        # provisioned once at this time and permanently ineligible, even if the
+        # generated config rows are later deleted.
+        litellm_auto_provisioned_at = Column(
+            TIMESTAMP(timezone=True), nullable=True
+        )
 
         memory_md = Column(Text, nullable=True, server_default="")
 

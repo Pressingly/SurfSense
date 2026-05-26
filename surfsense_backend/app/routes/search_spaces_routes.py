@@ -1,6 +1,6 @@
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel as PydanticBaseModel
 from sqlalchemy import func, update
@@ -33,10 +33,6 @@ from app.schemas import (
     SearchSpaceRead,
     SearchSpaceUpdate,
     SearchSpaceWithStats,
-)
-from app.services.litellm_provisioning import (
-    ensure_personal_litellm_keys,
-    should_auto_provision,
 )
 from app.users import current_active_user
 from app.utils.content_utils import extract_text_content
@@ -238,7 +234,6 @@ async def read_search_spaces(
 @router.get("/searchspaces/{search_space_id}", response_model=SearchSpaceRead)
 async def read_search_space(
     search_space_id: int,
-    request: Request,
     session: AsyncSession = Depends(get_async_session),
     user: User = Depends(current_active_user),
 ):
@@ -257,28 +252,6 @@ async def read_search_space(
 
         if not search_space:
             raise HTTPException(status_code=404, detail="Search space not found")
-
-        # AC4 lazy guard: if auto-provisioning is enabled and the owner is
-        # viewing their own space without personal LiteLLM rows yet, try once
-        # to provision the key + four config rows. The service is idempotent
-        # — it short-circuits with a single SELECT when the agent marker row
-        # exists, so this stays cheap on the steady-state path. Owner-only so
-        # we never provision on behalf of someone viewing a shared space.
-        # Wrapped in try/except — the GET must never 500 because of
-        # provisioning.
-        if should_auto_provision(config) and search_space.user_id == user.id:
-            try:
-                await ensure_personal_litellm_keys(
-                    session=session,
-                    user=user,
-                    search_space=search_space,
-                    request=request,
-                )
-            except Exception:
-                logger.exception(
-                    "Lazy LiteLLM provisioning guard failed for search_space %s",
-                    search_space.id,
-                )
 
         return search_space
 
