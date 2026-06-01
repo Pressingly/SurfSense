@@ -1,11 +1,10 @@
 import logging
 import secrets
 import unicodedata
-from datetime import UTC, datetime
 
 from fastapi_users.db import SQLAlchemyUserDatabase
 from fastapi_users.password import PasswordHelper  # singleton below
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
@@ -18,7 +17,6 @@ logger = logging.getLogger(__name__)
 _password_helper = PasswordHelper()
 
 _DEFAULT_BYPASS_PATHS = ["/health"]
-_LAST_LOGIN_THROTTLE_SECONDS = 300
 
 
 def _normalise_email(email: str) -> str:
@@ -152,62 +150,82 @@ class ProxyAuthMiddleware(BaseHTTPMiddleware):
                             )
                             return None
 
-                # Update last_login at most once every 5 minutes per user.
-                # Unlike Plane (Django session — one DB write per login session),
-                # FastAPI has no server-side session so this middleware runs on
-                # every request. Writing last_login unconditionally would add an
-                # UPDATE + COMMIT to every API call; throttling keeps it cheap.
-                now = datetime.now(UTC)
-                needs_update = created or (
-                    user.last_login is None
-                    or (now - user.last_login).total_seconds()
-                    > _LAST_LOGIN_THROTTLE_SECONDS
-                )
-                if needs_update:
-                    try:
-                        await session.execute(
-                            update(User)
-                            .where(User.id == user.id)
-                            .values(last_login=now)
-                        )
-                        await session.commit()
-                    except Exception:
-                        logger.warning(
-                            "ProxyAuth: failed to update last_login for %s", email
-                        )
+                # Fire UserManager lifecycle hooks. Middleware is a dumb
+                # pipe — actual side-effects live in UserManager so the
+                # fastapi-users login flows (JWT, Google OAuth) and this
+                # proxy-auth path stay behaviourally identical.
+                #
+                # Per-hook side-effects (so a future maintainer doesn't
+                # have to grep UserManager to map them):
+                #   on_after_register  → default SearchSpace, RBAC roles,
+                #                        owner membership, system prompts,
+                #                        SMB auto-join, first-time LiteLLM
+                #                        provisioning
+                #   on_after_login     → throttled last_login update,
+                #                        idempotent LiteLLM provisioning
+                #                        (retries any registration-time
+                #                        transient failure)
+                #
+                # Deferred import: app.users transitively imports from
+                # this module's import chain via litellm_provisioning →
+                # app.db → ProxyAuthMiddleware references. Module-level
+                # import here creates a cycle at startup.
+                from app.users import UserManager
 
                 if created:
-                    # Trigger on_after_register so the default SearchSpace,
-                    # RBAC roles and system prompts are created — same as
-                    # Google OAuth and email/password signup.
-                    # Use a fresh session so UserManager always has a clean connection.
-                    # Re-fetch user in reg_session to avoid DetachedInstanceError —
-                    # the user object from the outer session (or a rolled-back session
-                    # after an IntegrityError race) must not be used across sessions.
+                    # on_after_register opens its own session internally
+                    # (it inserts default SearchSpace, RBAC roles,
+                    # prompts). Pass a fresh session and re-fetch the
+                    # user inside it to avoid DetachedInstanceError —
+                    # the outer `user` may have been rolled back by an
+                    # IntegrityError race.
                     try:
-                        from app.users import UserManager
-
                         async with async_session_maker() as reg_session:
                             reg_result = await reg_session.execute(
                                 select(User).where(User.id == user.id)
                             )
                             reg_user = reg_result.unique().scalar_one_or_none()
                             if reg_user is None:
-                                raise RuntimeError(
-                                    f"ProxyAuth: user {user.id} vanished before on_after_register"
+                                # User row disappeared between the outer
+                                # INSERT+commit and this re-SELECT. Only
+                                # plausible cause: an operator hard-deleted
+                                # the row between the two statements. Log
+                                # and skip on_after_register — there is
+                                # nothing useful to do without the row.
+                                # No exception raised: the surrounding
+                                # ``except Exception`` would catch it
+                                # without adding diagnostic value over a
+                                # direct log line.
+                                logger.error(
+                                    "ProxyAuth: user %s vanished before "
+                                    "on_after_register could run — default "
+                                    "search space will not be created",
+                                    user.id,
                                 )
-
-                            user_db = SQLAlchemyUserDatabase(reg_session, User)
-                            user_manager = UserManager(user_db)
-                            await user_manager.on_after_register(
-                                reg_user, request=request
-                            )
+                            else:
+                                reg_db = SQLAlchemyUserDatabase(reg_session, User)
+                                reg_manager = UserManager(reg_db)
+                                await reg_manager.on_after_register(
+                                    reg_user, request=request
+                                )
                     except Exception:
                         logger.exception(
                             "ProxyAuth: on_after_register failed for %s — "
                             "user created but default search space may be missing",
                             email,
                         )
+
+                # on_after_login owns the throttled last_login update AND
+                # the first-login LiteLLM provisioning hook (race-tolerant
+                # via SELECT ... FOR UPDATE inside the service). Fire on
+                # every request — both side-effects guard themselves so
+                # the steady-state cost is two attribute reads + return.
+                try:
+                    login_db = SQLAlchemyUserDatabase(session, User)
+                    login_manager = UserManager(login_db)
+                    await login_manager.on_after_login(user, request=request)
+                except Exception:
+                    logger.exception("ProxyAuth: on_after_login failed for %s", email)
 
                 return user
 

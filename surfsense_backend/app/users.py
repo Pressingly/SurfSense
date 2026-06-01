@@ -27,10 +27,35 @@ from app.db import (
     get_user_db,
 )
 from app.prompts.system_defaults import SYSTEM_PROMPT_DEFAULTS
+from app.services.litellm_provisioning import (
+    ensure_personal_litellm_keys,
+    ensure_personal_litellm_keys_for_user,
+    read_mpass_access_token,
+)
 from app.services.smb_auto_join import auto_join_smb_search_space
 from app.utils.refresh_tokens import create_refresh_token
 
 logger = logging.getLogger(__name__)
+
+# `on_after_login` is invoked on every authenticated SSO request by
+# ProxyAuthMiddleware (proxy auth has no server-side session to amortize
+# the cost across, unlike Django sessions or JWT-only flows). Without a
+# throttle, last_login would issue one UPDATE per API call. The window
+# is small enough to keep the metric usefully fresh, large enough to
+# disappear from the request profile.
+_LAST_LOGIN_THROTTLE_SECONDS = 300
+
+
+def _session_from_user_db(user_db: SQLAlchemyUserDatabase):
+    """Pull the underlying AsyncSession from fastapi-users' user_db wrapper.
+
+    ``SQLAlchemyUserDatabase.session`` is not part of fastapi-users'
+    publicly documented API surface — it is the attribute name fastapi-
+    users currently uses to expose the session it was constructed with.
+    Isolated here so a future fastapi-users upgrade only requires editing
+    one site. See review item P6 #42.
+    """
+    return user_db.session
 
 
 class BearerResponse(BaseModel):
@@ -134,16 +159,113 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
         request: Request | None = None,
         response: Response | None = None,
     ) -> None:
+        """Update last_login (throttled) + auto-provision personal LiteLLM keys.
+
+        Fired on every successful login event:
+        - fastapi-users JWT login (``/auth/jwt/login``) — once per credential
+          exchange.
+        - Google OAuth callback — once per OAuth round trip.
+        - ProxyAuthMiddleware — on every authenticated SSO request.
+
+        Both side-effects are best-effort: a failure here must never
+        propagate, otherwise login would break for bookkeeping reasons.
+
+        The hook uses ``self.user_db.session`` (the request-scoped session
+        wired into the user db) so callers don't pay per-request session
+        construction cost.
+
+        Transaction ownership
+        ---------------------
+        The provisioning service flushes only (writes wrapped in a
+        SAVEPOINT for race-loss isolation, see service module docstring).
+        This hook commits the session after the wrapper returns so the
+        SAVEPOINT-released writes become durable. Empty commits (when the
+        wrapper short-circuits on the marker fast path) are cheap; the
+        wrapper guarantees no rollback of caller state on its own. See
+        review item P6 #56 — the proper long-term fix is a
+        ``UserLifecycleService`` that owns transaction lifecycle
+        end-to-end so this hook doesn't need to know about commits.
+
+        Inactive accounts
+        -----------------
+        ``last_login`` is updated regardless of ``is_active`` — a deactivated
+        account that still presents valid credentials is useful forensic
+        signal ("when did this suspended account last try to access?").
+        LiteLLM provisioning is skipped for inactive accounts: a
+        deactivated user must not consume Askii credit or accrue config
+        rows. fastapi-users' built-in flows (JWT, OAuth) pre-filter
+        inactive users before firing this hook, but ProxyAuthMiddleware
+        fires it manually for every authenticated request — without this
+        guard, every request from a deactivated SSO user would attempt
+        provisioning.
+        """
+        await self._update_last_login_throttled(user)
+        if not user.is_active:
+            return
+        if request is not None:
+            session = _session_from_user_db(self.user_db)
+            await ensure_personal_litellm_keys_for_user(
+                session=session,
+                user=user,
+                access_token=read_mpass_access_token(request),
+                cfg=config,
+            )
+            # Commit any pending writes from the provisioning service
+            # (it flushes only). Safe to commit unconditionally: on the
+            # marker fast path the session has no pending writes; on the
+            # SAVEPOINT-released path the writes are the inserts + marker
+            # UPDATE. On race-loss / failure the SAVEPOINT already rolled
+            # back, so commit is a no-op for provisioning.
+            try:
+                await session.commit()
+            except Exception:
+                logger.exception(
+                    "on_after_login: post-provisioning commit failed for user %s",
+                    user.id,
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception(
+                        "on_after_login: rollback after failed commit also failed for user %s",
+                        user.id,
+                    )
+
+    async def _update_last_login_throttled(self, user: User) -> None:
+        """Update ``user.last_login`` at most once per throttle window.
+
+        Cheap math first (reads attribute on the in-memory user object) so
+        the steady-state cost is one comparison and an early return — no
+        SQL, no transaction.
+        """
+        now = datetime.now(UTC)
+
+        # Snapshot the ORM attributes once, up front. A detached/expired user
+        # makes even a plain attribute read raise (e.g. MissingGreenlet); capture
+        # them under a guard so the throttle math and the failure logger below
+        # never re-touch the ORM object on the unhappy path.
+        try:
+            user_id = user.id
+            last_login = user.last_login
+        except Exception as e:
+            logger.warning(f"Failed to read user for last_login update: {e}")
+            return
+
+        if (
+            last_login is not None
+            and (now - last_login).total_seconds() <= _LAST_LOGIN_THROTTLE_SECONDS
+        ):
+            return
+
         try:
             async with async_session_maker() as session:
                 await session.execute(
-                    update(User)
-                    .where(User.id == user.id)
-                    .values(last_login=datetime.now(UTC))
+                    update(User).where(User.id == user_id).values(last_login=now)
                 )
                 await session.commit()
+                user.last_login = now  # mirror onto caller's object
         except Exception as e:
-            logger.warning(f"Failed to update last_login for user {user.id}: {e}")
+            logger.warning(f"Failed to update last_login for user {user_id}: {e}")
 
     async def on_after_register(self, user: User, request: Request | None = None):
         """
@@ -207,6 +329,46 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
                 logger.info(
                     f"Created default search space (ID: {default_search_space.id}) for user {user.id}"
                 )
+
+                # Best-effort: auto-provision the personal LiteLLM key + 4
+                # config rows (agent / doc-summary / image / vision). Gated
+                # inside the service on AUTH_TYPE=SSO +
+                # AUTO_PROVISION_LITELLM_KEY=true; one-shot per user via
+                # `user.litellm_auto_provisioned_at`. A failure here must
+                # NOT abort registration — the service's SAVEPOINT rolls
+                # back provisioning writes only; the on_after_login retry
+                # path will try again on the user's next request.
+                # Defense-in-depth try/except (redundant safety net —
+                # `logger.warning` rather than `logger.exception` so an
+                # alert here flags a contract regression in the service,
+                # not a normal-path failure). `request` is Optional in
+                # fastapi-users; the service needs it to read the mPass
+                # access-token header.
+                #
+                # The service flushes only (see its module docstring on
+                # transaction ownership) — we own the commit for our own
+                # provisioning writes. Registration is already durable
+                # from the commit above, matching the upstream contract.
+                if request is not None:
+                    try:
+                        await ensure_personal_litellm_keys(
+                            session=session,
+                            user=user,
+                            search_space=default_search_space,
+                            access_token=read_mpass_access_token(request),
+                            cfg=config,
+                        )
+                        await session.commit()
+                    except Exception as e:
+                        logger.warning(
+                            "Auto-provisioning LiteLLM keys raised unexpectedly "
+                            "for user %s — service's best-effort contract is "
+                            "supposed to prevent this (%s: %s); on_after_login "
+                            "retry path will run on next request",
+                            user.id,
+                            type(e).__name__,
+                            e,
+                        )
         except Exception as e:
             logger.error(
                 f"Failed to create default search space for user {user.id}: {e}"
