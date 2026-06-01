@@ -223,6 +223,13 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
                     "on_after_login: post-provisioning commit failed for user %s",
                     user.id,
                 )
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception(
+                        "on_after_login: rollback after failed commit also failed for user %s",
+                        user.id,
+                    )
 
     async def _update_last_login_throttled(self, user: User) -> None:
         """Update ``user.last_login`` at most once per throttle window.
