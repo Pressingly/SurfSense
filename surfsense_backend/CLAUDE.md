@@ -1,7 +1,7 @@
 # SurfSense Backend — Moneta Fork
 
 This file documents Moneta-fork-specific conventions for `surfsense_backend/`.
-Repo-wide guidance lives in `/Volumes/data/github/pressingly/CLAUDE.md`;
+Repo-wide guidance lives in the repository root documentation (e.g., `README.md` / `CONTRIBUTING.md`).
 SurfSense-upstream conventions in `surfsense/.cursor/`.
 
 ## Fork migrations
