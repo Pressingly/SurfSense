@@ -74,4 +74,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_column("user", "litellm_auto_provisioned_at")
+    conn = op.get_bind()
+    existing_columns = [col["name"] for col in sa.inspect(conn).get_columns("user")]
+
+    if "litellm_auto_provisioned_at" in existing_columns:
+        op.drop_column("user", "litellm_auto_provisioned_at")
