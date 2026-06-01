@@ -239,21 +239,33 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
         SQL, no transaction.
         """
         now = datetime.now(UTC)
+
+        # Snapshot the ORM attributes once, up front. A detached/expired user
+        # makes even a plain attribute read raise (e.g. MissingGreenlet); capture
+        # them under a guard so the throttle math and the failure logger below
+        # never re-touch the ORM object on the unhappy path.
+        try:
+            user_id = user.id
+            last_login = user.last_login
+        except Exception as e:
+            logger.warning(f"Failed to read user for last_login update: {e}")
+            return
+
         if (
-            user.last_login is not None
-            and (now - user.last_login).total_seconds() <= _LAST_LOGIN_THROTTLE_SECONDS
+            last_login is not None
+            and (now - last_login).total_seconds() <= _LAST_LOGIN_THROTTLE_SECONDS
         ):
             return
 
         try:
             async with async_session_maker() as session:
                 await session.execute(
-                    update(User).where(User.id == user.id).values(last_login=now)
+                    update(User).where(User.id == user_id).values(last_login=now)
                 )
                 await session.commit()
                 user.last_login = now  # mirror onto caller's object
         except Exception as e:
-            logger.warning(f"Failed to update last_login for user {user.id}: {e}")
+            logger.warning(f"Failed to update last_login for user {user_id}: {e}")
 
     async def on_after_register(self, user: User, request: Request | None = None):
         """
