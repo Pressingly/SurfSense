@@ -1,8 +1,10 @@
 import {
+	ActionBarMorePrimitive,
 	ActionBarPrimitive,
 	AuiIf,
 	ErrorPrimitive,
 	MessagePrimitive,
+	type ToolCallMessagePartComponent,
 	useAui,
 	useAuiState,
 } from "@assistant-ui/react";
@@ -14,24 +16,36 @@ import {
 	DownloadIcon,
 	ExternalLink,
 	Globe,
-	MessageSquare,
+	MessageCircleReply,
+	MoreHorizontalIcon,
 	RefreshCwIcon,
 } from "lucide-react";
 import dynamic from "next/dynamic";
 import type { FC } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { commentsEnabledAtom, targetCommentIdAtom } from "@/atoms/chat/current-thread.atom";
+import {
+	globalNewLLMConfigsAtom,
+	newLLMConfigsAtom,
+} from "@/atoms/new-llm-config/new-llm-config-query.atoms";
 import { activeSearchSpaceIdAtom } from "@/atoms/search-spaces/search-space-query.atoms";
 import {
 	CitationMetadataProvider,
 	useAllCitationMetadata,
 } from "@/components/assistant-ui/citation-metadata-context";
 import { MarkdownText } from "@/components/assistant-ui/markdown-text";
-import { ToolFallback } from "@/components/assistant-ui/tool-fallback";
+import { ReasoningMessagePart } from "@/components/assistant-ui/reasoning-message-part";
+import { RevertTurnButton } from "@/components/assistant-ui/revert-turn-button";
+import { useTokenUsage } from "@/components/assistant-ui/token-usage-context";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import { CommentPanelContainer } from "@/components/chat-comments/comment-panel-container/comment-panel-container";
 import { CommentSheet } from "@/components/chat-comments/comment-sheet/comment-sheet";
 import type { SerializableCitation } from "@/components/tool-ui/citation";
+import {
+	openSafeNavigationHref,
+	resolveSafeNavigationHref,
+} from "@/components/tool-ui/shared/media";
+import { Button } from "@/components/ui/button";
 import {
 	Drawer,
 	DrawerContent,
@@ -39,9 +53,12 @@ import {
 	DrawerHeader,
 	DrawerTitle,
 } from "@/components/ui/drawer";
+import { DropdownMenuLabel } from "@/components/ui/dropdown-menu";
 import { useComments } from "@/hooks/use-comments";
 import { useMediaQuery } from "@/hooks/use-media-query";
 import { useElectronAPI } from "@/hooks/use-platform";
+import { getProviderIcon } from "@/lib/provider-icons";
+import { tryGetHostname } from "@/lib/url";
 import { cn } from "@/lib/utils";
 
 // Captured once at module load — survives client-side navigations that strip the query param.
@@ -54,6 +71,13 @@ const GenerateReportToolUI = dynamic(
 	() =>
 		import("@/components/tool-ui/generate-report").then((m) => ({
 			default: m.GenerateReportToolUI,
+		})),
+	{ ssr: false }
+);
+const GenerateResumeToolUI = dynamic(
+	() =>
+		import("@/components/tool-ui/generate-resume").then((m) => ({
+			default: m.GenerateResumeToolUI,
 		})),
 	{ ssr: false }
 );
@@ -76,164 +100,12 @@ const GenerateImageToolUI = dynamic(
 		import("@/components/tool-ui/generate-image").then((m) => ({ default: m.GenerateImageToolUI })),
 	{ ssr: false }
 );
-const SaveMemoryToolUI = dynamic(
-	() => import("@/components/tool-ui/user-memory").then((m) => ({ default: m.SaveMemoryToolUI })),
-	{ ssr: false }
-);
-const RecallMemoryToolUI = dynamic(
-	() => import("@/components/tool-ui/user-memory").then((m) => ({ default: m.RecallMemoryToolUI })),
-	{ ssr: false }
-);
-const SandboxExecuteToolUI = dynamic(
-	() =>
-		import("@/components/tool-ui/sandbox-execute").then((m) => ({
-			default: m.SandboxExecuteToolUI,
-		})),
-	{ ssr: false }
-);
-const CreateNotionPageToolUI = dynamic(
-	() => import("@/components/tool-ui/notion").then((m) => ({ default: m.CreateNotionPageToolUI })),
-	{ ssr: false }
-);
-const UpdateNotionPageToolUI = dynamic(
-	() => import("@/components/tool-ui/notion").then((m) => ({ default: m.UpdateNotionPageToolUI })),
-	{ ssr: false }
-);
-const DeleteNotionPageToolUI = dynamic(
-	() => import("@/components/tool-ui/notion").then((m) => ({ default: m.DeleteNotionPageToolUI })),
-	{ ssr: false }
-);
-const CreateLinearIssueToolUI = dynamic(
-	() => import("@/components/tool-ui/linear").then((m) => ({ default: m.CreateLinearIssueToolUI })),
-	{ ssr: false }
-);
-const UpdateLinearIssueToolUI = dynamic(
-	() => import("@/components/tool-ui/linear").then((m) => ({ default: m.UpdateLinearIssueToolUI })),
-	{ ssr: false }
-);
-const DeleteLinearIssueToolUI = dynamic(
-	() => import("@/components/tool-ui/linear").then((m) => ({ default: m.DeleteLinearIssueToolUI })),
-	{ ssr: false }
-);
-const CreateGoogleDriveFileToolUI = dynamic(
-	() =>
-		import("@/components/tool-ui/google-drive").then((m) => ({
-			default: m.CreateGoogleDriveFileToolUI,
-		})),
-	{ ssr: false }
-);
-const DeleteGoogleDriveFileToolUI = dynamic(
-	() =>
-		import("@/components/tool-ui/google-drive").then((m) => ({
-			default: m.DeleteGoogleDriveFileToolUI,
-		})),
-	{ ssr: false }
-);
-const CreateOneDriveFileToolUI = dynamic(
-	() =>
-		import("@/components/tool-ui/onedrive").then((m) => ({ default: m.CreateOneDriveFileToolUI })),
-	{ ssr: false }
-);
-const DeleteOneDriveFileToolUI = dynamic(
-	() =>
-		import("@/components/tool-ui/onedrive").then((m) => ({ default: m.DeleteOneDriveFileToolUI })),
-	{ ssr: false }
-);
-const CreateDropboxFileToolUI = dynamic(
-	() =>
-		import("@/components/tool-ui/dropbox").then((m) => ({ default: m.CreateDropboxFileToolUI })),
-	{ ssr: false }
-);
-const DeleteDropboxFileToolUI = dynamic(
-	() =>
-		import("@/components/tool-ui/dropbox").then((m) => ({ default: m.DeleteDropboxFileToolUI })),
-	{ ssr: false }
-);
-const CreateCalendarEventToolUI = dynamic(
-	() =>
-		import("@/components/tool-ui/google-calendar").then((m) => ({
-			default: m.CreateCalendarEventToolUI,
-		})),
-	{ ssr: false }
-);
-const UpdateCalendarEventToolUI = dynamic(
-	() =>
-		import("@/components/tool-ui/google-calendar").then((m) => ({
-			default: m.UpdateCalendarEventToolUI,
-		})),
-	{ ssr: false }
-);
-const DeleteCalendarEventToolUI = dynamic(
-	() =>
-		import("@/components/tool-ui/google-calendar").then((m) => ({
-			default: m.DeleteCalendarEventToolUI,
-		})),
-	{ ssr: false }
-);
-const CreateGmailDraftToolUI = dynamic(
-	() => import("@/components/tool-ui/gmail").then((m) => ({ default: m.CreateGmailDraftToolUI })),
-	{ ssr: false }
-);
-const UpdateGmailDraftToolUI = dynamic(
-	() => import("@/components/tool-ui/gmail").then((m) => ({ default: m.UpdateGmailDraftToolUI })),
-	{ ssr: false }
-);
-const SendGmailEmailToolUI = dynamic(
-	() => import("@/components/tool-ui/gmail").then((m) => ({ default: m.SendGmailEmailToolUI })),
-	{ ssr: false }
-);
-const TrashGmailEmailToolUI = dynamic(
-	() => import("@/components/tool-ui/gmail").then((m) => ({ default: m.TrashGmailEmailToolUI })),
-	{ ssr: false }
-);
-const CreateJiraIssueToolUI = dynamic(
-	() => import("@/components/tool-ui/jira").then((m) => ({ default: m.CreateJiraIssueToolUI })),
-	{ ssr: false }
-);
-const UpdateJiraIssueToolUI = dynamic(
-	() => import("@/components/tool-ui/jira").then((m) => ({ default: m.UpdateJiraIssueToolUI })),
-	{ ssr: false }
-);
-const DeleteJiraIssueToolUI = dynamic(
-	() => import("@/components/tool-ui/jira").then((m) => ({ default: m.DeleteJiraIssueToolUI })),
-	{ ssr: false }
-);
-const CreateConfluencePageToolUI = dynamic(
-	() =>
-		import("@/components/tool-ui/confluence").then((m) => ({
-			default: m.CreateConfluencePageToolUI,
-		})),
-	{ ssr: false }
-);
-const UpdateConfluencePageToolUI = dynamic(
-	() =>
-		import("@/components/tool-ui/confluence").then((m) => ({
-			default: m.UpdateConfluencePageToolUI,
-		})),
-	{ ssr: false }
-);
-const DeleteConfluencePageToolUI = dynamic(
-	() =>
-		import("@/components/tool-ui/confluence").then((m) => ({
-			default: m.DeleteConfluencePageToolUI,
-		})),
-	{ ssr: false }
-);
-
-function extractDomain(url: string): string | undefined {
-	try {
-		return new URL(url).hostname.replace(/^www\./, "");
-	} catch {
-		return undefined;
-	}
-}
-
 function useCitationsFromMetadata(): SerializableCitation[] {
 	const allCitations = useAllCitationMetadata();
 	return useMemo(() => {
 		const result: SerializableCitation[] = [];
 		for (const [url, meta] of allCitations) {
-			const domain = extractDomain(url);
+			const domain = tryGetHostname(url);
 			result.push({
 				id: `url-cite-${url}`,
 				href: url,
@@ -265,14 +137,15 @@ const MobileCitationDrawer: FC = () => {
 
 	return (
 		<>
-			<button
+			<Button
 				type="button"
+				variant="ghost"
 				onClick={() => setOpen(true)}
 				className={cn(
-					"isolate inline-flex cursor-pointer items-center gap-2 rounded-lg px-3 py-2",
+					"isolate h-auto cursor-pointer gap-2 rounded-lg px-3 py-2",
 					"bg-muted/40 outline-none",
 					"transition-colors duration-150",
-					"hover:bg-muted/70",
+					"hover:bg-accent hover:text-accent-foreground",
 					"focus-visible:ring-ring focus-visible:ring-2"
 				)}
 			>
@@ -315,7 +188,7 @@ const MobileCitationDrawer: FC = () => {
 				<span className="text-muted-foreground text-sm tabular-nums">
 					{citations.length} source{citations.length !== 1 && "s"}
 				</span>
-			</button>
+			</Button>
 
 			<Drawer open={open} onOpenChange={setOpen}>
 				<DrawerContent className="max-h-[85vh] flex flex-col">
@@ -325,11 +198,12 @@ const MobileCitationDrawer: FC = () => {
 					</DrawerHeader>
 					<div className="overflow-y-auto flex-1 min-h-0 px-1 pb-6">
 						{citations.map((citation) => (
-							<button
+							<Button
 								key={citation.id}
 								type="button"
+								variant="ghost"
 								onClick={() => handleNavigate(citation)}
-								className="group flex w-full items-center gap-2.5 rounded-md px-3 py-2.5 text-left transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none"
+								className="group h-auto w-full justify-start gap-2.5 px-3 py-2.5 text-left hover:bg-accent hover:text-accent-foreground focus-visible:bg-muted"
 							>
 								{citation.favicon ? (
 									// biome-ignore lint/performance/noImgElement: external favicon from arbitrary domain
@@ -351,7 +225,7 @@ const MobileCitationDrawer: FC = () => {
 									<p className="text-muted-foreground truncate text-xs">{citation.domain}</p>
 								</div>
 								<ExternalLink className="text-muted-foreground size-3.5 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
-							</button>
+							</Button>
 						))}
 					</div>
 				</DrawerContent>
@@ -370,6 +244,141 @@ export const MessageError: FC = () => {
 	);
 };
 
+function formatMessageDate(date: Date): string {
+	return date.toLocaleDateString(undefined, {
+		month: "short",
+		day: "numeric",
+		hour: "numeric",
+		minute: "2-digit",
+		hour12: true,
+	});
+}
+
+/**
+ * Format provider USD cost (in micro-USD) for inline display next to a
+ * token count. Falls back to ``"<$0.001"`` for sub-tenth-of-a-cent
+ * costs so a real-but-tiny figure doesn't render as ``$0.000``.
+ */
+function formatTurnCost(micros: number): string {
+	const dollars = micros / 1_000_000;
+	if (dollars >= 1) return `$${dollars.toFixed(2)}`;
+	if (dollars >= 0.01) return `$${dollars.toFixed(3)}`;
+	if (dollars > 0) return "<$0.001";
+	return "$0";
+}
+
+const MessageInfoDropdown: FC<{ chatTurnId: string | null | undefined }> = ({ chatTurnId }) => {
+	const messageId = useAuiState(({ message }) => message?.id);
+	const createdAt = useAuiState(({ message }) => message?.createdAt);
+	const usage = useTokenUsage(messageId);
+
+	const { data: localConfigs } = useAtomValue(newLLMConfigsAtom);
+	const { data: globalConfigs } = useAtomValue(globalNewLLMConfigsAtom);
+
+	const configByModel = useMemo(() => {
+		const map = new Map<string, { name: string; provider: string }>();
+		for (const c of [...(globalConfigs ?? []), ...(localConfigs ?? [])]) {
+			map.set(c.model_name, { name: c.name, provider: c.provider });
+		}
+		return map;
+	}, [localConfigs, globalConfigs]);
+
+	const resolveModel = (modelKey: string) => {
+		const parts = modelKey.split("/");
+		const bare = parts[parts.length - 1] ?? modelKey;
+		const config = configByModel.get(modelKey) ?? configByModel.get(bare);
+		return config
+			? { name: config.name, icon: getProviderIcon(config.provider, { className: "size-3.5" }) }
+			: { name: modelKey, icon: null };
+	};
+
+	const modelBreakdown = usage ? (usage.usage ?? usage.model_breakdown) : undefined;
+	const models = modelBreakdown ? Object.entries(modelBreakdown) : [];
+	const hasUsage = usage && usage.total_tokens > 0;
+
+	return (
+		<ActionBarMorePrimitive.Root>
+			<ActionBarMorePrimitive.Trigger asChild>
+				<Button variant="ghost" size="icon" className="aui-button-icon size-6 p-1">
+					<MoreHorizontalIcon className="size-4" />
+					<span className="sr-only">More</span>
+				</Button>
+			</ActionBarMorePrimitive.Trigger>
+			<ActionBarMorePrimitive.Content
+				align="start"
+				className="bg-popover text-popover-foreground z-50 max-h-(--radix-dropdown-menu-content-available-height) min-w-[180px] origin-(--radix-dropdown-menu-content-transform-origin) overflow-x-hidden overflow-y-auto rounded-md p-1 shadow-md data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2"
+			>
+				{createdAt && (
+					<DropdownMenuLabel className="text-xs text-muted-foreground font-normal select-none">
+						{formatMessageDate(createdAt)}
+					</DropdownMenuLabel>
+				)}
+				{hasUsage && (
+					<>
+						<ActionBarMorePrimitive.Separator className="bg-popover-border mx-1 my-1 h-px" />
+						{models.length > 0 ? (
+							models.map(([model, counts]) => {
+								const { name, icon } = resolveModel(model);
+								const costMicros = counts.cost_micros;
+								return (
+									<ActionBarMorePrimitive.Item
+										key={model}
+										className="focus:bg-accent focus:text-accent-foreground relative flex cursor-default flex-col items-start gap-0.5 rounded-sm px-2 py-1.5 text-sm outline-hidden select-none"
+										onSelect={(e) => e.preventDefault()}
+									>
+										<span className="flex items-center gap-1.5 text-xs font-medium">
+											{icon}
+											{name}
+										</span>
+										<span className="text-xs text-muted-foreground">
+											{counts.total_tokens.toLocaleString()} tokens
+											{costMicros && costMicros > 0 ? ` · ${formatTurnCost(costMicros)}` : ""}
+										</span>
+									</ActionBarMorePrimitive.Item>
+								);
+							})
+						) : (
+							<ActionBarMorePrimitive.Item
+								className="focus:bg-accent focus:text-accent-foreground relative flex cursor-default flex-col items-start gap-0.5 rounded-sm px-2 py-1.5 text-sm outline-hidden select-none"
+								onSelect={(e) => e.preventDefault()}
+							>
+								<span className="text-xs text-muted-foreground">
+									{usage.total_tokens.toLocaleString()} tokens
+									{usage.cost_micros && usage.cost_micros > 0
+										? ` · ${formatTurnCost(usage.cost_micros)}`
+										: ""}
+								</span>
+							</ActionBarMorePrimitive.Item>
+						)}
+					</>
+				)}
+				<RevertTurnButton chatTurnId={chatTurnId} variant="menu-item" />
+			</ActionBarMorePrimitive.Content>
+		</ActionBarMorePrimitive.Root>
+	);
+};
+
+/**
+ * Tools rendered in the message BODY — value-add deliverables only.
+ *
+ * Process tools (connector CRUD, sandbox execute, memory updates,
+ * etc.) are NOT here; they render in the timeline via the slice's
+ * tool registry (see ``features/chat-messages/timeline``). The body
+ * opts out of every other tool by registering ``NullBodyTool`` as the
+ * fallback — any tool name not in this map renders nothing in the
+ * body and is picked up by the timeline instead.
+ */
+const BODY_TOOLS = {
+	generate_report: GenerateReportToolUI,
+	generate_resume: GenerateResumeToolUI,
+	generate_podcast: GeneratePodcastToolUI,
+	generate_video_presentation: GenerateVideoPresentationToolUI,
+	display_image: GenerateImageToolUI,
+	generate_image: GenerateImageToolUI,
+} as const;
+
+const NullBodyTool: ToolCallMessagePartComponent = () => null;
+
 const AssistantMessageInner: FC = () => {
 	const isMobile = !useMediaQuery("(min-width: 768px)");
 
@@ -379,47 +388,10 @@ const AssistantMessageInner: FC = () => {
 				<MessagePrimitive.Parts
 					components={{
 						Text: MarkdownText,
+						Reasoning: ReasoningMessagePart,
 						tools: {
-							by_name: {
-								generate_report: GenerateReportToolUI,
-								generate_podcast: GeneratePodcastToolUI,
-								generate_video_presentation: GenerateVideoPresentationToolUI,
-								display_image: GenerateImageToolUI,
-								generate_image: GenerateImageToolUI,
-								save_memory: SaveMemoryToolUI,
-								recall_memory: RecallMemoryToolUI,
-								execute: SandboxExecuteToolUI,
-								create_notion_page: CreateNotionPageToolUI,
-								update_notion_page: UpdateNotionPageToolUI,
-								delete_notion_page: DeleteNotionPageToolUI,
-								create_linear_issue: CreateLinearIssueToolUI,
-								update_linear_issue: UpdateLinearIssueToolUI,
-								delete_linear_issue: DeleteLinearIssueToolUI,
-								create_google_drive_file: CreateGoogleDriveFileToolUI,
-								delete_google_drive_file: DeleteGoogleDriveFileToolUI,
-								create_onedrive_file: CreateOneDriveFileToolUI,
-								delete_onedrive_file: DeleteOneDriveFileToolUI,
-								create_dropbox_file: CreateDropboxFileToolUI,
-								delete_dropbox_file: DeleteDropboxFileToolUI,
-								create_calendar_event: CreateCalendarEventToolUI,
-								update_calendar_event: UpdateCalendarEventToolUI,
-								delete_calendar_event: DeleteCalendarEventToolUI,
-								create_gmail_draft: CreateGmailDraftToolUI,
-								update_gmail_draft: UpdateGmailDraftToolUI,
-								send_gmail_email: SendGmailEmailToolUI,
-								trash_gmail_email: TrashGmailEmailToolUI,
-								create_jira_issue: CreateJiraIssueToolUI,
-								update_jira_issue: UpdateJiraIssueToolUI,
-								delete_jira_issue: DeleteJiraIssueToolUI,
-								create_confluence_page: CreateConfluencePageToolUI,
-								update_confluence_page: UpdateConfluencePageToolUI,
-								delete_confluence_page: DeleteConfluencePageToolUI,
-								web_search: () => null,
-								link_preview: () => null,
-								multi_link_preview: () => null,
-								scrape_webpage: () => null,
-							},
-							Fallback: ToolFallback,
+							by_name: BODY_TOOLS,
+							Fallback: NullBodyTool,
 						},
 					}}
 				/>
@@ -432,8 +404,10 @@ const AssistantMessageInner: FC = () => {
 				</div>
 			)}
 
-			<div className="aui-assistant-message-footer mt-1 mb-5 ml-2 flex">
-				<AssistantActionBar />
+			<div className="aui-assistant-message-footer mt-3 mb-5 ml-2 h-6">
+				<div className="h-full opacity-100 transition-opacity">
+					<AssistantActionBar />
+				</div>
 			</div>
 		</CitationMetadataProvider>
 	);
@@ -526,35 +500,42 @@ export const AssistantMessage: FC = () => {
 			className="aui-assistant-message-root group fade-in slide-in-from-bottom-1 relative mx-auto w-full max-w-(--thread-max-width) animate-in py-3 duration-150"
 			data-role="assistant"
 		>
-			{/* Comment trigger — right-aligned, just below user query on all screen sizes */}
-			{showCommentTrigger && (
-				<div className="mr-2 mb-1 flex justify-end">
-					<button
-						ref={isDesktop ? commentTriggerRef : undefined}
-						type="button"
-						onClick={
-							isDesktop ? () => setIsInlineOpen((prev) => !prev) : () => setIsSheetOpen(true)
-						}
-						className={cn(
-							"flex items-center gap-1.5 rounded-full px-3 py-1 text-sm transition-colors",
-							isDesktop && isInlineOpen
-								? "bg-primary/10 text-primary"
-								: hasComments
-									? "text-primary hover:bg-primary/10"
-									: "text-muted-foreground hover:text-foreground hover:bg-muted"
-						)}
-					>
-						<MessageSquare className={cn("size-3.5", hasComments && "fill-current")} />
-						{hasComments ? (
-							<span>
-								{commentCount} {commentCount === 1 ? "comment" : "comments"}
-							</span>
-						) : (
-							<span>Add comment</span>
-						)}
-					</button>
-				</div>
-			)}
+			{/* Fixed trigger slot prevents any vertical reflow when visibility changes */}
+			<div className="mr-2 mb-1 flex h-7 justify-end">
+				<Button
+					ref={isDesktop ? commentTriggerRef : undefined}
+					type="button"
+					variant="ghost"
+					onClick={
+						showCommentTrigger
+							? isDesktop
+								? () => setIsInlineOpen((prev) => !prev)
+								: () => setIsSheetOpen(true)
+							: undefined
+					}
+					aria-hidden={!showCommentTrigger}
+					tabIndex={showCommentTrigger ? 0 : -1}
+					className={cn(
+						"h-auto gap-1.5 rounded-full px-3 py-1 text-sm transition-colors",
+						"opacity-0 pointer-events-none",
+						showCommentTrigger && "opacity-100 pointer-events-auto",
+						isDesktop && isInlineOpen
+							? "bg-primary/10 text-primary"
+							: hasComments
+								? "text-primary hover:bg-primary/10"
+								: "text-muted-foreground hover:text-accent-foreground hover:bg-accent hover:text-accent-foreground"
+					)}
+				>
+					<MessageCircleReply className={cn("size-3.5", hasComments && "fill-current")} />
+					{hasComments ? (
+						<span>
+							{commentCount} {commentCount === 1 ? "comment" : "comments"}
+						</span>
+					) : (
+						<span>Add comment</span>
+					)}
+				</Button>
+			</div>
 
 			{/* Desktop floating comment panel — overlays on top of chat content */}
 			{showCommentTrigger && isDesktop && isInlineOpen && dbMessageId && (
@@ -586,6 +567,13 @@ const AssistantActionBar: FC = () => {
 	const isLast = useAuiState((s) => s.message.isLast);
 	const aui = useAui();
 	const api = useElectronAPI();
+	// Surface the persisted ``chat_turn_id`` so the per-turn revert
+	// affordance can scope to just this message's actions. Streamed
+	// turns get their id once the assistant message is hydrated/finalised.
+	const chatTurnId = useAuiState(({ message }) => {
+		const meta = message?.metadata as { custom?: { chatTurnId?: string | null } } | undefined;
+		return meta?.custom?.chatTurnId ?? null;
+	});
 
 	const isQuickAssist = !!api?.replaceText && IS_QUICK_ASSIST_WINDOW;
 
@@ -597,7 +585,7 @@ const AssistantActionBar: FC = () => {
 			className="aui-assistant-action-bar-root -ml-1 col-start-3 row-start-2 flex gap-1 text-muted-foreground md:data-floating:absolute md:data-floating:rounded-md md:data-floating:p-1 [&>button]:opacity-100 md:[&>button]:opacity-[var(--aui-button-opacity,1)]"
 		>
 			<ActionBarPrimitive.Copy asChild>
-				<TooltipIconButton tooltip="Copy to clipboard">
+				<TooltipIconButton tooltip="Copy">
 					<AuiIf condition={({ message }) => message.isCopied}>
 						<CheckIcon />
 					</AuiIf>
@@ -629,6 +617,7 @@ const AssistantActionBar: FC = () => {
 					<ClipboardPaste />
 				</TooltipIconButton>
 			)}
+			<MessageInfoDropdown chatTurnId={chatTurnId} />
 		</ActionBarPrimitive.Root>
 	);
 };

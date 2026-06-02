@@ -1,6 +1,5 @@
 "use client";
 
-import { motion } from "motion/react";
 import Link from "next/link";
 import { AUTH_TYPE, isSSOAuth } from "@/lib/env-config";
 import { trackLoginAttempt } from "@/lib/posthog/events";
@@ -76,19 +75,17 @@ export const SignInButton = ({ variant = "desktop" }: SignInButtonProps) => {
 
 	if (isProxyLogin) {
 		return (
-			<motion.button
+			<button
 				type="button"
 				onClick={handleProxyLogin}
-				whileHover={{ scale: 1.02 }}
-				whileTap={{ scale: 0.98 }}
 				className={cn(
-					"flex items-center justify-center gap-2 font-semibold transition-all duration-200",
+					"flex items-center justify-center gap-2 transition-colors duration-200 disabled:cursor-not-allowed disabled:opacity-50",
 					getClassName()
 				)}
 			>
 				{isGoogleAuth && <GoogleLogo className="h-4 w-4" />}
 				<span>Sign In</span>
-			</motion.button>
+			</button>
 		);
 	}
 

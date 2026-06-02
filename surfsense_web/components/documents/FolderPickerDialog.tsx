@@ -1,7 +1,7 @@
 "use client";
 
 import { ChevronDown, ChevronRight, Folder, FolderOpen, Home } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -36,12 +36,16 @@ export function FolderPickerDialog({
 	const [selectedId, setSelectedId] = useState<number | null>(null);
 	const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
 
-	useEffect(() => {
-		if (open) {
-			setSelectedId(null);
-			setExpandedIds(new Set());
-		}
-	}, [open]);
+	const handleOpenChange = useCallback(
+		(next: boolean) => {
+			if (next) {
+				setSelectedId(null);
+				setExpandedIds(new Set());
+			}
+			onOpenChange(next);
+		},
+		[onOpenChange]
+	);
 
 	const foldersByParent = useMemo(() => {
 		const map: Record<string, FolderDisplay[]> = {};
@@ -81,49 +85,54 @@ export function FolderPickerDialog({
 			const FolderIcon = isExpanded ? FolderOpen : Folder;
 
 			return [
-				<button
-					key={f.id}
-					type="button"
-					disabled={isDisabled}
-					className={cn(
-						"flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-sm transition-colors",
-						isSelected && "bg-accent text-accent-foreground",
-						!isSelected && !isDisabled && "hover:bg-accent/50",
-						isDisabled && "cursor-not-allowed opacity-40"
-					)}
-					style={{ paddingLeft: `${depth * 16 + 8}px` }}
-					onClick={() => {
-						if (!isDisabled) setSelectedId(f.id);
-					}}
-				>
-					{hasChildren ? (
-						<button
+				<div key={f.id} className="relative w-full">
+					{hasChildren && (
+						<Button
 							type="button"
-							className="flex h-4 w-4 shrink-0 items-center justify-center"
+							variant="ghost"
+							size="icon"
+							disabled={isDisabled}
+							className="absolute top-1/2 z-10 size-4 -translate-y-1/2 p-0"
+							style={{ left: `${depth * 16 + 8}px` }}
+							aria-label={isExpanded ? `Collapse ${f.name}` : `Expand ${f.name}`}
 							onClick={(e) => {
 								e.stopPropagation();
 								toggleExpand(f.id);
 							}}
 						>
 							{isExpanded ? (
-								<ChevronDown className="h-3.5 w-3.5" />
+								<ChevronDown data-icon="inline-start" />
 							) : (
-								<ChevronRight className="h-3.5 w-3.5" />
+								<ChevronRight data-icon="inline-start" />
 							)}
-						</button>
-					) : (
-						<span className="h-4 w-4 shrink-0" />
+						</Button>
 					)}
-					<FolderIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
-					<span className="truncate">{f.name}</span>
-				</button>,
+					<Button
+						type="button"
+						variant="ghost"
+						disabled={isDisabled}
+						className={cn(
+							"h-auto w-full justify-start gap-1.5 px-2 py-1.5 text-sm font-normal",
+							isSelected && "bg-accent text-accent-foreground",
+							isDisabled && "cursor-not-allowed opacity-40"
+						)}
+						style={{ paddingLeft: `${depth * 16 + 8}px` }}
+						onClick={() => {
+							if (!isDisabled) setSelectedId(f.id);
+						}}
+					>
+						<span className="size-4 shrink-0" />
+						<FolderIcon data-icon="inline-start" className="text-muted-foreground" />
+						<span className="truncate">{f.name}</span>
+					</Button>
+				</div>,
 				...(isExpanded ? renderPickerLevel(f.id, depth + 1) : []),
 			];
 		});
 	}
 
 	return (
-		<Dialog open={open} onOpenChange={onOpenChange}>
+		<Dialog open={open} onOpenChange={handleOpenChange}>
 			<DialogContent className="select-none max-w-[90vw] sm:max-w-sm p-4 sm:p-5 data-[state=open]:animate-none data-[state=closed]:animate-none">
 				<DialogHeader className="space-y-2 pb-2">
 					<div className="flex items-center gap-2 sm:gap-3">
@@ -139,19 +148,19 @@ export function FolderPickerDialog({
 				</DialogHeader>
 
 				<div className="max-h-[300px] overflow-y-auto rounded-md border p-1">
-					<button
+					<Button
 						type="button"
+						variant="ghost"
 						className={cn(
-							"flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-sm transition-colors",
-							selectedId === null && "bg-accent text-accent-foreground",
-							selectedId !== null && "hover:bg-accent/50"
+							"h-auto w-full justify-start gap-1.5 px-2 py-1.5 text-sm font-normal",
+							selectedId === null && "bg-accent text-accent-foreground"
 						)}
 						onClick={() => setSelectedId(null)}
 					>
-						<span className="h-4 w-4 shrink-0" />
-						<Home className="h-4 w-4 shrink-0 text-muted-foreground" />
+						<span className="size-4 shrink-0" />
+						<Home data-icon="inline-start" className="text-muted-foreground" />
 						<span>Root</span>
-					</button>
+					</Button>
 					{renderPickerLevel(null, 1)}
 				</div>
 

@@ -49,6 +49,7 @@ interface VisionConfigDialogProps {
 	isGlobal: boolean;
 	searchSpaceId: number;
 	mode: "create" | "edit" | "view";
+	defaultProvider?: string;
 }
 
 const INITIAL_FORM = {
@@ -68,6 +69,7 @@ export function VisionConfigDialog({
 	isGlobal,
 	searchSpaceId,
 	mode,
+	defaultProvider,
 }: VisionConfigDialogProps) {
 	const [isSubmitting, setIsSubmitting] = useState(false);
 	const [formData, setFormData] = useState(INITIAL_FORM);
@@ -87,11 +89,11 @@ export function VisionConfigDialog({
 					api_version: (config as VisionLLMConfig).api_version || "",
 				});
 			} else if (mode === "create") {
-				setFormData(INITIAL_FORM);
+				setFormData({ ...INITIAL_FORM, provider: defaultProvider ?? "" });
 			}
 			setScrollPos("top");
 		}
-	}, [open, mode, config, isGlobal]);
+	}, [open, mode, config, isGlobal, defaultProvider]);
 
 	const { mutateAsync: createConfig } = useAtomValue(createVisionLLMConfigMutationAtom);
 	const { mutateAsync: updateConfig } = useAtomValue(updateVisionLLMConfigMutationAtom);
@@ -297,7 +299,7 @@ export function VisionConfigDialog({
 								/>
 							</div>
 
-							<Separator />
+							<Separator className="bg-popover-border" />
 
 							<div className="space-y-2">
 								<Label className="text-sm font-medium">Provider *</Label>
@@ -337,10 +339,7 @@ export function VisionConfigDialog({
 											<ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
 										</Button>
 									</PopoverTrigger>
-									<PopoverContent
-										className="w-full p-0 bg-muted dark:border-neutral-700"
-										align="start"
-									>
+									<PopoverContent className="w-full p-0" align="start">
 										<Command shouldFilter={false} className="bg-transparent">
 											<CommandInput
 												placeholder={selectedProvider?.example || "Search model name"}

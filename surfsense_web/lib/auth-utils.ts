@@ -18,6 +18,7 @@ const PUBLIC_ROUTE_PREFIXES = [
 	"/desktop/login",
 	"/docs",
 	"/public",
+	"/free",
 	"/invite",
 	"/contact",
 	"/pricing",
@@ -67,9 +68,9 @@ export function handleUnauthorized(): void {
 	if (isPublicRoute(pathname)) return;
 
 	const currentPath = pathname + window.location.search + window.location.hash;
-	const excludedPaths = ["/auth", "/"];
+	const excludedPaths = ["/auth", "/auth/callback", "/"];
 	if (!excludedPaths.includes(pathname)) {
-		localStorage.setItem(REDIRECT_PATH_KEY, currentPath);
+		setRedirectPath(currentPath);
 	}
 
 	// Redirect through oauth2-proxy /oauth2/sign_in. The dedicated auth subdomain
@@ -77,6 +78,14 @@ export function handleUnauthorized(): void {
 	const oauthProxyUrl = process.env.NEXT_PUBLIC_OAUTH2_PROXY_URL || window.location.origin;
 	const rd = window.location.href;
 	window.location.href = `${oauthProxyUrl}/oauth2/sign_in?rd=${encodeURIComponent(rd)}`;
+}
+
+/**
+ * Stores the path to redirect to after successful authentication.
+ */
+export function setRedirectPath(path: string): void {
+	if (typeof window === "undefined") return;
+	localStorage.setItem(REDIRECT_PATH_KEY, path);
 }
 
 /**
@@ -270,7 +279,7 @@ export function redirectToLogin(): void {
 	// Don't save auth-related paths or home page
 	const excludedPaths = ["/auth", "/", "/login", "/register"];
 	if (!excludedPaths.includes(window.location.pathname)) {
-		localStorage.setItem(REDIRECT_PATH_KEY, currentPath);
+		setRedirectPath(currentPath);
 	}
 
 	window.location.href = getLoginPath();

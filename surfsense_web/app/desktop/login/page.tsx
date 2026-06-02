@@ -1,18 +1,18 @@
 "use client";
 
-import { IconBrandGoogleFilled } from "@tabler/icons-react";
 import { useAtom } from "jotai";
-import { BrainCog, Eye, EyeOff, Rocket, Zap } from "lucide-react";
+import { Crop, Eye, EyeOff, Rocket, RotateCcw, Zap } from "lucide-react";
 import Image from "next/image";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { loginMutationAtom } from "@/atoms/auth/auth-mutation.atoms";
-import { DEFAULT_SHORTCUTS, ShortcutRecorder } from "@/components/desktop/shortcut-recorder";
+import { DEFAULT_SHORTCUTS, keyEventToAccelerator } from "@/components/desktop/shortcut-recorder";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { ShortcutKbd } from "@/components/ui/shortcut-kbd";
 import { Spinner } from "@/components/ui/spinner";
 import { useElectronAPI } from "@/hooks/use-platform";
 import { searchSpacesApiService } from "@/lib/apis/search-spaces-api.service";
@@ -20,6 +20,171 @@ import { setBearerToken } from "@/lib/auth-utils";
 import { AUTH_TYPE, BACKEND_URL } from "@/lib/env-config";
 
 const isGoogleAuth = AUTH_TYPE === "GOOGLE";
+type ShortcutKey = "generalAssist" | "quickAsk" | "screenshotAssist";
+type ShortcutMap = typeof DEFAULT_SHORTCUTS;
+
+function GoogleGLogo({ className }: { className?: string }) {
+	return (
+		<svg
+			className={className}
+			xmlns="http://www.w3.org/2000/svg"
+			viewBox="0 0 48 48"
+			aria-hidden="true"
+		>
+			<path
+				fill="#EA4335"
+				d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
+			/>
+			<path
+				fill="#4285F4"
+				d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
+			/>
+			<path
+				fill="#FBBC05"
+				d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
+			/>
+			<path
+				fill="#34A853"
+				d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
+			/>
+		</svg>
+	);
+}
+
+const HOTKEY_ROWS: Array<{
+	key: ShortcutKey;
+	label: string;
+	description: string;
+	icon: React.ElementType;
+}> = [
+	{
+		key: "generalAssist",
+		label: "General Assist",
+		description: "Launch SurfSense instantly from any application",
+		icon: Rocket,
+	},
+	{
+		key: "screenshotAssist",
+		label: "Screenshot Assist",
+		description: "Draw a region on screen to attach that capture to chat",
+		icon: Crop,
+	},
+	{
+		key: "quickAsk",
+		label: "Quick Assist",
+		description: "Select text anywhere, then ask AI to explain, rewrite, or act on it",
+		icon: Zap,
+	},
+];
+
+function acceleratorToKeys(accel: string, isMac: boolean): string[] {
+	if (!accel) return [];
+	return accel.split("+").map((part) => {
+		if (part === "CommandOrControl") {
+			return isMac ? "⌘" : "Ctrl";
+		}
+		if (part === "Alt") {
+			return isMac ? "⌥" : "Alt";
+		}
+		if (part === "Shift") {
+			return isMac ? "⇧" : "Shift";
+		}
+		if (part === "Space") return "Space";
+		return part.length === 1 ? part.toUpperCase() : part;
+	});
+}
+
+function HotkeyRow({
+	label,
+	description,
+	value,
+	defaultValue,
+	icon: Icon,
+	isMac,
+	onChange,
+	onReset,
+}: {
+	label: string;
+	description: string;
+	value: string;
+	defaultValue: string;
+	icon: React.ElementType;
+	isMac: boolean;
+	onChange: (accelerator: string) => void;
+	onReset: () => void;
+}) {
+	const [recording, setRecording] = useState(false);
+	const inputRef = useRef<HTMLButtonElement>(null);
+	const isDefault = value === defaultValue;
+	const displayKeys = useMemo(() => acceleratorToKeys(value, isMac), [value, isMac]);
+
+	const handleKeyDown = useCallback(
+		(e: React.KeyboardEvent) => {
+			if (!recording) return;
+			e.preventDefault();
+			e.stopPropagation();
+
+			if (e.key === "Escape") {
+				setRecording(false);
+				return;
+			}
+
+			const accel = keyEventToAccelerator(e);
+			if (accel) {
+				onChange(accel);
+				setRecording(false);
+			}
+		},
+		[onChange, recording]
+	);
+
+	return (
+		<div className="flex items-center justify-between gap-2.5 border-border/60 border-b py-3 last:border-b-0">
+			<div className="flex items-center gap-2.5 min-w-0">
+				<div className="flex size-7 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
+					<Icon className="size-3.5" />
+				</div>
+				<div className="min-w-0">
+					<p className="text-sm font-medium text-foreground truncate">{label}</p>
+					<p className="text-xs text-muted-foreground line-clamp-2">{description}</p>
+				</div>
+			</div>
+			<div className="flex shrink-0 items-center gap-1">
+				{!isDefault && (
+					<Button
+						variant="ghost"
+						size="icon"
+						className="size-7 text-muted-foreground hover:text-foreground"
+						onClick={onReset}
+						title="Reset to default"
+					>
+						<RotateCcw className="size-3" />
+					</Button>
+				)}
+				<Button
+					ref={inputRef}
+					type="button"
+					variant="ghost"
+					title={recording ? "Press shortcut keys" : "Click to edit shortcut"}
+					onClick={() => setRecording(true)}
+					onKeyDown={handleKeyDown}
+					onBlur={() => setRecording(false)}
+					className={
+						recording
+							? "h-7 border border-transparent bg-primary/5 px-0 outline-none ring-0 focus:outline-none focus-visible:outline-none focus-visible:ring-0"
+							: "h-7 cursor-pointer border border-transparent bg-transparent px-0 outline-none ring-0 transition-colors hover:bg-accent hover:text-accent-foreground focus:outline-none focus-visible:outline-none focus-visible:ring-0"
+					}
+				>
+					{recording ? (
+						<span className="px-2 text-[9px] text-primary whitespace-nowrap">Press hotkeys</span>
+					) : (
+						<ShortcutKbd keys={displayKeys} className="ml-0 px-1.5 text-foreground/85" />
+					)}
+				</Button>
+			</div>
+		</div>
+	);
+}
 
 export default function DesktopLoginPage() {
 	const router = useRouter();
@@ -30,9 +195,11 @@ export default function DesktopLoginPage() {
 	const [password, setPassword] = useState("");
 	const [showPassword, setShowPassword] = useState(false);
 	const [loginError, setLoginError] = useState<string | null>(null);
+	const [isGoogleRedirecting, setIsGoogleRedirecting] = useState(false);
 
 	const [shortcuts, setShortcuts] = useState(DEFAULT_SHORTCUTS);
 	const [shortcutsLoaded, setShortcutsLoaded] = useState(false);
+	const isMac = api?.versions?.platform === "darwin";
 
 	useEffect(() => {
 		if (!api?.getShortcuts) {
@@ -41,7 +208,7 @@ export default function DesktopLoginPage() {
 		}
 		api
 			.getShortcuts()
-			.then((config) => {
+			.then((config: ShortcutMap | null) => {
 				if (config) setShortcuts(config);
 				setShortcutsLoaded(true);
 			})
@@ -49,7 +216,7 @@ export default function DesktopLoginPage() {
 	}, [api]);
 
 	const updateShortcut = useCallback(
-		(key: "generalAssist" | "quickAsk" | "autocomplete", accelerator: string) => {
+		(key: ShortcutKey, accelerator: string) => {
 			setShortcuts((prev) => {
 				const updated = { ...prev, [key]: accelerator };
 				api?.setShortcuts?.({ [key]: accelerator }).catch(() => {
@@ -63,13 +230,15 @@ export default function DesktopLoginPage() {
 	);
 
 	const resetShortcut = useCallback(
-		(key: "generalAssist" | "quickAsk" | "autocomplete") => {
+		(key: ShortcutKey) => {
 			updateShortcut(key, DEFAULT_SHORTCUTS[key]);
 		},
 		[updateShortcut]
 	);
 
 	const handleGoogleLogin = () => {
+		if (isGoogleRedirecting) return;
+		setIsGoogleRedirecting(true);
 		window.location.href = `${BACKEND_URL}/auth/google/authorize-redirect`;
 	};
 
@@ -117,18 +286,8 @@ export default function DesktopLoginPage() {
 	};
 
 	return (
-		<div className="relative flex min-h-svh items-center justify-center bg-background p-4 sm:p-6">
-			{/* Subtle radial glow */}
-			<div className="pointer-events-none fixed inset-0 overflow-hidden">
-				<div
-					className="absolute -top-1/2 left-1/2 size-[800px] -translate-x-1/2 rounded-full opacity-[0.03]"
-					style={{
-						background: "radial-gradient(circle, hsl(var(--primary)) 0%, transparent 70%)",
-					}}
-				/>
-			</div>
-
-			<div className="relative flex w-full max-w-md flex-col overflow-hidden rounded-xl border bg-card shadow-lg">
+		<div className="relative flex min-h-svh items-center justify-center bg-main-panel p-4 sm:p-6 select-none">
+			<div className="relative flex w-full max-w-md flex-col overflow-hidden bg-main-panel">
 				{/* Header */}
 				<div className="flex flex-col items-center px-6 pt-6 pb-2 text-center">
 					<Image
@@ -141,7 +300,7 @@ export default function DesktopLoginPage() {
 					/>
 					<h1 className="text-lg font-semibold tracking-tight">Welcome to SurfSense Desktop</h1>
 					<p className="mt-1 text-sm text-muted-foreground">
-						Configure shortcuts, then sign in to get started.
+						Configure shortcuts, then sign in to get started
 					</p>
 				</div>
 
@@ -151,41 +310,24 @@ export default function DesktopLoginPage() {
 						{/* ---- Shortcuts ---- */}
 						{shortcutsLoaded ? (
 							<div className="flex flex-col gap-2">
-								<p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-									Keyboard Shortcuts
-								</p>
-								<div className="flex flex-col gap-1.5">
-									<ShortcutRecorder
-										value={shortcuts.generalAssist}
-										onChange={(accel) => updateShortcut("generalAssist", accel)}
-										onReset={() => resetShortcut("generalAssist")}
-										defaultValue={DEFAULT_SHORTCUTS.generalAssist}
-										label="General Assist"
-										description="Launch SurfSense instantly from any application"
-										icon={Rocket}
-									/>
-									<ShortcutRecorder
-										value={shortcuts.quickAsk}
-										onChange={(accel) => updateShortcut("quickAsk", accel)}
-										onReset={() => resetShortcut("quickAsk")}
-										defaultValue={DEFAULT_SHORTCUTS.quickAsk}
-										label="Quick Assist"
-										description="Select text anywhere, then ask AI to explain, rewrite, or act on it"
-										icon={Zap}
-									/>
-									<ShortcutRecorder
-										value={shortcuts.autocomplete}
-										onChange={(accel) => updateShortcut("autocomplete", accel)}
-										onReset={() => resetShortcut("autocomplete")}
-										defaultValue={DEFAULT_SHORTCUTS.autocomplete}
-										label="Extreme Assist"
-										description="AI drafts text using your screen context and knowledge base"
-										icon={BrainCog}
-									/>
+								{/* <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+									Hotkeys
+								</p> */}
+								<div>
+									{HOTKEY_ROWS.map((row) => (
+										<HotkeyRow
+											key={row.key}
+											label={row.label}
+											description={row.description}
+											value={shortcuts[row.key]}
+											defaultValue={DEFAULT_SHORTCUTS[row.key]}
+											icon={row.icon}
+											isMac={isMac}
+											onChange={(accel) => updateShortcut(row.key, accel)}
+											onReset={() => resetShortcut(row.key)}
+										/>
+									))}
 								</div>
-								<p className="text-[11px] text-muted-foreground text-center mt-1">
-									Click a shortcut and press a new key combination to change it.
-								</p>
 							</div>
 						) : (
 							<div className="flex justify-center py-6">
@@ -197,13 +339,18 @@ export default function DesktopLoginPage() {
 
 						{/* ---- Auth ---- */}
 						<div className="flex flex-col gap-3">
-							<p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+							{/* <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
 								Sign In
-							</p>
+							</p> */}
 
 							{isGoogleAuth ? (
-								<Button variant="outline" className="w-full gap-2 h-10" onClick={handleGoogleLogin}>
-									<IconBrandGoogleFilled className="size-4" />
+								<Button
+									variant="outline"
+									className="w-full gap-2 h-10 bg-white text-[#1f1f1f] border-white hover:bg-zinc-100 hover:text-[#1f1f1f] dark:border-white shadow-sm font-medium"
+									disabled={isGoogleRedirecting}
+									onClick={handleGoogleLogin}
+								>
+									<GoogleGLogo className="size-4" />
 									Continue with Google
 								</Button>
 							) : (
@@ -246,10 +393,11 @@ export default function DesktopLoginPage() {
 												disabled={isLoggingIn}
 												className="h-9 pr-9"
 											/>
-											<button
+											<Button
 												type="button"
+												variant="ghost"
 												onClick={() => setShowPassword((v) => !v)}
-												className="absolute inset-y-0 right-0 flex items-center pr-2.5 text-muted-foreground hover:text-foreground"
+												className="absolute inset-y-0 right-0 h-auto bg-transparent px-2.5 py-0 text-muted-foreground hover:bg-transparent hover:text-foreground"
 												tabIndex={-1}
 											>
 												{showPassword ? (
@@ -257,18 +405,14 @@ export default function DesktopLoginPage() {
 												) : (
 													<Eye className="size-3.5" />
 												)}
-											</button>
+											</Button>
 										</div>
 									</div>
 
-									<Button type="submit" disabled={isLoggingIn} className="h-9 mt-1">
-										{isLoggingIn ? (
-											<>
-												<Spinner size="sm" className="text-primary-foreground" />
-												Signing in…
-											</>
-										) : (
-											"Sign in"
+									<Button type="submit" disabled={isLoggingIn} className="relative h-9 mt-1">
+										<span className={isLoggingIn ? "opacity-0" : ""}>Sign in</span>
+										{isLoggingIn && (
+											<Spinner size="sm" className="absolute text-primary-foreground" />
 										)}
 									</Button>
 								</form>

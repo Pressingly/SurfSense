@@ -1,16 +1,18 @@
 "use client";
 
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
-import { PanelRight, PanelRightClose } from "lucide-react";
+import { PanelRight } from "lucide-react";
 import dynamic from "next/dynamic";
-import { startTransition, useEffect } from "react";
-import { closeHitlEditPanelAtom, hitlEditPanelAtom } from "@/atoms/chat/hitl-edit-panel.atom";
+import { type MouseEvent, startTransition, useEffect } from "react";
 import { closeReportPanelAtom, reportPanelAtom } from "@/atoms/chat/report-panel.atom";
+import { citationPanelAtom, closeCitationPanelAtom } from "@/atoms/citation/citation-panel.atom";
 import { documentsSidebarOpenAtom } from "@/atoms/documents/ui.atoms";
 import { closeEditorPanelAtom, editorPanelAtom } from "@/atoms/editor/editor-panel.atom";
 import { rightPanelCollapsedAtom, rightPanelTabAtom } from "@/atoms/layout/right-panel.atom";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { closeHitlEditPanelAtom, hitlEditPanelAtom } from "@/features/chat-messages/hitl";
+import { cn } from "@/lib/utils";
 import { DocumentsSidebar } from "../sidebar";
 
 const EditorPanelContent = dynamic(
@@ -21,9 +23,17 @@ const EditorPanelContent = dynamic(
 	{ ssr: false, loading: () => null }
 );
 
+const CitationPanelContent = dynamic(
+	() =>
+		import("@/components/citation-panel/citation-panel").then((m) => ({
+			default: m.CitationPanelContent,
+		})),
+	{ ssr: false, loading: () => null }
+);
+
 const HitlEditPanelContent = dynamic(
 	() =>
-		import("@/components/hitl-edit-panel/hitl-edit-panel").then((m) => ({
+		import("@/features/chat-messages/hitl").then((m) => ({
 			default: m.HitlEditPanelContent,
 		})),
 	{ ssr: false, loading: () => null }
@@ -42,18 +52,86 @@ interface RightPanelProps {
 		open: boolean;
 		onOpenChange: (open: boolean) => void;
 	};
+	showCollapseButton?: boolean;
+	showTopBorder?: boolean;
+}
+
+function isKeyboardClick(event: MouseEvent) {
+	return event.detail === 0;
 }
 
 function CollapseButton({ onClick }: { onClick: () => void }) {
 	return (
 		<Tooltip>
 			<TooltipTrigger asChild>
-				<Button variant="ghost" size="icon" onClick={onClick} className="h-8 w-8 shrink-0">
-					<PanelRightClose className="h-4 w-4" />
+				<Button
+					variant="ghost"
+					size="icon"
+					tabIndex={-1}
+					onClick={(event) => {
+						if (isKeyboardClick(event)) return;
+						onClick();
+					}}
+					className="h-8 w-8 shrink-0 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+				>
+					<PanelRight className="h-4 w-4" />
 					<span className="sr-only">Collapse panel</span>
 				</Button>
 			</TooltipTrigger>
-			<TooltipContent side="left">Collapse panel</TooltipContent>
+			<TooltipContent side="bottom">Collapse panel</TooltipContent>
+		</Tooltip>
+	);
+}
+
+interface RightPanelToggleButtonProps {
+	className?: string;
+	iconClassName?: string;
+	disabled?: boolean;
+}
+
+export function RightPanelToggleButton({
+	className,
+	iconClassName,
+	disabled = false,
+}: RightPanelToggleButtonProps) {
+	const [collapsed, setCollapsed] = useAtom(rightPanelCollapsedAtom);
+	const documentsOpen = useAtomValue(documentsSidebarOpenAtom);
+	const reportState = useAtomValue(reportPanelAtom);
+	const editorState = useAtomValue(editorPanelAtom);
+	const hitlEditState = useAtomValue(hitlEditPanelAtom);
+	const citationState = useAtomValue(citationPanelAtom);
+	const reportOpen = reportState.isOpen && !!reportState.reportId;
+	const editorOpen =
+		editorState.isOpen &&
+		(editorState.kind === "document" ? !!editorState.documentId : !!editorState.localFilePath);
+	const hitlEditOpen = hitlEditState.isOpen && !!hitlEditState.onSave;
+	const citationOpen = citationState.isOpen && citationState.chunkId != null;
+	const hasContent = documentsOpen || reportOpen || editorOpen || hitlEditOpen || citationOpen;
+	const label = collapsed ? "Expand panel" : "Collapse panel";
+
+	if (!hasContent) return null;
+
+	return (
+		<Tooltip>
+			<TooltipTrigger asChild>
+				<Button
+					variant="ghost"
+					size="icon"
+					disabled={disabled}
+					onClick={() => {
+						if (disabled) return;
+						startTransition(() => setCollapsed((value) => !value));
+					}}
+					className={cn(
+						"h-8 w-8 shrink-0 text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+						className
+					)}
+				>
+					<PanelRight className={cn("h-4 w-4", iconClassName)} />
+					<span className="sr-only">{label}</span>
+				</Button>
+			</TooltipTrigger>
+			<TooltipContent side="bottom">{label}</TooltipContent>
 		</Tooltip>
 	);
 }
@@ -64,41 +142,42 @@ function CollapseButton({ onClick }: { onClick: () => void }) {
  * inside the Documents header.
  */
 export function RightPanelExpandButton() {
-	const [collapsed, setCollapsed] = useAtom(rightPanelCollapsedAtom);
+	const [collapsed] = useAtom(rightPanelCollapsedAtom);
 	const documentsOpen = useAtomValue(documentsSidebarOpenAtom);
 	const reportState = useAtomValue(reportPanelAtom);
 	const editorState = useAtomValue(editorPanelAtom);
 	const hitlEditState = useAtomValue(hitlEditPanelAtom);
+	const citationState = useAtomValue(citationPanelAtom);
 	const reportOpen = reportState.isOpen && !!reportState.reportId;
-	const editorOpen = editorState.isOpen && !!editorState.documentId;
+	const editorOpen =
+		editorState.isOpen &&
+		(editorState.kind === "document" ? !!editorState.documentId : !!editorState.localFilePath);
 	const hitlEditOpen = hitlEditState.isOpen && !!hitlEditState.onSave;
-	const hasContent = documentsOpen || reportOpen || editorOpen || hitlEditOpen;
+	const citationOpen = citationState.isOpen && citationState.chunkId != null;
+	const hasContent = documentsOpen || reportOpen || editorOpen || hitlEditOpen || citationOpen;
 
 	if (!collapsed || !hasContent) return null;
 
 	return (
 		<div className="flex shrink-0 items-center px-0.5">
-			<Tooltip>
-				<TooltipTrigger asChild>
-					<Button
-						variant="ghost"
-						size="icon"
-						onClick={() => startTransition(() => setCollapsed(false))}
-						className="h-8 w-8 shrink-0 -m-0.5"
-					>
-						<PanelRight className="h-4 w-4" />
-						<span className="sr-only">Expand panel</span>
-					</Button>
-				</TooltipTrigger>
-				<TooltipContent side="left">Expand panel</TooltipContent>
-			</Tooltip>
+			<RightPanelToggleButton className="-m-0.5" />
 		</div>
 	);
 }
 
-const PANEL_WIDTHS = { sources: 420, report: 640, editor: 640, "hitl-edit": 640 } as const;
+const PANEL_WIDTHS = {
+	sources: 420,
+	report: 640,
+	editor: 640,
+	"hitl-edit": 640,
+	citation: 560,
+} as const;
 
-export function RightPanel({ documentsPanel }: RightPanelProps) {
+export function RightPanel({
+	documentsPanel,
+	showCollapseButton = true,
+	showTopBorder = false,
+}: RightPanelProps) {
 	const [activeTab] = useAtom(rightPanelTabAtom);
 	const reportState = useAtomValue(reportPanelAtom);
 	const closeReport = useSetAtom(closeReportPanelAtom);
@@ -106,54 +185,85 @@ export function RightPanel({ documentsPanel }: RightPanelProps) {
 	const closeEditor = useSetAtom(closeEditorPanelAtom);
 	const hitlEditState = useAtomValue(hitlEditPanelAtom);
 	const closeHitlEdit = useSetAtom(closeHitlEditPanelAtom);
+	const citationState = useAtomValue(citationPanelAtom);
+	const closeCitation = useSetAtom(closeCitationPanelAtom);
 	const [collapsed, setCollapsed] = useAtom(rightPanelCollapsedAtom);
 
 	const documentsOpen = documentsPanel?.open ?? false;
 	const reportOpen = reportState.isOpen && !!reportState.reportId;
-	const editorOpen = editorState.isOpen && !!editorState.documentId;
+	const editorOpen =
+		editorState.isOpen &&
+		(editorState.kind === "document" ? !!editorState.documentId : !!editorState.localFilePath);
 	const hitlEditOpen = hitlEditState.isOpen && !!hitlEditState.onSave;
+	const citationOpen = citationState.isOpen && citationState.chunkId != null;
 
 	useEffect(() => {
-		if (!reportOpen && !editorOpen && !hitlEditOpen) return;
+		if (!reportOpen && !editorOpen && !hitlEditOpen && !citationOpen) return;
 		const handleKeyDown = (e: KeyboardEvent) => {
 			if (e.key === "Escape") {
 				if (hitlEditOpen) closeHitlEdit();
+				else if (citationOpen) closeCitation();
 				else if (editorOpen) closeEditor();
 				else if (reportOpen) closeReport();
 			}
 		};
 		document.addEventListener("keydown", handleKeyDown);
 		return () => document.removeEventListener("keydown", handleKeyDown);
-	}, [reportOpen, editorOpen, hitlEditOpen, closeReport, closeEditor, closeHitlEdit]);
+	}, [
+		reportOpen,
+		editorOpen,
+		hitlEditOpen,
+		citationOpen,
+		closeReport,
+		closeEditor,
+		closeHitlEdit,
+		closeCitation,
+	]);
 
-	const isVisible = (documentsOpen || reportOpen || editorOpen || hitlEditOpen) && !collapsed;
+	const isVisible =
+		(documentsOpen || reportOpen || editorOpen || hitlEditOpen || citationOpen) && !collapsed;
 
 	let effectiveTab = activeTab;
 	if (effectiveTab === "hitl-edit" && !hitlEditOpen) {
-		effectiveTab = editorOpen ? "editor" : reportOpen ? "report" : "sources";
-	} else if (effectiveTab === "editor" && !editorOpen) {
-		effectiveTab = reportOpen ? "report" : "sources";
-	} else if (effectiveTab === "report" && !reportOpen) {
-		effectiveTab = editorOpen ? "editor" : "sources";
-	} else if (effectiveTab === "sources" && !documentsOpen) {
-		effectiveTab = hitlEditOpen
-			? "hitl-edit"
+		effectiveTab = citationOpen
+			? "citation"
 			: editorOpen
 				? "editor"
 				: reportOpen
 					? "report"
 					: "sources";
+	} else if (effectiveTab === "citation" && !citationOpen) {
+		effectiveTab = editorOpen ? "editor" : reportOpen ? "report" : "sources";
+	} else if (effectiveTab === "editor" && !editorOpen) {
+		effectiveTab = citationOpen ? "citation" : reportOpen ? "report" : "sources";
+	} else if (effectiveTab === "report" && !reportOpen) {
+		effectiveTab = citationOpen ? "citation" : editorOpen ? "editor" : "sources";
+	} else if (effectiveTab === "sources" && !documentsOpen) {
+		effectiveTab = hitlEditOpen
+			? "hitl-edit"
+			: citationOpen
+				? "citation"
+				: editorOpen
+					? "editor"
+					: reportOpen
+						? "report"
+						: "sources";
 	}
 
 	const targetWidth = PANEL_WIDTHS[effectiveTab];
-	const collapseButton = <CollapseButton onClick={() => setCollapsed(true)} />;
+	const collapseButton = showCollapseButton ? (
+		<CollapseButton onClick={() => setCollapsed(true)} />
+	) : null;
 
 	if (!isVisible) return null;
 
 	return (
 		<aside
 			style={{ width: targetWidth }}
-			className="flex h-full shrink-0 flex-col rounded-xl border bg-sidebar text-sidebar-foreground overflow-hidden transition-[width] duration-200 ease-out"
+			className={cn(
+				"flex h-full shrink-0 flex-col border-l bg-panel text-sidebar-foreground overflow-hidden transition-[width] duration-200 ease-out",
+				showTopBorder && "border-t"
+			)}
 		>
 			<div className="relative flex-1 min-h-0 overflow-hidden">
 				{effectiveTab === "sources" && documentsOpen && documentsPanel && (
@@ -179,8 +289,10 @@ export function RightPanel({ documentsPanel }: RightPanelProps) {
 				{effectiveTab === "editor" && editorOpen && (
 					<div className="h-full flex flex-col">
 						<EditorPanelContent
-							documentId={editorState.documentId as number}
-							searchSpaceId={editorState.searchSpaceId as number}
+							kind={editorState.kind}
+							documentId={editorState.documentId ?? undefined}
+							localFilePath={editorState.localFilePath ?? undefined}
+							searchSpaceId={editorState.searchSpaceId ?? undefined}
 							title={editorState.title}
 							onClose={closeEditor}
 						/>
@@ -197,6 +309,11 @@ export function RightPanel({ documentsPanel }: RightPanelProps) {
 							onSave={hitlEditState.onSave}
 							onClose={closeHitlEdit}
 						/>
+					</div>
+				)}
+				{effectiveTab === "citation" && citationOpen && citationState.chunkId != null && (
+					<div className="h-full flex flex-col">
+						<CitationPanelContent chunkId={citationState.chunkId} onClose={closeCitation} />
 					</div>
 				)}
 			</div>

@@ -9,6 +9,7 @@ import { z } from "zod";
 import { openReportPanelAtom, reportPanelAtom } from "@/atoms/chat/report-panel.atom";
 import { PlateEditor } from "@/components/editor/plate-editor";
 import { TextShimmerLoader } from "@/components/prompt-kit/loader";
+import { Button } from "@/components/ui/button";
 import { useMediaQuery } from "@/hooks/use-media-query";
 import { baseApiService } from "@/lib/apis/base-api.service";
 
@@ -96,8 +97,12 @@ function ReportErrorState({ title, error }: { title: string; error: string }) {
 			</div>
 			<div className="mx-5 h-px bg-border/50" />
 			<div className="px-5 py-4">
-				<p className="text-sm font-medium text-foreground line-clamp-2">{title}</p>
-				<p className="text-sm text-muted-foreground mt-1">{error}</p>
+				{title && title !== "Report" && (
+					<p className="text-sm font-medium text-foreground line-clamp-2">{title}</p>
+				)}
+				<p className={`text-sm text-muted-foreground${title && title !== "Report" ? " mt-1" : ""}`}>
+					{error}
+				</p>
 			</div>
 		</div>
 	);
@@ -133,10 +138,9 @@ function ReportCard({
 	const autoOpenedRef = useRef(false);
 	const [metadata, setMetadata] = useState<{
 		title: string;
-		wordCount: number | null;
 		versionLabel: string | null;
 		content: string | null;
-	}>({ title, wordCount: wordCount ?? null, versionLabel: null, content: null });
+	}>({ title, versionLabel: null, content: null });
 	const [isLoading, setIsLoading] = useState(true);
 	const [error, setError] = useState<string | null>(null);
 
@@ -165,10 +169,8 @@ function ReportCard({
 							}
 						}
 						const resolvedTitle = parsed.data.title || title;
-						const resolvedWordCount = parsed.data.report_metadata?.word_count ?? wordCount ?? null;
 						setMetadata({
 							title: resolvedTitle,
-							wordCount: resolvedWordCount,
 							versionLabel,
 							content: parsed.data.content ?? null,
 						});
@@ -178,7 +180,7 @@ function ReportCard({
 							openPanel({
 								reportId,
 								title: resolvedTitle,
-								wordCount: resolvedWordCount ?? undefined,
+								wordCount: parsed.data.report_metadata?.word_count ?? wordCount ?? undefined,
 								shareToken,
 							});
 						}
@@ -206,7 +208,6 @@ function ReportCard({
 		openPanel({
 			reportId,
 			title: metadata.title,
-			wordCount: metadata.wordCount ?? undefined,
 			shareToken,
 		});
 	};
@@ -215,18 +216,11 @@ function ReportCard({
 		<div
 			className={`my-4 max-w-lg overflow-hidden rounded-2xl border bg-muted/30 transition-[box-shadow] duration-300 ${isActive ? "ring-1 ring-primary/50" : ""}`}
 		>
-			{/* biome-ignore lint/a11y/useSemanticElements: can't use <button> here because PlateEditor renders nested <button> elements (e.g. CopyButton) */}
-			<div
-				role="button"
-				tabIndex={0}
+			<Button
+				variant="ghost"
+				type="button"
 				onClick={handleOpen}
-				onKeyDown={(e) => {
-					if (e.key === "Enter" || e.key === " ") {
-						e.preventDefault();
-						handleOpen();
-					}
-				}}
-				className="w-full text-left transition-colors hover:bg-muted/50 focus:outline-none focus-visible:outline-none cursor-pointer"
+				className="h-auto w-full flex-col items-stretch justify-start gap-0 rounded-2xl p-0 text-left font-normal whitespace-normal transition-colors hover:bg-accent hover:text-accent-foreground focus:outline-none focus-visible:outline-none cursor-pointer"
 			>
 				<div className="px-5 pt-5 pb-4 select-none">
 					<p className="text-sm font-semibold text-foreground line-clamp-2">
@@ -237,10 +231,8 @@ function ReportCard({
 							<span className="inline-block h-3 w-24 rounded bg-muted/60 animate-pulse" />
 						) : (
 							<>
-								{metadata.wordCount != null && `${metadata.wordCount.toLocaleString()} words`}
-								{metadata.wordCount != null && metadata.versionLabel && (
-									<Dot className="inline size-4" />
-								)}
+								Markdown
+								{metadata.versionLabel && <Dot className="inline size-4" />}
 								{metadata.versionLabel}
 							</>
 						)}
@@ -272,7 +264,7 @@ function ReportCard({
 						<p className="text-sm text-muted-foreground italic">No content available</p>
 					)}
 				</div>
-			</div>
+			</Button>
 		</div>
 	);
 }

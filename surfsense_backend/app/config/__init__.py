@@ -13,6 +13,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 env_file = BASE_DIR / ".env"
 load_dotenv(env_file)
 
+os.environ.setdefault("OR_APP_NAME", "SurfSense")
+os.environ.setdefault("OR_SITE_URL", "https://surfsense.com")
+
 
 def is_ffmpeg_installed():
     """
@@ -42,7 +45,72 @@ def load_global_llm_configs():
     try:
         with open(global_config_file, encoding="utf-8") as f:
             data = yaml.safe_load(f)
-            return data.get("global_llm_configs", [])
+            configs = data.get("global_llm_configs", [])
+
+        # Lazy import keeps the `app.config` -> `app.services` edge one-way
+        # and matches the `provider_api_base` pattern used elsewhere.
+        from app.services.provider_capabilities import derive_supports_image_input
+
+        seen_slugs: dict[str, int] = {}
+        for cfg in configs:
+            cfg.setdefault("billing_tier", "free")
+            cfg.setdefault("anonymous_enabled", False)
+            cfg.setdefault("seo_enabled", False)
+            # Capability flag: explicit YAML override always wins. When the
+            # operator has not annotated the model, defer to LiteLLM's
+            # authoritative model map (`supports_vision`) which already
+            # knows GPT-5.x / GPT-4o / Claude 3.x / Gemini 2.x are
+            # vision-capable. Unknown / unmapped models default-allow so
+            # we don't lock the user out of a freshly added third-party
+            # entry; the streaming-task safety net (driven by
+            # `is_known_text_only_chat_model`) is the only place a False
+            # actually blocks a request.
+            if "supports_image_input" not in cfg:
+                litellm_params = cfg.get("litellm_params") or {}
+                base_model = (
+                    litellm_params.get("base_model")
+                    if isinstance(litellm_params, dict)
+                    else None
+                )
+                cfg["supports_image_input"] = derive_supports_image_input(
+                    provider=cfg.get("provider"),
+                    model_name=cfg.get("model_name"),
+                    base_model=base_model,
+                    custom_provider=cfg.get("custom_provider"),
+                )
+
+            if cfg.get("seo_enabled") and cfg.get("seo_slug"):
+                slug = cfg["seo_slug"]
+                if slug in seen_slugs:
+                    print(
+                        f"Warning: Duplicate seo_slug '{slug}' in global LLM configs "
+                        f"(ids {seen_slugs[slug]} and {cfg.get('id')})"
+                    )
+                else:
+                    seen_slugs[slug] = cfg.get("id", 0)
+
+        # Stamp Auto (Fastest) ranking metadata. YAML configs are always
+        # Tier A — operator-curated, locked first when premium-eligible.
+        # The OpenRouter refresh tick later re-stamps health for any cfg
+        # whose provider == "OPENROUTER" via _enrich_health.
+        try:
+            from app.services.quality_score import static_score_yaml
+
+            for cfg in configs:
+                cfg["auto_pin_tier"] = "A"
+                static_q = static_score_yaml(cfg)
+                cfg["quality_score_static"] = static_q
+                cfg["quality_score"] = static_q
+                cfg["quality_score_health"] = None
+                # YAML cfgs whose provider is OPENROUTER are also subject
+                # to health gating against their own /endpoints data — a
+                # hand-picked dead OR model is still dead. _enrich_health
+                # re-stamps health_gated for them on the next refresh tick.
+                cfg["health_gated"] = False
+        except Exception as e:
+            print(f"Warning: Failed to score global LLM configs: {e}")
+
+        return configs
     except Exception as e:
         print(f"Warning: Failed to load global LLM configs: {e}")
         return []
@@ -96,7 +164,11 @@ def load_global_image_gen_configs():
     try:
         with open(global_config_file, encoding="utf-8") as f:
             data = yaml.safe_load(f)
-            return data.get("global_image_generation_configs", [])
+            configs = data.get("global_image_generation_configs", []) or []
+            for cfg in configs:
+                if isinstance(cfg, dict):
+                    cfg.setdefault("billing_tier", "free")
+            return configs
     except Exception as e:
         print(f"Warning: Failed to load global image generation configs: {e}")
         return []
@@ -111,7 +183,11 @@ def load_global_vision_llm_configs():
     try:
         with open(global_config_file, encoding="utf-8") as f:
             data = yaml.safe_load(f)
-            return data.get("global_vision_llm_configs", [])
+            configs = data.get("global_vision_llm_configs", []) or []
+            for cfg in configs:
+                if isinstance(cfg, dict):
+                    cfg.setdefault("billing_tier", "free")
+            return configs
     except Exception as e:
         print(f"Warning: Failed to load global vision LLM configs: {e}")
         return []
@@ -169,24 +245,175 @@ def load_image_gen_router_settings():
         return default_settings
 
 
+def load_openrouter_integration_settings() -> dict | None:
+    """
+    Load OpenRouter integration settings from the YAML config.
+
+    Emits startup warnings for deprecated keys (``billing_tier``,
+    ``anonymous_enabled``) and seeds their replacements for back-compat.
+
+    Returns:
+        dict with settings if present and enabled, None otherwise
+    """
+    global_config_file = BASE_DIR / "app" / "config" / "global_llm_config.yaml"
+
+    if not global_config_file.exists():
+        return None
+
+    try:
+        with open(global_config_file, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+            settings = data.get("openrouter_integration")
+            if not settings or not settings.get("enabled"):
+                return None
+
+            if "billing_tier" in settings:
+                print(
+                    "Warning: openrouter_integration.billing_tier is deprecated; "
+                    "tier is now derived per model from OpenRouter data "
+                    "(':free' suffix or zero pricing). Remove this key."
+                )
+
+            if "anonymous_enabled" in settings:
+                print(
+                    "Warning: openrouter_integration.anonymous_enabled is "
+                    "deprecated; use anonymous_enabled_paid and/or "
+                    "anonymous_enabled_free instead. Both new flags have been "
+                    "seeded from the legacy value for back-compat."
+                )
+                settings.setdefault(
+                    "anonymous_enabled_paid", settings["anonymous_enabled"]
+                )
+                settings.setdefault(
+                    "anonymous_enabled_free", settings["anonymous_enabled"]
+                )
+
+            # Image generation + vision LLM emission are opt-in (issue L).
+            # OpenRouter's catalogue contains hundreds of image / vision
+            # capable models; auto-injecting all of them into every
+            # deployment would explode the model selector and surprise
+            # operators upgrading from prior versions. Default to False so
+            # admins must explicitly turn them on.
+            settings.setdefault("image_generation_enabled", False)
+            settings.setdefault("vision_enabled", False)
+
+            return settings
+    except Exception as e:
+        print(f"Warning: Failed to load OpenRouter integration settings: {e}")
+        return None
+
+
+def initialize_openrouter_integration():
+    """
+    If enabled, fetch all OpenRouter models and append them to
+    config.GLOBAL_LLM_CONFIGS as dynamic entries. Each model's ``billing_tier``
+    is derived per-model from OpenRouter's API signals (``:free`` suffix or
+    zero pricing), so free OpenRouter models correctly skip premium quota.
+
+    Should be called BEFORE initialize_llm_router(). Dynamic entries are
+    tagged ``router_pool_eligible=False`` so the LiteLLM Router pool (used
+    by title-gen / sub-agent flows) remains scoped to curated YAML configs,
+    while user-facing Auto-mode thread pinning still considers them.
+    """
+    settings = load_openrouter_integration_settings()
+    if not settings:
+        return
+
+    try:
+        from app.services.openrouter_integration_service import (
+            OpenRouterIntegrationService,
+        )
+
+        service = OpenRouterIntegrationService.get_instance()
+        new_configs = service.initialize(settings)
+
+        if new_configs:
+            config.GLOBAL_LLM_CONFIGS.extend(new_configs)
+            free_count = sum(1 for c in new_configs if c.get("billing_tier") == "free")
+            premium_count = sum(
+                1 for c in new_configs if c.get("billing_tier") == "premium"
+            )
+            print(
+                f"Info: OpenRouter integration added {len(new_configs)} models "
+                f"(free={free_count}, premium={premium_count})"
+            )
+        else:
+            print("Info: OpenRouter integration enabled but no models fetched")
+
+        # Image generation + vision LLM emissions are opt-in (issue L).
+        # Both reuse the catalogue already cached by ``service.initialize``
+        # so we don't make additional network calls here.
+        if settings.get("image_generation_enabled"):
+            try:
+                image_configs = service.get_image_generation_configs()
+                if image_configs:
+                    config.GLOBAL_IMAGE_GEN_CONFIGS.extend(image_configs)
+                    print(
+                        f"Info: OpenRouter integration added {len(image_configs)} "
+                        f"image-generation models"
+                    )
+            except Exception as e:
+                print(f"Warning: Failed to inject OpenRouter image-gen configs: {e}")
+
+        if settings.get("vision_enabled"):
+            try:
+                vision_configs = service.get_vision_llm_configs()
+                if vision_configs:
+                    config.GLOBAL_VISION_LLM_CONFIGS.extend(vision_configs)
+                    print(
+                        f"Info: OpenRouter integration added {len(vision_configs)} "
+                        f"vision LLM models"
+                    )
+            except Exception as e:
+                print(f"Warning: Failed to inject OpenRouter vision-LLM configs: {e}")
+    except Exception as e:
+        print(f"Warning: Failed to initialize OpenRouter integration: {e}")
+
+
+def initialize_pricing_registration():
+    """
+    Teach LiteLLM the per-token cost of every deployment in
+    ``config.GLOBAL_LLM_CONFIGS`` (OpenRouter dynamic models pulled
+    from the OpenRouter catalogue + any operator-declared YAML pricing).
+
+    Must run AFTER ``initialize_openrouter_integration()`` so the
+    OpenRouter catalogue is populated and BEFORE the first LLM call so
+    ``response_cost`` is available in ``TokenTrackingCallback``.
+
+    Failures are logged but never raised — startup must not be blocked
+    by a missing pricing entry; the worst-case is the model debits 0.
+    """
+    try:
+        from app.services.pricing_registration import (
+            register_pricing_from_global_configs,
+        )
+
+        register_pricing_from_global_configs()
+    except Exception as e:
+        print(f"Warning: Failed to register LiteLLM pricing: {e}")
+
+
 def initialize_llm_router():
     """
     Initialize the LLM Router service for Auto mode.
-    This should be called during application startup.
+    This should be called during application startup, AFTER
+    initialize_openrouter_integration() so dynamic models are included.
+    Uses config.GLOBAL_LLM_CONFIGS (in-memory) which includes both
+    static YAML configs and dynamic OpenRouter models.
     """
-    global_configs = load_global_llm_configs()
+    all_configs = config.GLOBAL_LLM_CONFIGS
     router_settings = load_router_settings()
 
-    if not global_configs:
+    if not all_configs:
         print("Info: No global LLM configs found, Auto mode will not be available")
         return
 
     try:
         from app.services.llm_router_service import LLMRouterService
 
-        LLMRouterService.initialize(global_configs, router_settings)
+        LLMRouterService.initialize(all_configs, router_settings)
         print(
-            f"Info: LLM Router initialized with {len(global_configs)} models "
+            f"Info: LLM Router initialized with {len(all_configs)} models "
             f"(strategy: {router_settings.get('routing_strategy', 'usage-based-routing')})"
         )
     except Exception as e:
@@ -246,10 +473,16 @@ def initialize_vision_llm_router():
 class Config:
     # Check if ffmpeg is installed
     if not is_ffmpeg_installed():
-        import static_ffmpeg
+        allow_static_ffmpeg = (
+            os.getenv("SURFSENSE_ALLOW_STATIC_FFMPEG_DOWNLOAD", "TRUE").upper()
+            == "TRUE"
+        )
+        if allow_static_ffmpeg:
+            import static_ffmpeg
 
-        # ffmpeg installed on first call to add_paths(), threadsafe.
-        static_ffmpeg.add_paths()
+            # ffmpeg installed on first call to add_paths(), threadsafe.
+            static_ffmpeg.add_paths()
+
         # check if ffmpeg is installed again
         if not is_ffmpeg_installed():
             raise ValueError(
@@ -260,6 +493,9 @@ class Config:
     # self-hosted: Full access to local file system connectors (Obsidian, etc.)
     # cloud: Only cloud-based connectors available
     DEPLOYMENT_MODE = os.getenv("SURFSENSE_DEPLOYMENT_MODE", "self-hosted")
+    ENABLE_DESKTOP_LOCAL_FILESYSTEM = (
+        os.getenv("ENABLE_DESKTOP_LOCAL_FILESYSTEM", "FALSE").upper() == "TRUE"
+    )
 
     @classmethod
     def is_self_hosted(cls) -> bool:
@@ -307,10 +543,137 @@ class Config:
         os.getenv("STRIPE_RECONCILIATION_BATCH_SIZE", "100")
     )
 
+    # Premium credit (micro-USD) quota settings.
+    #
+    # Storage unit is integer micro-USD (1_000_000 = $1.00). The legacy
+    # ``PREMIUM_TOKEN_LIMIT`` and ``STRIPE_TOKENS_PER_UNIT`` env vars are
+    # still honoured for one release as fall-back values — the prior
+    # $1-per-1M-tokens Stripe price means every existing value maps 1:1
+    # to micros, so operators upgrading without changing their .env still
+    # get correct behaviour. A startup deprecation warning fires below if
+    # they're set.
+    PREMIUM_CREDIT_MICROS_LIMIT = int(
+        os.getenv("PREMIUM_CREDIT_MICROS_LIMIT")
+        or os.getenv("PREMIUM_TOKEN_LIMIT", "5000000")
+    )
+    STRIPE_PREMIUM_TOKEN_PRICE_ID = os.getenv("STRIPE_PREMIUM_TOKEN_PRICE_ID")
+    STRIPE_CREDIT_MICROS_PER_UNIT = int(
+        os.getenv("STRIPE_CREDIT_MICROS_PER_UNIT")
+        or os.getenv("STRIPE_TOKENS_PER_UNIT", "1000000")
+    )
+    STRIPE_TOKEN_BUYING_ENABLED = (
+        os.getenv("STRIPE_TOKEN_BUYING_ENABLED", "FALSE").upper() == "TRUE"
+    )
+
+    # Safety ceiling on the per-call premium reservation. ``stream_new_chat``
+    # estimates an upper-bound cost from ``litellm.get_model_info`` x the
+    # config's ``quota_reserve_tokens`` and clamps the result to this value
+    # so a misconfigured "$1000/M" model can't lock the user's whole balance
+    # on one call. Default $1.00 covers realistic worst-cases (Opus + 4K
+    # reserve_tokens ≈ $0.36) with headroom.
+    QUOTA_MAX_RESERVE_MICROS = int(os.getenv("QUOTA_MAX_RESERVE_MICROS", "1000000"))
+
+    if os.getenv("PREMIUM_TOKEN_LIMIT") and not os.getenv(
+        "PREMIUM_CREDIT_MICROS_LIMIT"
+    ):
+        print(
+            "Warning: PREMIUM_TOKEN_LIMIT is deprecated; rename to "
+            "PREMIUM_CREDIT_MICROS_LIMIT (1:1 numerical mapping under the "
+            "current Stripe price). The old key will be removed in a "
+            "future release."
+        )
+    if os.getenv("STRIPE_TOKENS_PER_UNIT") and not os.getenv(
+        "STRIPE_CREDIT_MICROS_PER_UNIT"
+    ):
+        print(
+            "Warning: STRIPE_TOKENS_PER_UNIT is deprecated; rename to "
+            "STRIPE_CREDIT_MICROS_PER_UNIT (1:1 numerical mapping). "
+            "The old key will be removed in a future release."
+        )
+
+    # Anonymous / no-login mode settings
+    NOLOGIN_MODE_ENABLED = os.getenv("NOLOGIN_MODE_ENABLED", "FALSE").upper() == "TRUE"
+    MULTI_AGENT_CHAT_ENABLED = (
+        os.getenv("MULTI_AGENT_CHAT_ENABLED", "FALSE").upper() == "TRUE"
+    )
+    ANON_TOKEN_LIMIT = int(os.getenv("ANON_TOKEN_LIMIT", "500000"))
+    ANON_TOKEN_WARNING_THRESHOLD = int(
+        os.getenv("ANON_TOKEN_WARNING_THRESHOLD", "400000")
+    )
+    ANON_TOKEN_QUOTA_TTL_DAYS = int(os.getenv("ANON_TOKEN_QUOTA_TTL_DAYS", "30"))
+    ANON_MAX_UPLOAD_SIZE_MB = int(os.getenv("ANON_MAX_UPLOAD_SIZE_MB", "5"))
+
+    # Default quota reserve tokens when not specified per-model
+    QUOTA_MAX_RESERVE_PER_CALL = int(os.getenv("QUOTA_MAX_RESERVE_PER_CALL", "8000"))
+
+    # Per-image reservation (in micro-USD) used by ``billable_call`` for the
+    # ``POST /image-generations`` endpoint when the global config does not
+    # override it. $0.05 covers realistic worst-cases for current OpenAI /
+    # OpenRouter image-gen pricing. Bypassed entirely for free configs.
+    QUOTA_DEFAULT_IMAGE_RESERVE_MICROS = int(
+        os.getenv("QUOTA_DEFAULT_IMAGE_RESERVE_MICROS", "50000")
+    )
+
+    # Per-podcast reservation (in micro-USD). One agent LLM call generating
+    # a transcript, typically 5k-20k completion tokens. $0.20 covers a long
+    # premium-model run. Tune via env.
+    QUOTA_DEFAULT_PODCAST_RESERVE_MICROS = int(
+        os.getenv("QUOTA_DEFAULT_PODCAST_RESERVE_MICROS", "200000")
+    )
+
+    # Per-video-presentation reservation (in micro-USD). Fan-out of N
+    # slide-scene generations (up to ``VIDEO_PRESENTATION_MAX_SLIDES=30``)
+    # plus refine retries; can produce many premium completions. $1.00
+    # covers worst-case. Tune via env.
+    #
+    # NOTE: this equals the existing ``QUOTA_MAX_RESERVE_MICROS`` default of
+    # 1_000_000. The override path in ``billable_call`` bypasses the
+    # per-call clamp in ``estimate_call_reserve_micros``, so this is the
+    # *actual* hold — raising it via env is fine but means a single video
+    # task can lock $1+ of credit.
+    QUOTA_DEFAULT_VIDEO_PRESENTATION_RESERVE_MICROS = int(
+        os.getenv("QUOTA_DEFAULT_VIDEO_PRESENTATION_RESERVE_MICROS", "1000000")
+    )
+
+    # Abuse prevention: concurrent stream cap and CAPTCHA
+    ANON_MAX_CONCURRENT_STREAMS = int(os.getenv("ANON_MAX_CONCURRENT_STREAMS", "2"))
+    ANON_CAPTCHA_REQUEST_THRESHOLD = int(
+        os.getenv("ANON_CAPTCHA_REQUEST_THRESHOLD", "5")
+    )
+
+    # Cloudflare Turnstile CAPTCHA
+    TURNSTILE_ENABLED = os.getenv("TURNSTILE_ENABLED", "FALSE").upper() == "TRUE"
+    TURNSTILE_SECRET_KEY = os.getenv("TURNSTILE_SECRET_KEY", "")
+
     # Auth — this fork is SSO-only. Default to SSO so a missing envvar doesn't
     # silently fall through to upstream LOCAL behaviour; app.py asserts on boot.
     AUTH_TYPE = os.getenv("AUTH_TYPE", "SSO")
     REGISTRATION_ENABLED = os.getenv("REGISTRATION_ENABLED", "TRUE").upper() == "TRUE"
+
+    # Auto-provisioning of a personal LiteLLM key via Askii on first SSO login.
+    # One Askii key is provisioned with access to all four model slots a
+    # search space needs (agent / document summary / image gen / vision),
+    # and four SurfSense config rows are inserted to point at them.
+    #
+    # Gated on top of AUTH_TYPE=SSO; both this flag and the three required
+    # model env vars (agent / image / vision) must be non-empty for the
+    # feature to fire. Doc-summary defaults to the agent model when blank.
+    AUTO_PROVISION_LITELLM_KEY = (
+        os.getenv("AUTO_PROVISION_LITELLM_KEY", "FALSE").upper() == "TRUE"
+    )
+    ASKII_BASE_URL = os.getenv("ASKII_BASE_URL", "https://api.askii.ai")
+    # Optional override for the LiteLLM proxy URL written into NewLLMConfig /
+    # ImageGenerationConfig / VisionLLMConfig rows. Blank ⇒ inherits
+    # ASKII_BASE_URL (typical case: the platform-key-management API and the
+    # LiteLLM proxy share a host). Set this only when they diverge.
+    ASKII_LITELLM_BASE_URL = os.getenv("ASKII_LITELLM_BASE_URL", "")
+    ASKII_AGENT_MODEL = os.getenv("ASKII_AGENT_MODEL", "")
+    ASKII_DOCUMENT_SUMMARY_MODEL = os.getenv("ASKII_DOCUMENT_SUMMARY_MODEL", "")
+    ASKII_IMAGE_GEN_MODEL = os.getenv("ASKII_IMAGE_GEN_MODEL", "")
+    ASKII_VISION_MODEL = os.getenv("ASKII_VISION_MODEL", "")
+    ASKII_LITELLM_KEY_DURATION_DAYS = int(
+        os.getenv("ASKII_LITELLM_KEY_DURATION_DAYS", "90")
+    )
 
     # Comma-separated path prefixes that bypass proxy auth (default: /health).
     MPASS_BYPASS_PATHS = os.getenv("MPASS_BYPASS_PATHS", None)
@@ -417,6 +780,9 @@ class Config:
 
     # Router settings for Vision LLM Auto mode
     VISION_LLM_ROUTER_SETTINGS = load_vision_llm_router_settings()
+
+    # OpenRouter Integration settings (optional)
+    OPENROUTER_INTEGRATION_SETTINGS = load_openrouter_integration_settings()
 
     # Chonkie Configuration | Edit this to your needs
     EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")

@@ -9,3 +9,15 @@ node_modules/
 deepagents/.env.local
 .env.local
 .idea/
+debug.log
+
+references/
+references
+
+# Playwright (E2E test artifacts)
+surfsense_web/playwright/.auth/
+surfsense_web/playwright-report/
+surfsense_web/test-results/
+surfsense_web/blob-report/
+
+content_research/

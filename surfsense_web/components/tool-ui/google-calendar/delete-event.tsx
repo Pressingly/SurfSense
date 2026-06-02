@@ -6,7 +6,8 @@ import { useCallback, useEffect, useState } from "react";
 import { TextShimmerLoader } from "@/components/prompt-kit/loader";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import { useHitlPhase } from "@/hooks/use-hitl-phase";
+import type { HitlDecision, InterruptResult } from "@/features/chat-messages/hitl";
+import { isInterruptResult, useHitlDecision, useHitlPhase } from "@/features/chat-messages/hitl";
 
 interface GoogleCalendarAccount {
 	id: number;
@@ -27,24 +28,11 @@ interface CalendarEvent {
 	indexed_at?: string;
 }
 
-interface InterruptResult {
-	__interrupt__: true;
-	__decided__?: "approve" | "reject";
-	__completed__?: boolean;
-	action_requests: Array<{
-		name: string;
-		args: Record<string, unknown>;
-	}>;
-	review_configs: Array<{
-		action_name: string;
-		allowed_decisions: Array<"approve" | "reject">;
-	}>;
-	context?: {
-		account?: GoogleCalendarAccount;
-		event?: CalendarEvent;
-		error?: string;
-	};
-}
+type CalendarDeleteEventContext = {
+	account?: GoogleCalendarAccount;
+	event?: CalendarEvent;
+	error?: string;
+};
 
 interface SuccessResult {
 	status: "success";
@@ -83,22 +71,13 @@ interface InsufficientPermissionsResult {
 }
 
 type DeleteCalendarEventResult =
-	| InterruptResult
+	| InterruptResult<CalendarDeleteEventContext>
 	| SuccessResult
 	| ErrorResult
 	| NotFoundResult
 	| WarningResult
 	| InsufficientPermissionsResult
 	| AuthErrorResult;
-
-function isInterruptResult(result: unknown): result is InterruptResult {
-	return (
-		typeof result === "object" &&
-		result !== null &&
-		"__interrupt__" in result &&
-		(result as InterruptResult).__interrupt__ === true
-	);
-}
 
 function isErrorResult(result: unknown): result is ErrorResult {
 	return (
@@ -162,12 +141,8 @@ function ApprovalCard({
 	interruptData,
 	onDecision,
 }: {
-	interruptData: InterruptResult;
-	onDecision: (decision: {
-		type: "approve" | "reject";
-		message?: string;
-		edited_action?: { name: string; args: Record<string, unknown> };
-	}) => void;
+	interruptData: InterruptResult<CalendarDeleteEventContext>;
+	onDecision: (decision: HitlDecision) => void;
 }) {
 	const { phase, setProcessing, setRejected } = useHitlPhase(interruptData);
 	const [deleteFromKb, setDeleteFromKb] = useState(false);
@@ -437,18 +412,15 @@ export const DeleteCalendarEventToolUI = ({
 	{ event_title_or_id: string; delete_from_kb?: boolean },
 	DeleteCalendarEventResult
 >) => {
+	const { dispatch } = useHitlDecision();
+
 	if (!result) return null;
 
 	if (isInterruptResult(result)) {
 		return (
 			<ApprovalCard
-				interruptData={result}
-				onDecision={(decision) => {
-					const event = new CustomEvent("hitl-decision", {
-						detail: { decisions: [decision] },
-					});
-					window.dispatchEvent(event);
-				}}
+				interruptData={result as InterruptResult<CalendarDeleteEventContext>}
+				onDecision={(decision) => dispatch([decision])}
 			/>
 		);
 	}

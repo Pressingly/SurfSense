@@ -12,6 +12,7 @@ from sqlalchemy import (
     ARRAY,
     JSON,
     TIMESTAMP,
+    BigInteger,
     Boolean,
     Column,
     Enum as SQLAlchemyEnum,
@@ -313,6 +314,12 @@ class IncentiveTaskType(StrEnum):
 
 
 class PagePurchaseStatus(StrEnum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class PremiumTokenPurchaseStatus(StrEnum):
     PENDING = "pending"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -631,6 +638,12 @@ class NewChatThread(BaseModel, TimestampMixin):
         default=False,
         server_default="false",
     )
+    # Auto (Fastest) model pin for this thread: concrete resolved global LLM
+    # config id. NULL means no pin; Auto will resolve on the next turn.
+    # Single-writer invariant: only app.services.auto_model_pin_service sets
+    # or clears this column (plus bulk clears when a search space's
+    # agent_llm_id changes). Unindexed: all reads are by primary key.
+    pinned_llm_config_id = Column(Integer, nullable=True)
 
     # Relationships
     search_space = relationship("SearchSpace", back_populates="new_chat_threads")
@@ -647,6 +660,11 @@ class NewChatThread(BaseModel, TimestampMixin):
         cascade="all, delete-orphan",
         foreign_keys="[PublicChatSnapshot.thread_id]",
     )
+    token_usages = relationship(
+        "TokenUsage",
+        back_populates="thread",
+        cascade="all, delete-orphan",
+    )
 
 
 class NewChatMessage(BaseModel, TimestampMixin):
@@ -656,6 +674,23 @@ class NewChatMessage(BaseModel, TimestampMixin):
     """
 
     __tablename__ = "new_chat_messages"
+
+    # Partial unique index on (thread_id, turn_id, role) where turn_id IS NOT NULL.
+    # Mirrors alembic migration 141. Lets the streaming agent and the
+    # legacy frontend appendMessage call coexist idempotently — the second
+    # writer trips the unique and recovers without creating a duplicate row.
+    # Partial so legacy NULL turn_id rows and clone/snapshot inserts in
+    # app/services/public_chat_service.py (which omit turn_id) are unaffected.
+    __table_args__ = (
+        Index(
+            "uq_new_chat_messages_thread_turn_role",
+            "thread_id",
+            "turn_id",
+            "role",
+            unique=True,
+            postgresql_where=text("turn_id IS NOT NULL"),
+        ),
+    )
 
     role = Column(SQLAlchemyEnum(NewChatMessageRole), nullable=False)
     # Content stored as JSONB to support rich content (text, tool calls, etc.)
@@ -677,6 +712,12 @@ class NewChatMessage(BaseModel, TimestampMixin):
         index=True,
     )
 
+    # Per-turn correlation id sourced from ``configurable.turn_id`` at
+    # streaming time (``f"{chat_id}:{ms}"``). Nullable because legacy rows
+    # predate the column. Used by C1's edit-from-arbitrary-position to map
+    # a message back to the LangGraph checkpoint that produced its turn.
+    turn_id = Column(String(64), nullable=True, index=True)
+
     # Relationships
     thread = relationship("NewChatThread", back_populates="messages")
     author = relationship("User")
@@ -685,6 +726,80 @@ class NewChatMessage(BaseModel, TimestampMixin):
         back_populates="message",
         cascade="all, delete-orphan",
     )
+    token_usage = relationship(
+        "TokenUsage",
+        back_populates="message",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
+
+class TokenUsage(BaseModel, TimestampMixin):
+    """
+    Tracks LLM token consumption per assistant turn.
+
+    One row per usage event. For chat, linked to a specific message via message_id.
+    The usage_type column enables future extension to track non-chat usage
+    (indexing, image generation, podcasts, etc.) without schema changes.
+    """
+
+    __tablename__ = "token_usage"
+
+    # Partial unique index on (message_id) where message_id IS NOT NULL.
+    # Mirrors alembic migration 142. Lets the streaming agent's
+    # ``finalize_assistant_turn`` and the legacy frontend ``append_message``
+    # recovery branch both use ``INSERT ... ON CONFLICT DO NOTHING`` without
+    # racing on a SELECT-then-INSERT window. Partial so non-chat usage rows
+    # (indexing, image generation, podcasts) — which keep ``message_id`` NULL
+    # because there is no per-message anchor — are unaffected.
+    __table_args__ = (
+        Index(
+            "uq_token_usage_message_id",
+            "message_id",
+            unique=True,
+            postgresql_where=text("message_id IS NOT NULL"),
+        ),
+    )
+
+    prompt_tokens = Column(Integer, nullable=False, default=0)
+    completion_tokens = Column(Integer, nullable=False, default=0)
+    total_tokens = Column(Integer, nullable=False, default=0)
+    cost_micros = Column(BigInteger, nullable=False, default=0, server_default="0")
+    model_breakdown = Column(JSONB, nullable=True)
+    call_details = Column(JSONB, nullable=True)
+
+    usage_type = Column(String(50), nullable=False, default="chat", index=True)
+
+    thread_id = Column(
+        Integer,
+        ForeignKey("new_chat_threads.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    message_id = Column(
+        Integer,
+        ForeignKey("new_chat_messages.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    search_space_id = Column(
+        Integer,
+        ForeignKey("searchspaces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    # Relationships
+    thread = relationship("NewChatThread", back_populates="token_usages")
+    message = relationship("NewChatMessage", back_populates="token_usage")
+    search_space = relationship("SearchSpace")
+    user = relationship("User")
 
 
 class PublicChatSnapshot(BaseModel, TimestampMixin):
@@ -861,99 +976,6 @@ class ChatSessionState(BaseModel):
     ai_responding_to_user = relationship("User")
 
 
-class MemoryCategory(StrEnum):
-    """Categories for user memories."""
-
-    # Using lowercase keys to match PostgreSQL enum values
-    preference = "preference"  # User preferences (e.g., "prefers dark mode")
-    fact = "fact"  # Facts about the user (e.g., "is a Python developer")
-    instruction = (
-        "instruction"  # Standing instructions (e.g., "always respond in bullet points")
-    )
-    context = "context"  # Contextual information (e.g., "working on project X")
-
-
-class UserMemory(BaseModel, TimestampMixin):
-    """
-    Private memory: facts, preferences, context per user per search space.
-    Used only for private chats (not shared/team chats).
-    """
-
-    __tablename__ = "user_memories"
-
-    user_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("user.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    # Optional association with a search space (if memory is space-specific)
-    search_space_id = Column(
-        Integer,
-        ForeignKey("searchspaces.id", ondelete="CASCADE"),
-        nullable=True,
-        index=True,
-    )
-
-    # The actual memory content
-    memory_text = Column(Text, nullable=False)
-    # Category for organization and filtering
-    category = Column(
-        SQLAlchemyEnum(MemoryCategory),
-        nullable=False,
-        default=MemoryCategory.fact,
-    )
-    # Vector embedding for semantic search
-    embedding = Column(Vector(config.embedding_model_instance.dimension))
-
-    # Track when memory was last updated
-    updated_at = Column(
-        TIMESTAMP(timezone=True),
-        nullable=False,
-        default=lambda: datetime.now(UTC),
-        onupdate=lambda: datetime.now(UTC),
-        index=True,
-    )
-
-    # Relationships
-    user = relationship("User", back_populates="memories")
-    search_space = relationship("SearchSpace", back_populates="user_memories")
-
-
-class SharedMemory(BaseModel, TimestampMixin):
-    __tablename__ = "shared_memories"
-
-    search_space_id = Column(
-        Integer,
-        ForeignKey("searchspaces.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    created_by_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("user.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    memory_text = Column(Text, nullable=False)
-    category = Column(
-        SQLAlchemyEnum(MemoryCategory),
-        nullable=False,
-        default=MemoryCategory.fact,
-    )
-    embedding = Column(Vector(config.embedding_model_instance.dimension))
-    updated_at = Column(
-        TIMESTAMP(timezone=True),
-        nullable=False,
-        default=lambda: datetime.now(UTC),
-        onupdate=lambda: datetime.now(UTC),
-        index=True,
-    )
-
-    search_space = relationship("SearchSpace", back_populates="shared_memories")
-    created_by = relationship("User")
-
-
 class Folder(BaseModel, TimestampMixin):
     __tablename__ = "folders"
 
@@ -1000,7 +1022,15 @@ class Document(BaseModel, TimestampMixin):
     document_metadata = Column(JSON, nullable=True)
 
     content = Column(Text, nullable=False)
-    content_hash = Column(String, nullable=False, index=True, unique=True)
+    # ``content_hash`` is intentionally NOT globally unique. In a real
+    # filesystem two files at different paths can hold identical bytes,
+    # and the agent's ``write_file`` flow needs that semantic to support
+    # copy / duplicate operations. Path uniqueness lives on
+    # ``unique_identifier_hash`` (per search space). The hash remains
+    # indexed because connector indexers consult it as a change-detection
+    # / cross-source dedup hint via :func:`check_duplicate_document`.
+    # See migration 133.
+    content_hash = Column(String, nullable=False, index=True)
     unique_identifier_hash = Column(String, nullable=True, index=True, unique=True)
     embedding = Column(Vector(config.embedding_model_instance.dimension))
 
@@ -1222,12 +1252,13 @@ class VideoPresentation(BaseModel, TimestampMixin):
 
 
 class Report(BaseModel, TimestampMixin):
-    """Report model for storing generated Markdown reports."""
+    """Report model for storing generated reports (Markdown or Typst)."""
 
     __tablename__ = "reports"
 
     title = Column(String(500), nullable=False)
-    content = Column(Text, nullable=True)  # Markdown body
+    content = Column(Text, nullable=True)
+    content_type = Column(String(20), nullable=False, server_default="markdown")
     report_metadata = Column(JSONB, nullable=True)  # section headings, word count, etc.
     report_style = Column(
         String(100), nullable=True
@@ -1394,6 +1425,8 @@ class SearchSpace(BaseModel, TimestampMixin):
         Text, nullable=True, default=""
     )  # User's custom instructions
 
+    shared_memory_md = Column(Text, nullable=True, server_default="")
+
     # Search space-level LLM preferences (shared by all members)
     # Note: ID values:
     #   - 0: Auto mode (uses LiteLLM Router for load balancing) - default for new search spaces
@@ -1411,6 +1444,10 @@ class SearchSpace(BaseModel, TimestampMixin):
     vision_llm_config_id = Column(
         Integer, nullable=True, default=0
     )  # For vision/screenshot analysis, defaults to Auto mode
+
+    ai_file_sort_enabled = Column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     user_id = Column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), nullable=False
@@ -1516,20 +1553,6 @@ class SearchSpace(BaseModel, TimestampMixin):
         cascade="all, delete-orphan",
     )
 
-    # User memories associated with this search space
-    user_memories = relationship(
-        "UserMemory",
-        back_populates="search_space",
-        order_by="UserMemory.updated_at.desc()",
-        cascade="all, delete-orphan",
-    )
-    shared_memories = relationship(
-        "SharedMemory",
-        back_populates="search_space",
-        order_by="SharedMemory.updated_at.desc()",
-        cascade="all, delete-orphan",
-    )
-
 
 class SearchSourceConnector(BaseModel, TimestampMixin):
     __tablename__ = "search_source_connectors"
@@ -1540,6 +1563,31 @@ class SearchSourceConnector(BaseModel, TimestampMixin):
             "connector_type",
             "name",
             name="uq_searchspace_user_connector_type_name",
+        ),
+        # Mirrors migration 129; backs the ``/obsidian/connect`` upsert.
+        Index(
+            "search_source_connectors_obsidian_plugin_vault_uniq",
+            "user_id",
+            text("(config->>'vault_id')"),
+            unique=True,
+            postgresql_where=text(
+                "connector_type = 'OBSIDIAN_CONNECTOR' "
+                "AND config->>'source' = 'plugin' "
+                "AND config->>'vault_id' IS NOT NULL"
+            ),
+        ),
+        # Cross-device dedup: same vault content from different devices
+        # cannot produce two connector rows.
+        Index(
+            "search_source_connectors_obsidian_plugin_fingerprint_uniq",
+            "user_id",
+            text("(config->>'vault_fingerprint')"),
+            unique=True,
+            postgresql_where=text(
+                "connector_type = 'OBSIDIAN_CONNECTOR' "
+                "AND config->>'source' = 'plugin' "
+                "AND config->>'vault_fingerprint' IS NOT NULL"
+            ),
         ),
     )
 
@@ -1552,6 +1600,13 @@ class SearchSourceConnector(BaseModel, TimestampMixin):
     # Summary generation (LLM-based) - disabled by default to save resources.
     # When enabled, improves hybrid search quality at the cost of LLM calls.
     enable_summary = Column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
+    # Vision LLM for image files - disabled by default to save cost/time.
+    # When enabled, images are described via a vision language model instead
+    # of falling back to the document parser.
+    enable_vision_llm = Column(
         Boolean, nullable=False, default=False, server_default="false"
     )
 
@@ -1769,6 +1824,46 @@ class PagePurchase(Base, TimestampMixin):
     completed_at = Column(TIMESTAMP(timezone=True), nullable=True)
 
     user = relationship("User", back_populates="page_purchases")
+
+
+class PremiumTokenPurchase(Base, TimestampMixin):
+    """Tracks Stripe checkout sessions used to grant additional premium credit (USD micro-units).
+
+    Note: the table name is preserved (``premium_token_purchases``) for
+    operational continuity even though the unit is now USD micro-credits
+    instead of raw tokens. The ``credit_micros_granted`` column replaced
+    the legacy ``tokens_granted`` in migration 140; the stored values
+    were not transformed because the prior $1 = 1M tokens Stripe price
+    makes the unit conversion 1:1 numerically.
+    """
+
+    __tablename__ = "premium_token_purchases"
+    __allow_unmapped__ = True
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    stripe_checkout_session_id = Column(
+        String(255), nullable=False, unique=True, index=True
+    )
+    stripe_payment_intent_id = Column(String(255), nullable=True, index=True)
+    quantity = Column(Integer, nullable=False)
+    credit_micros_granted = Column(BigInteger, nullable=False)
+    amount_total = Column(Integer, nullable=True)
+    currency = Column(String(10), nullable=True)
+    status = Column(
+        SQLAlchemyEnum(PremiumTokenPurchaseStatus),
+        nullable=False,
+        default=PremiumTokenPurchaseStatus.PENDING,
+        index=True,
+    )
+    completed_at = Column(TIMESTAMP(timezone=True), nullable=True)
+
+    user = relationship("User", back_populates="premium_token_purchases")
 
 
 class SearchSpaceRole(BaseModel, TimestampMixin):
@@ -2030,14 +2125,6 @@ if config.AUTH_TYPE == "GOOGLE":
             passive_deletes=True,
         )
 
-        # User memories for personalized AI responses
-        memories = relationship(
-            "UserMemory",
-            back_populates="user",
-            order_by="UserMemory.updated_at.desc()",
-            cascade="all, delete-orphan",
-        )
-
         # Incentive tasks completed by this user
         incentive_tasks = relationship(
             "UserIncentiveTask",
@@ -2046,6 +2133,11 @@ if config.AUTH_TYPE == "GOOGLE":
         )
         page_purchases = relationship(
             "PagePurchase",
+            back_populates="user",
+            cascade="all, delete-orphan",
+        )
+        premium_token_purchases = relationship(
+            "PremiumTokenPurchase",
             back_populates="user",
             cascade="all, delete-orphan",
         )
@@ -2059,11 +2151,34 @@ if config.AUTH_TYPE == "GOOGLE":
         )
         pages_used = Column(Integer, nullable=False, default=0, server_default="0")
 
+        premium_credit_micros_limit = Column(
+            BigInteger,
+            nullable=False,
+            default=config.PREMIUM_CREDIT_MICROS_LIMIT,
+            server_default=str(config.PREMIUM_CREDIT_MICROS_LIMIT),
+        )
+        premium_credit_micros_used = Column(
+            BigInteger, nullable=False, default=0, server_default="0"
+        )
+        premium_credit_micros_reserved = Column(
+            BigInteger, nullable=False, default=0, server_default="0"
+        )
+
         # User profile from OAuth
         display_name = Column(String, nullable=True)
         avatar_url = Column(String, nullable=True)
 
         last_login = Column(TIMESTAMP(timezone=True), nullable=True)
+
+        # One-shot marker for Askii LiteLLM auto-provisioning
+        # (app.services.litellm_provisioning). NULL = eligible; non-NULL =
+        # provisioned once at this time and permanently ineligible, even if the
+        # generated config rows are later deleted.
+        litellm_auto_provisioned_at = Column(
+            TIMESTAMP(timezone=True), nullable=True
+        )
+
+        memory_md = Column(Text, nullable=True, server_default="")
 
         # Refresh tokens for this user
         refresh_tokens = relationship(
@@ -2150,14 +2265,6 @@ else:
             passive_deletes=True,
         )
 
-        # User memories for personalized AI responses
-        memories = relationship(
-            "UserMemory",
-            back_populates="user",
-            order_by="UserMemory.updated_at.desc()",
-            cascade="all, delete-orphan",
-        )
-
         # Incentive tasks completed by this user
         incentive_tasks = relationship(
             "UserIncentiveTask",
@@ -2166,6 +2273,11 @@ else:
         )
         page_purchases = relationship(
             "PagePurchase",
+            back_populates="user",
+            cascade="all, delete-orphan",
+        )
+        premium_token_purchases = relationship(
+            "PremiumTokenPurchase",
             back_populates="user",
             cascade="all, delete-orphan",
         )
@@ -2179,11 +2291,34 @@ else:
         )
         pages_used = Column(Integer, nullable=False, default=0, server_default="0")
 
+        premium_credit_micros_limit = Column(
+            BigInteger,
+            nullable=False,
+            default=config.PREMIUM_CREDIT_MICROS_LIMIT,
+            server_default=str(config.PREMIUM_CREDIT_MICROS_LIMIT),
+        )
+        premium_credit_micros_used = Column(
+            BigInteger, nullable=False, default=0, server_default="0"
+        )
+        premium_credit_micros_reserved = Column(
+            BigInteger, nullable=False, default=0, server_default="0"
+        )
+
         # User profile (can be set manually for non-OAuth users)
         display_name = Column(String, nullable=True)
         avatar_url = Column(String, nullable=True)
 
         last_login = Column(TIMESTAMP(timezone=True), nullable=True)
+
+        # One-shot marker for Askii LiteLLM auto-provisioning
+        # (app.services.litellm_provisioning). NULL = eligible; non-NULL =
+        # provisioned once at this time and permanently ineligible, even if the
+        # generated config rows are later deleted.
+        litellm_auto_provisioned_at = Column(
+            TIMESTAMP(timezone=True), nullable=True
+        )
+
+        memory_md = Column(Text, nullable=True, server_default="")
 
         # Refresh tokens for this user
         refresh_tokens = relationship(
@@ -2191,6 +2326,224 @@ else:
             back_populates="user",
             cascade="all, delete-orphan",
         )
+
+
+class AgentActionLog(BaseModel):
+    """Append-only audit trail of every tool call dispatched by the agent.
+
+    One row per ``ToolMessage`` produced; written by ``ActionLogMiddleware``
+    in its ``aafter_tool`` hook. Rows are referenced by the
+    ``/api/threads/{thread_id}/revert/{action_id}`` route to look up an
+    action's stored ``reverse_descriptor`` and replay it.
+
+    The table is intentionally narrow: large tool outputs are NOT stored
+    here. Result text lives in the langgraph checkpoint; this row only
+    keeps a short ``result_id`` (the LangChain ``ToolMessage.id`` or a
+    spilled-content path) for correlation.
+    """
+
+    __tablename__ = "agent_action_log"
+
+    thread_id = Column(
+        Integer,
+        ForeignKey("new_chat_threads.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    search_space_id = Column(
+        Integer,
+        ForeignKey("searchspaces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # ``turn_id`` historically held the LangChain ``tool_call.id``. It has
+    # been renamed to ``tool_call_id`` (with a parallel column kept for one
+    # release for back-compat). The real chat-turn id lives in
+    # ``chat_turn_id`` and is sourced from ``configurable.turn_id``.
+    turn_id = Column(String(64), nullable=True, index=True)
+    tool_call_id = Column(String(64), nullable=True, index=True)
+    chat_turn_id = Column(String(64), nullable=True, index=True)
+    message_id = Column(String(128), nullable=True, index=True)
+    tool_name = Column(String(255), nullable=False, index=True)
+    args = Column(JSONB, nullable=True)
+    result_id = Column(String(255), nullable=True)
+    reversible = Column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    reverse_descriptor = Column(JSONB, nullable=True)
+    error = Column(JSONB, nullable=True)
+    reverse_of = Column(
+        Integer,
+        ForeignKey("agent_action_log.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    created_at = Column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        server_default=text("(now() AT TIME ZONE 'utc')"),
+        index=True,
+    )
+
+    __table_args__ = (
+        Index("ix_agent_action_log_thread_created", "thread_id", "created_at"),
+        # Partial unique index enforces "at most one revert per
+        # original action". Created in migration 137 with
+        # ``WHERE reverse_of IS NOT NULL`` so non-revert rows
+        # (the vast majority) are unaffected and NULLs don't collide.
+        Index(
+            "ux_agent_action_log_reverse_of",
+            "reverse_of",
+            unique=True,
+            postgresql_where=text("reverse_of IS NOT NULL"),
+        ),
+    )
+
+
+class DocumentRevision(BaseModel):
+    """Snapshot of a :class:`Document` row taken before a mutating tool call.
+
+    Written by :class:`KnowledgeBasePersistenceMiddleware` (or its safety-net
+    `commit_staged_filesystem_state`) ahead of any NOTE / FILE / EXTENSION
+    document write. The row is referenced by ``/revert/{action_id}`` to
+    restore the original content in place.
+    """
+
+    __tablename__ = "document_revisions"
+
+    # ``ON DELETE SET NULL`` (not CASCADE) so the snapshot survives the
+    # hard-delete it describes — without that, ``rm`` would wipe the row
+    # we'd need to undo it. See migration ``134_relax_revision_fks``.
+    document_id = Column(
+        Integer,
+        ForeignKey("documents.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    search_space_id = Column(
+        Integer,
+        ForeignKey("searchspaces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    content_before = Column(Text, nullable=True)
+    title_before = Column(String, nullable=True)
+    folder_id_before = Column(Integer, nullable=True)
+    chunks_before = Column(JSONB, nullable=True)
+    metadata_before = Column("metadata_before", JSONB, nullable=True)
+    created_by_turn_id = Column(String(64), nullable=True, index=True)
+    agent_action_id = Column(
+        Integer,
+        ForeignKey("agent_action_log.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    created_at = Column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        server_default=text("(now() AT TIME ZONE 'utc')"),
+        index=True,
+    )
+
+
+class FolderRevision(BaseModel):
+    """Snapshot of a :class:`Folder` row taken before a mkdir / move."""
+
+    __tablename__ = "folder_revisions"
+
+    # ``ON DELETE SET NULL`` (not CASCADE) so the snapshot survives the
+    # hard-delete it describes — without that, ``rmdir`` would wipe the
+    # row we'd need to undo it. See migration ``134_relax_revision_fks``.
+    folder_id = Column(
+        Integer,
+        ForeignKey("folders.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    search_space_id = Column(
+        Integer,
+        ForeignKey("searchspaces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name_before = Column(String(255), nullable=True)
+    parent_id_before = Column(Integer, nullable=True)
+    position_before = Column(String(50), nullable=True)
+    created_by_turn_id = Column(String(64), nullable=True, index=True)
+    agent_action_id = Column(
+        Integer,
+        ForeignKey("agent_action_log.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    created_at = Column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        server_default=text("(now() AT TIME ZONE 'utc')"),
+        index=True,
+    )
+
+
+class AgentPermissionRule(BaseModel):
+    """Persistent permission rule consumed by :class:`PermissionMiddleware`.
+
+    Scoped at one of: search-space-wide (``user_id`` and ``thread_id`` NULL),
+    user-wide (``user_id`` set, ``thread_id`` NULL), or per-thread
+    (``thread_id`` set). Loaded at agent build time and converted to
+    :class:`Rule` instances inside the agent factory.
+    """
+
+    __tablename__ = "agent_permission_rules"
+
+    search_space_id = Column(
+        Integer,
+        ForeignKey("searchspaces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    thread_id = Column(
+        Integer,
+        ForeignKey("new_chat_threads.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    permission = Column(String(255), nullable=False)
+    pattern = Column(String(255), nullable=False, default="*", server_default="*")
+    action = Column(String(16), nullable=False)  # allow / deny / ask
+    created_at = Column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        server_default=text("(now() AT TIME ZONE 'utc')"),
+        index=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "search_space_id",
+            "user_id",
+            "thread_id",
+            "permission",
+            "pattern",
+            "action",
+            name="uq_agent_permission_rules_scope",
+        ),
+    )
 
 
 class RefreshToken(Base, TimestampMixin):

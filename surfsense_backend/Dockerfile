@@ -1,8 +1,16 @@
-FROM python:3.12-slim
+# =============================================================================
+# SurfSense Backend — Multi-stage Dockerfile
+# =============================================================================
+# Graph: base → deps → models → {e2e, production}
+#   e2e        — tests/ via additional_contexts (docker-compose.e2e.yml)
+#   production — published ghcr.io image (docker-build.yml pins target)
+# =============================================================================
+
+# ─── Stage 1: base (system deps, Pandoc, certificates) ──────────────────────
+FROM python:3.12-slim AS base
 
 WORKDIR /app
 
-# Install system dependencies including SSL tools, CUDA dependencies, and Tesseract OCR
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     python3-dev \
@@ -11,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     unzip \
     gnupg2 \
+    ffmpeg \
     espeak-ng \
     libsndfile1 \
     libgl1 \
@@ -22,71 +31,83 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Pandoc 3.x from GitHub as a fallback for Linux where pypandoc_binary
-# may not bundle pandoc (apt ships 2.17 which has broken table rendering).
-# pypandoc_binary bundles pandoc on Windows/macOS; on Linux it picks this up.
+RUN which ffmpeg && ffmpeg -version
+
+# Pandoc 3.x from GitHub Releases — apt ships 2.17 which has broken table rendering.
+# pypandoc_binary bundles pandoc on Windows/macOS; on Linux it picks up this binary.
 RUN ARCH=$(dpkg --print-architecture) && \
     wget -qO /tmp/pandoc.deb "https://github.com/jgm/pandoc/releases/download/3.9/pandoc-3.9-1-${ARCH}.deb" && \
     dpkg -i /tmp/pandoc.deb && \
     rm /tmp/pandoc.deb
 
-# Update certificates and install SSL tools
 RUN update-ca-certificates
 RUN pip install --upgrade certifi pip-system-certs
 
-# Copy requirements
-COPY pyproject.toml .
-COPY uv.lock .
-
-# Install PyTorch based on architecture
-RUN if [ "$(uname -m)" = "x86_64" ]; then \
-        pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121; \
-    else \
-        pip install --no-cache-dir torch torchvision torchaudio; \
-    fi
-
-# Install python dependencies
-RUN pip install --no-cache-dir uv && \
-    uv pip install --system --no-cache-dir -e .
-
-# Set SSL environment variables dynamically
-RUN CERTIFI_PATH=$(python -c "import certifi; print(certifi.where())") && \
-    echo "Setting SSL_CERT_FILE to $CERTIFI_PATH" && \
-    echo "export SSL_CERT_FILE=$CERTIFI_PATH" >> /root/.bashrc && \
-    echo "export REQUESTS_CA_BUNDLE=$CERTIFI_PATH" >> /root/.bashrc
 ENV SSL_CERT_FILE=/usr/local/lib/python3.12/site-packages/certifi/cacert.pem
 ENV REQUESTS_CA_BUNDLE=/usr/local/lib/python3.12/site-packages/certifi/cacert.pem
+ENV SURFSENSE_ALLOW_STATIC_FFMPEG_DOWNLOAD=FALSE
+
+
+# ─── Stage 2: deps (Python deps frozen from uv.lock) ────────────────────────
+FROM base AS deps
+
+COPY pyproject.toml uv.lock ./
+
+# Install all Python dependencies from uv.lock for deterministic builds.
+#
+# `uv pip install -e .` re-resolves from pyproject.toml and ignores uv.lock,
+# which lets prod silently drift to newer upstream versions on every rebuild
+# (e.g. deepagents 0.4.x -> 0.5.x breaking the FilesystemMiddleware imports).
+# Exporting the lock to requirements.txt and feeding it to `uv pip install`
+# pins every transitive package to the exact version captured in uv.lock.
+#
+# Note on torch/CUDA: we do NOT install torch from a separate cu* index here.
+# PyPI's torch wheels for Linux x86_64 already ship CUDA-enabled and pull
+# nvidia-cudnn-cu13, nvidia-nccl-cu13, triton, etc. as install deps (all
+# captured in uv.lock). If a specific CUDA version is needed, wire it through
+# [tool.uv.sources] in pyproject.toml so the lock stays the source of truth.
+RUN pip install --no-cache-dir uv && \
+    uv export --frozen --no-dev --no-hashes --no-emit-project \
+        --format requirements-txt -o /tmp/requirements.txt && \
+    uv pip install --system --no-cache-dir -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt
+
+
+# ─── Stage 3: models (pre-baked offline assets) ─────────────────────────────
+FROM deps AS models
 
 # Pre-download EasyOCR models to avoid runtime SSL issues
-RUN mkdir -p /root/.EasyOCR/model
-RUN wget --no-check-certificate https://github.com/JaidedAI/EasyOCR/releases/download/v1.3/english_g2.zip -O /root/.EasyOCR/model/english_g2.zip || true
-RUN wget --no-check-certificate https://github.com/JaidedAI/EasyOCR/releases/download/pre-v1.1.6/craft_mlt_25k.zip -O /root/.EasyOCR/model/craft_mlt_25k.zip || true
-RUN cd /root/.EasyOCR/model && (unzip -o english_g2.zip || true) && (unzip -o craft_mlt_25k.zip || true)
+RUN mkdir -p /root/.EasyOCR/model && \
+    wget --no-check-certificate https://github.com/JaidedAI/EasyOCR/releases/download/v1.3/english_g2.zip      -O /root/.EasyOCR/model/english_g2.zip      || true && \
+    wget --no-check-certificate https://github.com/JaidedAI/EasyOCR/releases/download/pre-v1.1.6/craft_mlt_25k.zip -O /root/.EasyOCR/model/craft_mlt_25k.zip || true && \
+    cd /root/.EasyOCR/model && \
+    (unzip -o english_g2.zip || true) && \
+    (unzip -o craft_mlt_25k.zip || true)
 
 # Pre-download Docling models
-RUN python -c "try:\n    from docling.document_converter import DocumentConverter\n    conv = DocumentConverter()\nexcept:\n    pass" || true
+RUN printf '%s\n' \
+    'try:' \
+    '    from docling.document_converter import DocumentConverter' \
+    '    DocumentConverter()' \
+    'except Exception:' \
+    '    pass' \
+    | python || true
 
-# Install Playwright browsers for web scraping if needed
-RUN pip install playwright && \
-    playwright install chromium --with-deps
+ARG EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+RUN python -c "from chonkie import AutoEmbeddings; AutoEmbeddings.get_embeddings('${EMBEDDING_MODEL}')"
 
-# Copy source code
-COPY . .
-
-# Copy and set permissions for entrypoint script
-# Use dos2unix to ensure LF line endings (fixes CRLF issues from Windows checkouts)
-COPY scripts/docker/entrypoint.sh /app/scripts/docker/entrypoint.sh
-RUN dos2unix /app/scripts/docker/entrypoint.sh && chmod +x /app/scripts/docker/entrypoint.sh
+# Install Playwright browsers (the playwright python package itself is in deps)
+RUN playwright install chromium --with-deps
 
 # Shared temp directory for file uploads between API and Worker containers.
 # Python's tempfile module uses TMPDIR, so uploaded files land here.
 # Mount the SAME volume at /shared_tmp on both API and Worker in Coolify.
 RUN mkdir -p /shared_tmp
-ENV TMPDIR=/shared_tmp
 
-# Prevent uvloop compatibility issues
 ENV PYTHONPATH=/app
 ENV UVICORN_LOOP=asyncio
+ENV TMPDIR=/shared_tmp
+ENV PYTHONUNBUFFERED=1
 
 # Tune glibc malloc to return freed memory to the OS more aggressively.
 # Without these, Python's gc.collect() frees objects but the underlying
@@ -95,11 +116,65 @@ ENV MALLOC_MMAP_THRESHOLD_=65536
 ENV MALLOC_TRIM_THRESHOLD_=131072
 ENV MALLOC_MMAP_MAX_=65536
 
+
+# ─── Stage 4: e2e (production source + tests/ + e2e entrypoint) ─────────────
+# Built via `docker buildx build --target e2e`. The default build target is
+# `production` (the last stage), so this stage is opt-in for CI only.
+#
+# `tests/` is excluded from the main build context by .dockerignore (so prod
+# can never accidentally ship test fakes). The e2e stage receives tests/
+# through an "additional context" passed by docker-compose.e2e.yml — see
+# https://docs.docker.com/reference/compose-file/build/#additional_contexts
+FROM models AS e2e
+
+# Same source copy as production. .dockerignore filters out tests/.
+COPY . .
+
+# Bring tests/ in via the named additional build context. CI passes
+#   --build-context tests-source=./tests
+# (or the equivalent additional_contexts entry in docker-compose.e2e.yml).
+COPY --from=tests-source . ./tests/
+
+# Install the project itself in editable mode. Dependencies were already
+# installed deterministically from uv.lock above, so --no-deps prevents any
+# re-resolution that could pull newer versions.
+RUN uv pip install --system --no-cache-dir --no-deps -e .
+
+COPY scripts/docker/entrypoint.e2e.sh /app/scripts/docker/entrypoint.e2e.sh
+RUN dos2unix /app/scripts/docker/entrypoint.e2e.sh && chmod +x /app/scripts/docker/entrypoint.e2e.sh
+
+# SERVICE_ROLE is overridden per service in docker-compose.e2e.yml (api / worker).
+ENV SERVICE_ROLE=api
+
+EXPOSE 8000-8001
+CMD ["/app/scripts/docker/entrypoint.e2e.sh"]
+
+
+# ─── Stage 5: production (published ghcr.io image) ──────────────────────────
+# CI pins `target: production`; also the default for `docker build` / dev compose.
+FROM models AS production
+
+# Copy source code (tests/ excluded by .dockerignore — production never ships tests).
+COPY . .
+
+# Install the project itself in editable mode. Dependencies were already
+# installed deterministically from uv.lock above, so --no-deps prevents any
+# re-resolution that could pull newer versions.
+RUN uv pip install --system --no-cache-dir --no-deps -e .
+
+# Use dos2unix to ensure LF line endings (fixes CRLF issues from Windows checkouts)
+COPY scripts/docker/entrypoint.sh /app/scripts/docker/entrypoint.sh
+RUN dos2unix /app/scripts/docker/entrypoint.sh && chmod +x /app/scripts/docker/entrypoint.sh
+
 # SERVICE_ROLE controls which process this container runs:
-#   api     – FastAPI backend only (runs migrations on startup)
+#   migrate – Run alembic upgrade head, verify zero_publication exists, exit 0.
+#             Used by the dedicated `migrations` service in docker-compose.yml
+#             so downstream services gate on `service_completed_successfully`.
+#   api     – FastAPI backend only (does NOT run migrations)
 #   worker  – Celery worker only
 #   beat    – Celery beat scheduler only
-#   all     – All three (legacy / dev default)
+#   all     – migrations + api + worker + beat (legacy / dev default;
+#             fails fast on migration error)
 ENV SERVICE_ROLE=all
 
 # Celery worker tuning (only used when SERVICE_ROLE=worker or all)
@@ -112,6 +187,5 @@ ENV CELERY_MAX_TASKS_PER_CHILD=50
 #   ""                       – both queues (default, for single-worker setups)
 ENV CELERY_QUEUES=""
 
-# Run
 EXPOSE 8000-8001
 CMD ["/app/scripts/docker/entrypoint.sh"]

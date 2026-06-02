@@ -15,8 +15,9 @@ from langchain_core.tools import tool
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import SurfsenseDocsChunk, SurfsenseDocsDocument
+from app.db import SurfsenseDocsChunk, SurfsenseDocsDocument, async_session_maker
 from app.utils.document_converters import embed_text
+from app.utils.surfsense_docs import surfsense_docs_public_url
 
 
 def format_surfsense_docs_results(results: list[tuple]) -> str:
@@ -40,13 +41,14 @@ def format_surfsense_docs_results(results: list[tuple]) -> str:
     # Group chunks by document
     grouped: dict[int, dict] = {}
     for chunk, doc in results:
+        public_url = surfsense_docs_public_url(doc.source)
         if doc.id not in grouped:
             grouped[doc.id] = {
                 "document_id": f"doc-{doc.id}",
                 "document_type": "SURFSENSE_DOCS",
                 "title": doc.title,
-                "url": doc.source,
-                "metadata": {"source": doc.source},
+                "url": public_url,
+                "metadata": {"source": doc.source, "public_url": public_url},
                 "chunks": [],
             }
         grouped[doc.id]["chunks"].append(
@@ -124,12 +126,19 @@ def create_search_surfsense_docs_tool(db_session: AsyncSession):
     """
     Factory function to create the search_surfsense_docs tool.
 
+    The tool acquires its own short-lived ``AsyncSession`` per call via
+    :data:`async_session_maker` so the closure is safe to share across
+    HTTP requests by the compiled-agent cache. Capturing a per-request
+    session here would surface stale/closed sessions on cache hits.
+
     Args:
-        db_session: Database session for executing queries
+        db_session: Reserved for registry compatibility. Per-call sessions
+            are opened via :data:`async_session_maker` inside the tool body.
 
     Returns:
         A configured tool function for searching Surfsense documentation
     """
+    del db_session  # per-call session — see docstring
 
     @tool
     async def search_surfsense_docs(query: str, top_k: int = 10) -> str:
@@ -155,10 +164,11 @@ def create_search_surfsense_docs_tool(db_session: AsyncSession):
         Returns:
             Relevant documentation content formatted with chunk IDs for citations
         """
-        return await search_surfsense_docs_async(
-            query=query,
-            db_session=db_session,
-            top_k=top_k,
-        )
+        async with async_session_maker() as db_session:
+            return await search_surfsense_docs_async(
+                query=query,
+                db_session=db_session,
+                top_k=top_k,
+            )
 
     return search_surfsense_docs

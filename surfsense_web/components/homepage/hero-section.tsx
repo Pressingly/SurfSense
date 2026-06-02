@@ -2,8 +2,9 @@
 import { ChevronDown, Download, Monitor } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import Link from "next/link";
-import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { memo, useCallback, useEffect, useRef, useState } from "react";
 import Balancer from "react-wrap-balancer";
+import { Button } from "@/components/ui/button";
 import {
 	DropdownMenu,
 	DropdownMenuContent,
@@ -12,6 +13,11 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { ExpandedMediaOverlay, useExpandedMedia } from "@/components/ui/expanded-gif-overlay";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+	GITHUB_RELEASES_URL,
+	getAssetLabel,
+	usePrimaryDownload,
+} from "@/lib/desktop-download-utils";
 import { AUTH_TYPE, isSSOAuth } from "@/lib/env-config";
 import { trackLoginAttempt } from "@/lib/posthog/events";
 import { cn } from "@/lib/utils";
@@ -58,10 +64,10 @@ const TAB_ITEMS = [
 		featured: true,
 	},
 	{
-		title: "Extreme Assist",
+		title: "Screenshot Assist",
 		description:
-			"Get inline writing suggestions powered by your knowledge base as you type in any app.",
-		src: "/homepage/hero_tutorial/extreme_assist.mp4",
+			"Use a global shortcut to select a region on your screen and attach it to your chat message.",
+		src: "/homepage/hero_tutorial/screenshot_assist.mp4",
 		featured: true,
 	},
 	{
@@ -148,14 +154,14 @@ export function HeroSection() {
 				</h1>
 				<div className="mt-4 flex w-full flex-col items-start justify-between gap-4 md:mt-12 md:flex-row md:items-end md:gap-10">
 					<div>
-						<h2
+						<p
 							className={cn(
 								"relative mb-8 max-w-2xl text-left text-sm tracking-wide text-neutral-600 antialiased sm:text-base md:text-xl dark:text-neutral-400"
 							)}
 						>
-							An open source, privacy focused alternative to NotebookLM for teams with no data
-							limits.
-						</h2>
+							A free, open source NotebookLM alternative for teams with no data limits. Use ChatGPT,
+							Claude AI, and any AI model for free.
+						</p>
 
 						<div className="relative mb-4 flex w-full flex-col justify-center gap-y-2 sm:flex-row sm:justify-start sm:space-y-0 sm:space-x-4">
 							<DownloadButton />
@@ -183,190 +189,70 @@ function GetStartedButton() {
 
 	if (isProxyLogin) {
 		return (
-			<button
+			<Button
 				type="button"
+				variant="ghost"
 				onClick={handleProxyLogin}
-				whileHover="hover"
-				whileTap={{ scale: 0.98 }}
-				initial="idle"
-				className="group relative z-20 flex h-11 w-full cursor-pointer items-center justify-center gap-3 overflow-hidden rounded-xl bg-white px-6 py-2.5 text-sm font-semibold text-neutral-700 shadow-lg ring-1 ring-neutral-200/50 transition-shadow duration-300 hover:shadow-xl sm:w-56 dark:bg-neutral-900 dark:text-neutral-200 dark:ring-neutral-700/50"
-				variants={{
-					idle: { scale: 1, y: 0 },
-					hover: { scale: 1.02, y: -2 },
-				}}
+				className="h-14 w-full cursor-pointer gap-3 rounded-lg border border-white bg-white text-center text-base font-medium text-[#1f1f1f] shadow-sm transition duration-150 hover:bg-zinc-100 hover:text-[#1f1f1f] sm:w-56 dark:border-white"
 			>
-				{/* Animated gradient background on hover */}
-				<motion.div
-					className="absolute inset-0 bg-linear-to-r from-blue-50 via-green-50 to-yellow-50 dark:from-blue-950/30 dark:via-green-950/30 dark:to-yellow-950/30"
-					variants={{
-						idle: { opacity: 0 },
-						hover: { opacity: 1 },
-					}}
-					transition={{ duration: 0.3 }}
-				/>
-				{/* Show Google logo only for native Google OAuth, not SSO */}
-				{isGoogleAuth && (
-					<motion.div
-						className="relative"
-						variants={{
-							idle: { rotate: 0 },
-							hover: { rotate: [0, -8, 8, 0] },
-						}}
-						transition={{ duration: 0.4, ease: "easeInOut" }}
-					>
-						<GoogleLogo className="h-5 w-5" />
-					</motion.div>
-				)}
-				<span className="relative">{isGoogleAuth ? "Continue with Google" : "Sign In"}</span>
-			</motion.button>
+				{isGoogleAuth && <GoogleLogo className="h-5 w-5" />}
+				<span>{isGoogleAuth ? "Continue with Google" : "Sign In"}</span>
+			</Button>
 		);
 	}
 
 	return (
-		<Link
-			href="/login"
-			className="flex h-14 w-full items-center justify-center rounded-lg bg-black text-center text-base font-medium text-white shadow-sm ring-1 shadow-black/10 ring-black/10 transition duration-150 active:scale-98 sm:w-52 dark:bg-white dark:text-black"
+		<Button
+			asChild
+			variant="ghost"
+			className="h-14 w-full rounded-lg bg-black text-center text-base font-medium text-white shadow-sm ring-1 shadow-black/10 ring-black/10 transition duration-150 active:scale-98 hover:bg-black sm:w-52 dark:bg-white dark:text-black dark:hover:bg-white"
 		>
-			Get Started
-		</Link>
+			<Link href="/login">Get Started</Link>
+		</Button>
 	);
 }
 
-type OSInfo = {
-	os: "macOS" | "Windows" | "Linux";
-	arch: "arm64" | "x64";
-};
-
-function useUserOS(): OSInfo {
-	const [info, setInfo] = useState<OSInfo>({ os: "macOS", arch: "arm64" });
-	useEffect(() => {
-		const ua = navigator.userAgent;
-		let os: OSInfo["os"] = "macOS";
-		let arch: OSInfo["arch"] = "x64";
-
-		if (/Windows/i.test(ua)) {
-			os = "Windows";
-			arch = "x64";
-		} else if (/Linux/i.test(ua)) {
-			os = "Linux";
-			arch = "x64";
-		} else {
-			os = "macOS";
-			arch = /Mac/.test(ua) && !/Intel/.test(ua) ? "arm64" : "arm64";
-		}
-
-		const uaData = (navigator as Navigator & { userAgentData?: { architecture?: string } })
-			.userAgentData;
-		if (uaData?.architecture === "arm") arch = "arm64";
-		else if (uaData?.architecture === "x86") arch = "x64";
-
-		setInfo({ os, arch });
-	}, []);
-	return info;
-}
-
-interface ReleaseAsset {
-	name: string;
-	url: string;
-}
-
-function useLatestRelease() {
-	const [assets, setAssets] = useState<ReleaseAsset[]>([]);
-
-	useEffect(() => {
-		const controller = new AbortController();
-		fetch("https://api.github.com/repos/MODSetter/SurfSense/releases/latest", {
-			signal: controller.signal,
-		})
-			.then((r) => r.json())
-			.then((data) => {
-				if (data?.assets) {
-					setAssets(
-						data.assets
-							.filter((a: { name: string }) => /\.(exe|dmg|AppImage|deb)$/.test(a.name))
-							.map((a: { name: string; browser_download_url: string }) => ({
-								name: a.name,
-								url: a.browser_download_url,
-							}))
-					);
-				}
-			})
-			.catch(() => {});
-		return () => controller.abort();
-	}, []);
-
-	return assets;
-}
-
-const ASSET_LABELS: Record<string, string> = {
-	".exe": "Windows (exe)",
-	"-arm64.dmg": "macOS Apple Silicon (dmg)",
-	"-x64.dmg": "macOS Intel (dmg)",
-	"-arm64.zip": "macOS Apple Silicon (zip)",
-	"-x64.zip": "macOS Intel (zip)",
-	".AppImage": "Linux (AppImage)",
-	".deb": "Linux (deb)",
-};
-
-function getAssetLabel(name: string): string {
-	for (const [suffix, label] of Object.entries(ASSET_LABELS)) {
-		if (name.endsWith(suffix)) return label;
-	}
-	return name;
-}
-
 function DownloadButton() {
-	const { os, arch } = useUserOS();
-	const assets = useLatestRelease();
-
-	const { primary, alternatives } = useMemo(() => {
-		if (assets.length === 0) return { primary: null, alternatives: [] };
-
-		const matchers: Record<string, (n: string) => boolean> = {
-			Windows: (n) => n.endsWith(".exe"),
-			macOS: (n) => n.endsWith(`-${arch}.dmg`),
-			Linux: (n) => n.endsWith(".AppImage"),
-		};
-
-		const match = matchers[os];
-		const primary = assets.find((a) => match(a.name)) ?? null;
-		const alternatives = assets.filter((a) => a !== primary);
-		return { primary, alternatives };
-	}, [assets, os, arch]);
+	const { os, primary, alternatives } = usePrimaryDownload();
 
 	const fallbackUrl = GITHUB_RELEASES_URL;
 
 	if (!primary) {
 		return (
-			<a
-				href={fallbackUrl}
-				target="_blank"
-				rel="noopener noreferrer"
-				className="flex h-14 w-full items-center justify-center gap-2 rounded-lg border border-neutral-200 bg-white text-center text-base font-medium text-neutral-700 shadow-sm transition duration-150 active:scale-98 hover:bg-neutral-50 sm:w-auto sm:px-6 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-200 dark:hover:bg-neutral-800"
+			<Button
+				asChild
+				variant="ghost"
+				className="h-14 w-full gap-2 rounded-lg border border-neutral-200 bg-white text-center text-base font-medium text-neutral-700 shadow-sm transition duration-150 active:scale-98 hover:bg-neutral-50 sm:w-auto sm:px-6 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-200 dark:hover:bg-neutral-800"
 			>
-				<Download className="size-4" />
-				Download for {os}
-			</a>
+				<a href={fallbackUrl} target="_blank" rel="noopener noreferrer">
+					<Download className="size-4" />
+					Download for {os}
+				</a>
+			</Button>
 		);
 	}
 
 	return (
 		<div className="flex h-14 w-full items-stretch sm:w-auto">
-			<a
-				href={primary.url}
-				className="flex flex-1 items-center justify-center gap-2 rounded-l-lg border border-r-0 border-neutral-200 bg-white px-5 text-base font-medium text-neutral-700 shadow-sm transition duration-150 active:scale-[0.99] hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-200 dark:hover:bg-neutral-800"
+			<Button
+				asChild
+				variant="ghost"
+				className="h-auto flex-1 gap-2 rounded-l-lg rounded-r-none border border-r-0 border-neutral-200 bg-white px-5 text-base font-medium text-neutral-700 shadow-sm transition duration-150 active:scale-[0.99] hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-200 dark:hover:bg-neutral-800"
 			>
-				<Download className="size-4 shrink-0" />
-				Download for {os}
-			</a>
+				<a href={primary.url}>
+					<Download className="size-4 shrink-0" />
+					Download for {os}
+				</a>
+			</Button>
 			<DropdownMenu>
 				<DropdownMenuTrigger asChild>
-					<button
+					<Button
 						type="button"
-						className="flex items-center justify-center rounded-r-lg border border-neutral-200 bg-white px-2.5 text-neutral-500 shadow-sm transition duration-150 hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-400 dark:hover:bg-neutral-800"
+						variant="ghost"
+						className="h-auto rounded-l-none rounded-r-lg border border-neutral-200 bg-white px-2.5 text-neutral-500 shadow-sm transition duration-150 hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-400 dark:hover:bg-neutral-800"
 					>
 						<ChevronDown className="size-4" />
-					</button>
+					</Button>
 				</DropdownMenuTrigger>
 				<DropdownMenuContent align="end" className="w-64">
 					{alternatives.map((asset) => (
@@ -410,11 +296,12 @@ const BrowserWindow = () => {
 					<div className="no-visible-scrollbar flex min-w-0 shrink flex-row items-center justify-start gap-2 overflow-x-auto mask-l-from-98% py-0.5 pr-2 pl-2 md:pl-4">
 						{TAB_ITEMS.map((item, index) => (
 							<React.Fragment key={item.title}>
-								<button
+								<Button
 									type="button"
+									variant="ghost"
 									onClick={() => setSelectedIndex(index)}
 									className={cn(
-										"flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-xs transition duration-150 hover:bg-white sm:text-sm dark:hover:bg-neutral-950",
+										"h-auto shrink-0 gap-1.5 rounded-md px-2 py-1 text-xs transition duration-150 hover:bg-white sm:text-sm dark:hover:bg-neutral-950",
 										selectedIndex === index &&
 											!item.featured &&
 											"bg-white shadow ring-1 shadow-black/10 ring-black/10 dark:bg-neutral-900",
@@ -437,7 +324,7 @@ const BrowserWindow = () => {
 											<TooltipContent side="bottom">Desktop app only</TooltipContent>
 										</Tooltip>
 									)}
-								</button>
+								</Button>
 								{index !== TAB_ITEMS.length - 1 && (
 									<div className="h-4 w-px shrink-0 rounded-full bg-neutral-300 dark:bg-neutral-700" />
 								)}
@@ -480,13 +367,14 @@ const BrowserWindow = () => {
 									</p>
 								</div>
 							</div>
-							<button
+							<Button
 								type="button"
-								className="cursor-pointer bg-neutral-50 p-2 sm:p-3 dark:bg-neutral-950 w-full"
+								variant="ghost"
+								className="h-auto w-full cursor-pointer rounded-none bg-neutral-50 p-2 hover:bg-neutral-50 sm:p-3 dark:bg-neutral-950 dark:hover:bg-neutral-950"
 								onClick={open}
 							>
-								<TabVideo src={selectedItem.src} />
-							</button>
+								<TabVideo key={selectedItem.src} src={selectedItem.src} />
+							</Button>
 						</motion.div>
 					</AnimatePresence>
 				</div>
@@ -511,7 +399,7 @@ const TabVideo = memo(function TabVideo({ src }: { src: string }) {
 		if (!video) return;
 		video.currentTime = 0;
 		video.play().catch(() => {});
-	}, [src]);
+	}, []);
 
 	const handleCanPlay = useCallback(() => {
 		setHasLoaded(true);
@@ -536,5 +424,3 @@ const TabVideo = memo(function TabVideo({ src }: { src: string }) {
 		</div>
 	);
 });
-
-const GITHUB_RELEASES_URL = "https://github.com/MODSetter/SurfSense/releases/latest";

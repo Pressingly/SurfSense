@@ -12,7 +12,7 @@ WORKDIR /app
 RUN corepack enable pnpm && corepack prepare pnpm@10.33.4 --activate
 
 # Copy package files
-COPY package.json pnpm-lock.yaml* .npmrc* ./
+COPY package.json pnpm-lock.yaml* pnpm-workspace.yaml* .npmrc* ./
 
 # First copy the config file and content to avoid fumadocs-mdx postinstall error
 COPY source.config.ts ./
