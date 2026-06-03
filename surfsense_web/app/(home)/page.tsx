@@ -1,6 +1,5 @@
 "use client";
 
-import { useRouter } from "next/navigation";
 import { useEffect } from "react";
 
 import {
@@ -26,11 +25,9 @@ import {
  * redirect take the user where they need to go.
  */
 export default function HomePage() {
-	const router = useRouter();
-
 	useEffect(() => {
 		if (getBearerToken()) {
-			router.replace("/dashboard");
+			window.location.href = "/dashboard";
 			return;
 		}
 
@@ -42,13 +39,13 @@ export default function HomePage() {
 			setBearerToken(token);
 			if (refreshToken) setRefreshToken(refreshToken);
 			clearSSOCookies();
-			router.replace("/dashboard");
+			window.location.href = "/dashboard";
 			return;
 		}
 
 		// No JWT anywhere → start the SSO flow.
 		window.location.href = `${process.env.NEXT_PUBLIC_FASTAPI_BACKEND_URL}/auth/jwt/proxy-login`;
-	}, [router]);
+	}, []);
 
 	// Splash — neutral background, no UI flash during the redirect dance.
 	return <div className="min-h-screen bg-gray-50 dark:bg-black" />;
