@@ -927,14 +927,23 @@ async def ensure_org_litellm_keys_for_admin(
 
     Best-effort: swallows every exception so callers can wire this into the
     login hot path without guards. Returns ``False`` for any skipped/failed
-    outcome (gate off, no SMB space configured/created yet, caller is not the
-    org-space admin, transient upstream error) and ``True`` only when the org
-    space is confirmed provisioned.
+    outcome (gate off, no mPass access token, no SMB space configured/created
+    yet, caller is not the org-space admin, transient upstream error) and
+    ``True`` only when the org space is confirmed provisioned.
 
     ``cfg`` / ``access_token`` semantics: see
     :func:`ensure_personal_litellm_keys`.
     """
     if not should_auto_provision(cfg):
+        return False
+
+    # Provisioning mints an Askii key from the mPass Cognito access token —
+    # skip the SMB-space lookup + ownership query entirely when there is no
+    # token (non-mPass logins: fastapi-users JWT, Google OAuth, dev hitting the
+    # backend directly). The core ensure_org_litellm_keys re-checks this as
+    # defense-in-depth; here it just avoids the two DB round-trips. The marker
+    # stays NULL, so the admin's next mPass login retries.
+    if access_token is None:
         return False
 
     user_id: uuid.UUID | None = None

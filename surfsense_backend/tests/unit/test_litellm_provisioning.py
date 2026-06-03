@@ -1480,6 +1480,32 @@ async def test_org_wrapper_returns_false_when_feature_disabled(
     find_smb.assert_not_awaited()
 
 
+async def test_org_wrapper_skips_db_when_token_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No mPass token → return False before any DB work (can't mint a key
+    without it). Covers non-mPass logins (JWT/OAuth, dev-direct)."""
+    find_smb = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        "app.services.litellm_provisioning.find_smb_search_space", find_smb
+    )
+    is_owner = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "app.services.litellm_provisioning.is_search_space_owner", is_owner
+    )
+
+    ok = await ensure_org_litellm_keys_for_admin(
+        session=AsyncMock(),
+        user=_FakeUser(),
+        access_token=None,
+        cfg=_cfg_ns(),
+    )
+
+    assert ok is False
+    find_smb.assert_not_awaited()
+    is_owner.assert_not_awaited()
+
+
 async def test_org_wrapper_returns_false_when_no_org_space(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
