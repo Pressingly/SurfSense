@@ -135,7 +135,10 @@ async def test_on_after_login_commits_session_after_provisioning() -> None:
     the wrapper returns. Otherwise the SAVEPOINT-released writes would
     be rolled back when the session closes.
 
-    Empty commit on the marker fast path is acceptable (cheap no-op).
+    The hook runs TWO provisioning steps — personal then org-space — each
+    with its own commit so a failure in one cannot suppress the other.
+    Empty commits on the marker / gate fast paths are acceptable (cheap
+    no-ops).
     """
     user = _FakeUser(is_active=True)
     request = _make_request()
@@ -147,6 +150,10 @@ async def test_on_after_login_commits_session_after_provisioning() -> None:
             "app.users.ensure_personal_litellm_keys_for_user",
             new=AsyncMock(),
         ),
+        patch(
+            "app.users.ensure_org_litellm_keys_for_admin",
+            new=AsyncMock(),
+        ),
         patch.object(
             manager,
             "_update_last_login_throttled",
@@ -155,12 +162,17 @@ async def test_on_after_login_commits_session_after_provisioning() -> None:
     ):
         await manager.on_after_login(user, request=request)
 
-    user_db.session.commit.assert_awaited_once()
+    # One commit after the personal step, one after the org step.
+    assert user_db.session.commit.await_count == 2
 
 
 async def test_on_after_login_swallows_commit_failure() -> None:
     """Commit failure after provisioning must NOT propagate — login flows
-    must never break on bookkeeping. Logged + swallowed."""
+    must never break on bookkeeping. Logged + swallowed.
+
+    Both commit boundaries (personal + org-space) are attempted; a failure
+    in either is swallowed independently.
+    """
     user = _FakeUser(is_active=True)
     request = _make_request()
     user_db = _make_user_db_with_session()
@@ -172,6 +184,10 @@ async def test_on_after_login_swallows_commit_failure() -> None:
             "app.users.ensure_personal_litellm_keys_for_user",
             new=AsyncMock(),
         ),
+        patch(
+            "app.users.ensure_org_litellm_keys_for_admin",
+            new=AsyncMock(),
+        ),
         patch.object(
             manager,
             "_update_last_login_throttled",
@@ -181,7 +197,47 @@ async def test_on_after_login_swallows_commit_failure() -> None:
         # Must not raise.
         await manager.on_after_login(user, request=request)
 
-    user_db.session.commit.assert_awaited_once()
+    # Both commits attempted; both failures swallowed.
+    assert user_db.session.commit.await_count == 2
+
+
+async def test_on_after_login_fires_org_provisioning_when_user_active() -> None:
+    """Active user with a request triggers org-space provisioning too, with
+    the same session + access token as the personal step (token read once)."""
+    user = _FakeUser(is_active=True)
+    request = _make_request()
+    user_db = _make_user_db_with_session()
+    manager = UserManager(user_db)
+
+    with (
+        patch(
+            "app.users.ensure_personal_litellm_keys_for_user",
+            new=AsyncMock(),
+        ) as personal_wrapper,
+        patch(
+            "app.users.ensure_org_litellm_keys_for_admin",
+            new=AsyncMock(),
+        ) as org_wrapper,
+        patch.object(
+            manager,
+            "_update_last_login_throttled",
+            new=AsyncMock(),
+        ),
+    ):
+        await manager.on_after_login(user, request=request)
+
+    from app.users import config as app_cfg
+
+    assert org_wrapper.await_count == 1
+    org_kwargs = org_wrapper.await_args.kwargs
+    assert org_kwargs["session"] is user_db.session
+    assert org_kwargs["user"] is user
+    assert org_kwargs["cfg"] is app_cfg
+    # The org step reuses the exact access token read once for the personal
+    # step (single read_mpass_access_token call shared across both).
+    assert (
+        org_kwargs["access_token"] == personal_wrapper.await_args.kwargs["access_token"]
+    )
 
 
 async def test_on_after_login_skips_provisioning_when_request_is_none() -> None:

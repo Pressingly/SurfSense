@@ -1445,6 +1445,12 @@ class SearchSpace(BaseModel, TimestampMixin):
         Integer, nullable=True, default=0
     )  # For vision/screenshot analysis, defaults to Auto mode
 
+    # Org-space one-shot LiteLLM auto-provision marker (Moneta fork).
+    # NULL → eligible; non-NULL → provisioned once, permanently ineligible.
+    # SearchSpace-scoped analogue of User.litellm_auto_provisioned_at; stamped
+    # when the is_owner admin of the shared SMB/Organization space logs in.
+    litellm_auto_provisioned_at = Column(TIMESTAMP(timezone=True), nullable=True)
+
     ai_file_sort_enabled = Column(
         Boolean, nullable=False, default=False, server_default="false"
     )

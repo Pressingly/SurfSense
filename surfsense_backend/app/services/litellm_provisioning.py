@@ -122,6 +122,8 @@ from app.db import (
     VisionLLMConfig,
     VisionProvider,
 )
+from app.services.smb_auto_join import find_smb_search_space
+from app.utils.rbac import is_search_space_owner
 
 if TYPE_CHECKING:
     import httpx
@@ -541,6 +543,77 @@ async def _persist_and_wire(
     user.litellm_auto_provisioned_at = now
 
 
+async def _check_space_marker_under_lock(
+    session: AsyncSession,
+    search_space_id: int,
+) -> None:
+    """Acquire a row lock on the org ``SearchSpace`` and re-check its marker.
+
+    SearchSpace-scoped analogue of :func:`_check_marker_under_lock`. Caller
+    MUST run this inside ``session.begin_nested()`` so the lock (and any
+    rollback) is scoped to the SAVEPOINT.
+
+    Raises :class:`_RaceLossError` when a sibling request stamped
+    ``SearchSpace.litellm_auto_provisioned_at`` while our Askii call was in
+    flight. Returns ``None`` when this caller holds the lock and the marker is
+    still NULL — caller proceeds with the insert.
+    """
+    result = await session.execute(
+        select(SearchSpace.litellm_auto_provisioned_at)
+        .where(SearchSpace.id == search_space_id)
+        .with_for_update()
+    )
+    if result.scalar_one_or_none() is not None:
+        raise _RaceLossError
+
+
+async def _persist_and_wire_space(
+    *,
+    session: AsyncSession,
+    search_space: SearchSpace,
+    search_space_id: int,
+    rows: tuple[NewLLMConfig, NewLLMConfig, ImageGenerationConfig, VisionLLMConfig],
+) -> None:
+    """Add the four rows, wire the SearchSpace FKs, stamp the space marker.
+
+    SearchSpace-scoped analogue of :func:`_persist_and_wire`. Flush-only (no
+    commit, no rollback) — caller owns transaction boundaries. Because the
+    one-shot marker lives on the same ``searchspaces`` row as the four FKs, a
+    single ``UPDATE`` wires the FKs and stamps the marker together (the
+    personal path needs two UPDATEs since its marker is on the ``user`` table).
+    Writes go through an explicit ``UPDATE ... WHERE`` rather than ORM attribute
+    mutation because ``search_space`` is frequently detached from this
+    service's session; the Python object is mirrored afterwards so the caller's
+    in-request view stays consistent.
+    """
+    agent_row, doc_summary_row, image_row, vision_row = rows
+    for row in rows:
+        session.add(row)
+    await session.flush()  # populate .id on each new row
+
+    now = datetime.now(UTC)
+    await session.execute(
+        update(SearchSpace)
+        .where(SearchSpace.id == search_space_id)
+        .values(
+            agent_llm_id=agent_row.id,
+            document_summary_llm_id=doc_summary_row.id,
+            image_generation_config_id=image_row.id,
+            vision_llm_config_id=vision_row.id,
+            litellm_auto_provisioned_at=now,
+        )
+    )
+
+    # Mirror onto the Python object (not load-bearing — the UPDATE above owns
+    # persistence). Keeps the caller's in-memory view consistent and lets tests
+    # assert against attributes without a DB round-trip.
+    search_space.agent_llm_id = agent_row.id
+    search_space.document_summary_llm_id = doc_summary_row.id
+    search_space.image_generation_config_id = image_row.id
+    search_space.vision_llm_config_id = vision_row.id
+    search_space.litellm_auto_provisioned_at = now
+
+
 # ---------------------------------------------------------------------------
 # Upstream Askii call
 # ---------------------------------------------------------------------------
@@ -718,6 +791,186 @@ async def ensure_personal_litellm_keys_for_user(
         return False
 
 
+async def ensure_org_litellm_keys(
+    *,
+    session: AsyncSession,
+    admin_user: User,
+    org_search_space: SearchSpace,
+    access_token: str | None,
+    cfg: Config,
+    http_client: httpx.AsyncClient | None = None,
+) -> bool:
+    """Auto-provision a fresh Askii key onto the shared Organization space.
+
+    Org-space analogue of :func:`ensure_personal_litellm_keys`. One-shot per
+    org space via ``org_search_space.litellm_auto_provisioned_at`` (the
+    SearchSpace marker, NOT the per-user one): the first ``is_owner`` admin to
+    log in mints one fresh upstream Askii key under their mPass token and wires
+    the four ``SearchSpace.*_id`` FKs onto the org space; subsequent
+    admins/logins short-circuit on the marker.
+
+    Same shape and guarantees as the personal path: the outbound Askii call
+    happens *without* a DB lock; the marker re-check + writes run inside a
+    ``session.begin_nested()`` SAVEPOINT with ``SELECT ... FOR UPDATE`` on the
+    org ``SearchSpace`` row (race-loss → ``_RaceLossError`` → SAVEPOINT
+    rollback → return ``True``, orphaned upstream key auto-expires).
+
+    Best-effort contract: never raises; returns ``False`` on any skip/failure
+    so the next-login retry path tries again. Does NOT commit or rollback the
+    caller's session (caller owns the commit).
+
+    ``admin_user`` is the org-space owner whose mPass ``access_token`` mints the
+    key and who owns the four config rows. ``cfg`` / ``access_token`` /
+    ``http_client`` semantics match :func:`ensure_personal_litellm_keys`.
+    """
+    if not should_auto_provision(cfg):
+        return False
+
+    user_id: uuid.UUID | None = None
+    search_space_id: int | None = None
+    askii_key_name: str | None = None
+
+    try:
+        user_id = admin_user.id
+        search_space_id = org_search_space.id
+
+        if org_search_space.litellm_auto_provisioned_at is not None:
+            return True
+
+        if access_token is None:
+            logger.warning(
+                "Org LiteLLM auto-provision skipped: missing mPass access token "
+                "for admin %s on org search_space %s",
+                user_id,
+                search_space_id,
+            )
+            return False
+
+        models = _resolve_models(cfg)
+        response = await _provision_via_askii(
+            access_token=access_token,
+            base_url=cfg.ASKII_BASE_URL,
+            duration_days=cfg.ASKII_LITELLM_KEY_DURATION_DAYS,
+            models=models,
+            user_id=user_id,
+            http_client=http_client,
+        )
+        if response is None:
+            return False
+
+        askii_key_name = response.key_name
+        api_key = response.api_key.get_secret_value()
+        api_base = cfg.ASKII_LITELLM_BASE_URL or cfg.ASKII_BASE_URL
+        rows = _build_config_rows(
+            user_id=user_id,
+            search_space_id=search_space_id,
+            models=models,
+            api_key=api_key,
+            api_base=api_base,
+        )
+
+        # SAVEPOINT isolates lock + writes from the caller's outer transaction
+        # (see ensure_personal_litellm_keys / module docstring).
+        try:
+            async with session.begin_nested():
+                await _check_space_marker_under_lock(session, search_space_id)
+                await _persist_and_wire_space(
+                    session=session,
+                    search_space=org_search_space,
+                    search_space_id=search_space_id,
+                    rows=rows,
+                )
+        except _RaceLossError:
+            logger.debug(
+                "Org LiteLLM auto-provision lost a race for org search_space %s — "
+                "upstream Askii key '%s' is orphaned (auto-expires)",
+                search_space_id,
+                askii_key_name,
+            )
+            return True
+
+        logger.info(
+            "Auto-provisioned org LiteLLM key '%s' (key_name=%s) and 4 config rows "
+            "on org search_space %s by admin %s",
+            LITELLM_KEY_ALIAS,
+            askii_key_name,
+            search_space_id,
+            user_id,
+        )
+        return True
+
+    except Exception:
+        logger.exception(
+            "Org LiteLLM auto-provision unexpectedly raised for admin %s on org "
+            "search_space %s — swallowed per best-effort contract; retry on next login",
+            user_id,
+            search_space_id,
+        )
+        return False
+
+
+async def ensure_org_litellm_keys_for_admin(
+    *,
+    session: AsyncSession,
+    user: User,
+    access_token: str | None,
+    cfg: Config,
+) -> bool:
+    """Provision the shared Organization space if ``user`` is its ``is_owner`` admin.
+
+    High-level entry point for :meth:`app.users.UserManager.on_after_login`.
+    Locates the shared SMB/Organization ``SearchSpace`` by name
+    (:func:`app.services.smb_auto_join.find_smb_search_space`), short-circuits
+    on its one-shot marker, gates on ``is_owner`` membership
+    (:func:`app.utils.rbac.is_search_space_owner`), then delegates to
+    :func:`ensure_org_litellm_keys`.
+
+    Best-effort: swallows every exception so callers can wire this into the
+    login hot path without guards. Returns ``False`` for any skipped/failed
+    outcome (gate off, no SMB space configured/created yet, caller is not the
+    org-space admin, transient upstream error) and ``True`` only when the org
+    space is confirmed provisioned.
+
+    ``cfg`` / ``access_token`` semantics: see
+    :func:`ensure_personal_litellm_keys`.
+    """
+    if not should_auto_provision(cfg):
+        return False
+
+    user_id: uuid.UUID | None = None
+    try:
+        user_id = user.id
+
+        org_search_space = await find_smb_search_space(session)
+        if org_search_space is None:
+            # No shared SMB/Organization space configured or created yet —
+            # nothing to provision. Retry on the admin's next login.
+            return False
+
+        if org_search_space.litellm_auto_provisioned_at is not None:
+            return True
+
+        if not await is_search_space_owner(session, user_id, org_search_space.id):
+            # Only the is_owner admin provisions the shared key. Any other
+            # member is a no-op (not an error).
+            return False
+
+        return await ensure_org_litellm_keys(
+            session=session,
+            admin_user=user,
+            org_search_space=org_search_space,
+            access_token=access_token,
+            cfg=cfg,
+        )
+    except Exception:
+        logger.exception(
+            "ensure_org_litellm_keys_for_admin: hook failed for user %s — "
+            "will retry on next login",
+            user_id,
+        )
+        return False
+
+
 __all__ = [
     "ALL_ROW_NAMES",
     "LITELLM_KEY_ALIAS",
@@ -725,6 +978,8 @@ __all__ = [
     "ROW_NAME_DOC_SUMMARY",
     "ROW_NAME_IMAGE",
     "ROW_NAME_VISION",
+    "ensure_org_litellm_keys",
+    "ensure_org_litellm_keys_for_admin",
     "ensure_personal_litellm_keys",
     "ensure_personal_litellm_keys_for_user",
     "read_mpass_access_token",

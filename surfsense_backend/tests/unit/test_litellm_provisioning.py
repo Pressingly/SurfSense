@@ -47,6 +47,8 @@ from app.services.litellm_provisioning import (
     ROW_NAME_DOC_SUMMARY,
     ROW_NAME_IMAGE,
     ROW_NAME_VISION,
+    ensure_org_litellm_keys,
+    ensure_org_litellm_keys_for_admin,
     ensure_personal_litellm_keys,
     ensure_personal_litellm_keys_for_user,
     read_mpass_access_token,
@@ -94,13 +96,21 @@ class _FakeSearchSpace:
     we use a real class to make FK assertions meaningful.
     """
 
-    def __init__(self, *, user_id: uuid.UUID, ss_id: int = 1) -> None:
+    def __init__(
+        self,
+        *,
+        user_id: uuid.UUID,
+        ss_id: int = 1,
+        provisioned_at: datetime | None = None,
+    ) -> None:
         self.id = ss_id
         self.user_id = user_id
         self.agent_llm_id = 0
         self.document_summary_llm_id = 0
         self.image_generation_config_id = 0
         self.vision_llm_config_id = 0
+        # Org-space one-shot marker (SearchSpace-scoped). NULL = eligible.
+        self.litellm_auto_provisioned_at = provisioned_at
 
 
 def _make_session(*, lock_finds_marker: bool = False) -> AsyncMock:
@@ -1162,3 +1172,454 @@ async def test_core_does_not_raise_when_user_id_capture_fails(
     # caller's pending writes).
     session.begin_nested.assert_not_called()
     session.rollback.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# ensure_org_litellm_keys — shared Organization-space provisioning (core)
+# ---------------------------------------------------------------------------
+
+
+async def test_org_happy_path_inserts_four_rows_links_fks_and_stamps_space_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Org analogue of the personal happy path: four rows are inserted and
+    the org SearchSpace's four FKs are wired, but the one-shot marker is
+    stamped on the SEARCH SPACE (not the admin user)."""
+    cfg = _set_config(
+        monkeypatch,
+        ASKII_BASE_URL="https://api.askii.test",
+        ASKII_LITELLM_BASE_URL="https://litellm.askii.test",
+        ASKII_AGENT_MODEL="gpt-5.4-mini",
+        ASKII_DOCUMENT_SUMMARY_MODEL="gpt-doc-summary",
+        ASKII_IMAGE_GEN_MODEL="gpt-image-1.5",
+        ASKII_VISION_MODEL="gpt-5.4-nano",
+        ASKII_LITELLM_KEY_DURATION_DAYS=30,
+    )
+    session = _make_session()
+    admin = _FakeUser()
+    org_ss = _FakeSearchSpace(user_id=admin.id, ss_id=77)
+
+    before = datetime.now(UTC)
+    recorded: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        recorded.append(req)
+        return httpx.Response(
+            200,
+            json={
+                "api_key": "sk-org-key-1234567890",
+                "key_name": "moneta-org-001",
+                "user_id": "askii-user-1",
+                "expires": "2026-08-01T00:00:00Z",
+            },
+        )
+
+    client = _mock_transport(handler)
+    try:
+        ok = await ensure_org_litellm_keys(
+            session=session,
+            admin_user=admin,
+            org_search_space=org_ss,
+            access_token="cognito-jwt",
+            http_client=client,
+            cfg=cfg,
+        )
+    finally:
+        await client.aclose()
+
+    assert ok is True
+
+    # exactly one Askii call with the admin's token + key alias
+    assert len(recorded) == 1
+    assert recorded[0].url.path == "/platform/provision-key"
+    sent = json.loads(recorded[0].content)
+    assert sent["mpass_token"] == "cognito-jwt"
+    assert sent["key_alias"] == LITELLM_KEY_ALIAS
+    assert sent["duration_days"] == 30
+    assert sent["default_model"] == "gpt-5.4-mini"
+
+    # four rows, all scoped to the ORG space and owned by the admin user
+    llm_rows = [o for o in session._added if isinstance(o, NewLLMConfig)]
+    image_rows = [o for o in session._added if isinstance(o, ImageGenerationConfig)]
+    vision_rows = [o for o in session._added if isinstance(o, VisionLLMConfig)]
+    assert len(llm_rows) == 2
+    assert len(image_rows) == 1
+    assert len(vision_rows) == 1
+    for row in session._added:
+        assert row.search_space_id == 77
+        assert row.user_id == admin.id
+        assert row.api_key == "sk-org-key-1234567890"
+
+    # all four FKs wired up on the org space
+    by_name = {r.name: r for r in llm_rows}
+    assert org_ss.agent_llm_id == by_name[ROW_NAME_AGENT].id
+    assert org_ss.document_summary_llm_id == by_name[ROW_NAME_DOC_SUMMARY].id
+    assert org_ss.image_generation_config_id == image_rows[0].id
+    assert org_ss.vision_llm_config_id == vision_rows[0].id
+
+    # one-shot marker stamped on the SEARCH SPACE …
+    assert org_ss.litellm_auto_provisioned_at is not None
+    assert before <= org_ss.litellm_auto_provisioned_at <= datetime.now(UTC)
+    # … and NOT on the admin user (org path is independent of the personal
+    # per-user marker).
+    assert admin.litellm_auto_provisioned_at is None
+
+    session.begin_nested.assert_called_once()
+    session.commit.assert_not_called()
+    session.rollback.assert_not_called()
+
+
+async def test_org_returns_false_when_feature_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _set_config(monkeypatch, AUTO_PROVISION_LITELLM_KEY=False)
+    session = _make_session()
+    admin = _FakeUser()
+    org_ss = _FakeSearchSpace(user_id=admin.id)
+
+    sdk_called = False
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal sdk_called
+        sdk_called = True
+        return httpx.Response(200, json={})
+
+    client = _mock_transport(handler)
+    try:
+        ok = await ensure_org_litellm_keys(
+            session=session,
+            admin_user=admin,
+            org_search_space=org_ss,
+            access_token="jwt",
+            http_client=client,
+            cfg=cfg,
+        )
+    finally:
+        await client.aclose()
+
+    assert ok is False
+    assert sdk_called is False
+    session.add.assert_not_called()
+    assert org_ss.litellm_auto_provisioned_at is None
+
+
+async def test_org_skips_when_access_token_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _set_config(monkeypatch)
+    session = _make_session()
+    admin = _FakeUser()
+    org_ss = _FakeSearchSpace(user_id=admin.id)
+
+    sdk_called = False
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal sdk_called
+        sdk_called = True
+        return httpx.Response(200, json={})
+
+    client = _mock_transport(handler)
+    try:
+        ok = await ensure_org_litellm_keys(
+            session=session,
+            admin_user=admin,
+            org_search_space=org_ss,
+            access_token=None,
+            http_client=client,
+            cfg=cfg,
+        )
+    finally:
+        await client.aclose()
+
+    assert ok is False
+    assert sdk_called is False
+    session.add.assert_not_called()
+    assert org_ss.litellm_auto_provisioned_at is None
+
+
+async def test_org_idempotent_when_space_already_provisioned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SearchSpace.litellm_auto_provisioned_at is the org one-shot marker —
+    once set, short-circuit to True with no session I/O and no Askii call."""
+    cfg = _set_config(monkeypatch)
+    stamped = datetime(2026, 5, 1, 12, 0, 0, tzinfo=UTC)
+    session = _make_session()
+    admin = _FakeUser()
+    org_ss = _FakeSearchSpace(user_id=admin.id, provisioned_at=stamped)
+
+    sdk_called = False
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal sdk_called
+        sdk_called = True
+        return httpx.Response(200, json={})
+
+    client = _mock_transport(handler)
+    try:
+        ok = await ensure_org_litellm_keys(
+            session=session,
+            admin_user=admin,
+            org_search_space=org_ss,
+            access_token="jwt",
+            http_client=client,
+            cfg=cfg,
+        )
+    finally:
+        await client.aclose()
+
+    assert ok is True
+    assert sdk_called is False
+    session.add.assert_not_called()
+    session.execute.assert_not_called()
+    assert org_ss.litellm_auto_provisioned_at == stamped
+
+
+async def test_org_race_loss_inside_lock_returns_true_without_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In-lock SELECT FOR UPDATE finds the space marker already stamped (a
+    sibling admin won the race during our Askii call) → return True, write
+    no rows; the upstream key we minted is orphaned and self-expires."""
+    cfg = _set_config(monkeypatch)
+    admin = _FakeUser()
+    org_ss = _FakeSearchSpace(user_id=admin.id, ss_id=21)
+    session = _make_session(lock_finds_marker=True)
+
+    sdk_called = False
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal sdk_called
+        sdk_called = True
+        return httpx.Response(
+            200,
+            json={
+                "api_key": "sk-org-wasted",
+                "key_name": "orphan-org-key",
+                "user_id": "u",
+                "expires": None,
+            },
+        )
+
+    client = _mock_transport(handler)
+    try:
+        ok = await ensure_org_litellm_keys(
+            session=session,
+            admin_user=admin,
+            org_search_space=org_ss,
+            access_token="jwt",
+            http_client=client,
+            cfg=cfg,
+        )
+    finally:
+        await client.aclose()
+
+    assert ok is True
+    assert sdk_called is True
+    session.add.assert_not_called()
+    session.commit.assert_not_called()
+    session.begin_nested.assert_called_once()
+    session.rollback.assert_not_called()
+    assert org_ss.agent_llm_id == 0
+    assert org_ss.litellm_auto_provisioned_at is None
+
+
+async def test_org_transient_500_returns_false_no_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _set_config(monkeypatch)
+    session = _make_session()
+    admin = _FakeUser()
+    org_ss = _FakeSearchSpace(user_id=admin.id)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"detail": "boom"})
+
+    client = _mock_transport(handler)
+    try:
+        ok = await ensure_org_litellm_keys(
+            session=session,
+            admin_user=admin,
+            org_search_space=org_ss,
+            access_token="jwt",
+            http_client=client,
+            cfg=cfg,
+        )
+    finally:
+        await client.aclose()
+
+    assert ok is False
+    session.add.assert_not_called()
+    assert org_ss.agent_llm_id == 0
+    assert org_ss.litellm_auto_provisioned_at is None
+    session.commit.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# ensure_org_litellm_keys_for_admin — wrapper (org-space discovery + is_owner)
+# ---------------------------------------------------------------------------
+
+
+async def test_org_wrapper_returns_false_when_feature_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gate is checked first — no org-space lookup, no delegation."""
+    find_smb = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        "app.services.litellm_provisioning.find_smb_search_space", find_smb
+    )
+
+    ok = await ensure_org_litellm_keys_for_admin(
+        session=AsyncMock(),
+        user=_FakeUser(),
+        access_token="jwt",
+        cfg=_cfg_ns(AUTO_PROVISION_LITELLM_KEY=False),
+    )
+
+    assert ok is False
+    find_smb.assert_not_awaited()
+
+
+async def test_org_wrapper_returns_false_when_no_org_space(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No shared SMB/Organization space found → False (retry next login)."""
+    monkeypatch.setattr(
+        "app.services.litellm_provisioning.find_smb_search_space",
+        AsyncMock(return_value=None),
+    )
+    delegate = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.litellm_provisioning.ensure_org_litellm_keys", delegate
+    )
+
+    ok = await ensure_org_litellm_keys_for_admin(
+        session=AsyncMock(),
+        user=_FakeUser(),
+        access_token="jwt",
+        cfg=_cfg_ns(),
+    )
+
+    assert ok is False
+    delegate.assert_not_awaited()
+
+
+async def test_org_wrapper_returns_true_when_space_already_provisioned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Org space marker already set → True; no ownership check, no delegation."""
+    admin = _FakeUser()
+    org_ss = _FakeSearchSpace(
+        user_id=admin.id, provisioned_at=datetime(2026, 5, 1, tzinfo=UTC)
+    )
+    monkeypatch.setattr(
+        "app.services.litellm_provisioning.find_smb_search_space",
+        AsyncMock(return_value=org_ss),
+    )
+    is_owner = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "app.services.litellm_provisioning.is_search_space_owner", is_owner
+    )
+    delegate = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.litellm_provisioning.ensure_org_litellm_keys", delegate
+    )
+
+    ok = await ensure_org_litellm_keys_for_admin(
+        session=AsyncMock(),
+        user=admin,
+        access_token="jwt",
+        cfg=_cfg_ns(),
+    )
+
+    assert ok is True
+    is_owner.assert_not_awaited()
+    delegate.assert_not_awaited()
+
+
+async def test_org_wrapper_returns_false_when_user_not_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Caller is a member but not the is_owner admin → no-op (False)."""
+    admin = _FakeUser()
+    org_ss = _FakeSearchSpace(user_id=admin.id)
+    monkeypatch.setattr(
+        "app.services.litellm_provisioning.find_smb_search_space",
+        AsyncMock(return_value=org_ss),
+    )
+    monkeypatch.setattr(
+        "app.services.litellm_provisioning.is_search_space_owner",
+        AsyncMock(return_value=False),
+    )
+    delegate = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.litellm_provisioning.ensure_org_litellm_keys", delegate
+    )
+
+    ok = await ensure_org_litellm_keys_for_admin(
+        session=AsyncMock(),
+        user=admin,
+        access_token="jwt",
+        cfg=_cfg_ns(),
+    )
+
+    assert ok is False
+    delegate.assert_not_awaited()
+
+
+async def test_org_wrapper_delegates_when_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Org space found, marker NULL, caller is is_owner → delegate to
+    ensure_org_litellm_keys with the discovered space + admin user."""
+    admin = _FakeUser()
+    org_ss = _FakeSearchSpace(user_id=admin.id, ss_id=88)
+    monkeypatch.setattr(
+        "app.services.litellm_provisioning.find_smb_search_space",
+        AsyncMock(return_value=org_ss),
+    )
+    monkeypatch.setattr(
+        "app.services.litellm_provisioning.is_search_space_owner",
+        AsyncMock(return_value=True),
+    )
+    delegate = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "app.services.litellm_provisioning.ensure_org_litellm_keys", delegate
+    )
+
+    session = AsyncMock()
+    cfg = _cfg_ns()
+    ok = await ensure_org_litellm_keys_for_admin(
+        session=session,
+        user=admin,
+        access_token="jwt",
+        cfg=cfg,
+    )
+
+    assert ok is True
+    delegate.assert_awaited_once()
+    kwargs = delegate.await_args.kwargs
+    assert kwargs["admin_user"] is admin
+    assert kwargs["org_search_space"] is org_ss
+    assert kwargs["access_token"] == "jwt"
+    assert kwargs["session"] is session
+    assert kwargs["cfg"] is cfg
+
+
+async def test_org_wrapper_swallows_unexpected_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Best-effort: any error during org-space lookup is logged + swallowed."""
+    monkeypatch.setattr(
+        "app.services.litellm_provisioning.find_smb_search_space",
+        AsyncMock(side_effect=RuntimeError("db down")),
+    )
+
+    ok = await ensure_org_litellm_keys_for_admin(
+        session=AsyncMock(),
+        user=_FakeUser(),
+        access_token="jwt",
+        cfg=_cfg_ns(),
+    )
+
+    assert ok is False

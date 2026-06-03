@@ -28,6 +28,7 @@ from app.db import (
 )
 from app.prompts.system_defaults import SYSTEM_PROMPT_DEFAULTS
 from app.services.litellm_provisioning import (
+    ensure_org_litellm_keys_for_admin,
     ensure_personal_litellm_keys,
     ensure_personal_litellm_keys_for_user,
     read_mpass_access_token,
@@ -204,10 +205,11 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
             return
         if request is not None:
             session = _session_from_user_db(self.user_db)
+            access_token = read_mpass_access_token(request)
             await ensure_personal_litellm_keys_for_user(
                 session=session,
                 user=user,
-                access_token=read_mpass_access_token(request),
+                access_token=access_token,
                 cfg=config,
             )
             # Commit any pending writes from the provisioning service
@@ -228,6 +230,33 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
                 except Exception:
                     logger.exception(
                         "on_after_login: rollback after failed commit also failed for user %s",
+                        user.id,
+                    )
+
+            # Org-space LiteLLM provisioning (best-effort, separate from the
+            # personal path above). Fires only for the is_owner admin of the
+            # shared SMB/Organization space; one-shot per org space via
+            # SearchSpace.litellm_auto_provisioned_at. Committed separately so a
+            # personal-path commit failure cannot suppress the org write (and
+            # vice versa). Reuses the access token already read above.
+            await ensure_org_litellm_keys_for_admin(
+                session=session,
+                user=user,
+                access_token=access_token,
+                cfg=config,
+            )
+            try:
+                await session.commit()
+            except Exception:
+                logger.exception(
+                    "on_after_login: post-org-provisioning commit failed for user %s",
+                    user.id,
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception(
+                        "on_after_login: rollback after failed org commit also failed for user %s",
                         user.id,
                     )
 
