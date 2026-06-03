@@ -43,6 +43,7 @@ from app.routes.auth_routes import router as auth_router
 from app.schemas import UserCreate, UserRead, UserUpdate
 from app.tasks.surfsense_docs_indexer import seed_surfsense_docs
 from app.users import (
+    SECRET,
     auth_backend,
     current_active_user,
     fastapi_users,
