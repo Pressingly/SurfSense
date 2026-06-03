@@ -146,7 +146,8 @@ export function SidebarUserProfile({
 	const displayName = user.name || user.email.split("@")[0];
 	const downloadUrl = primary?.url ?? GITHUB_RELEASES_URL;
 	const downloadLabel = t("download_for_os", { os });
-	const showDownloadCta = !isDesktop && isDesktopViewport && !isSSOAuth();
+	const downloadAllowed = !isDesktop && !isSSOAuth();
+	const showDownloadCta = downloadAllowed && isDesktopViewport;
 
 	const handleLanguageChange = (newLocale: "en" | "es" | "pt" | "hi" | "zh") => {
 		setLocale(newLocale);
@@ -334,7 +335,7 @@ export function SidebarUserProfile({
 								</DropdownMenuPortal>
 							</DropdownMenuSub>
 
-							{!isDesktop && (
+							{downloadAllowed && (
 								<DropdownMenuItem asChild className="font-medium">
 									<a href={downloadUrl} target="_blank" rel="noopener noreferrer">
 										<Download className="h-4 w-4" strokeWidth={2.5} />
@@ -519,7 +520,7 @@ export function SidebarUserProfile({
 						</DropdownMenuPortal>
 					</DropdownMenuSub>
 
-					{!isDesktop && (
+					{downloadAllowed && (
 						<DropdownMenuItem asChild className="font-medium">
 							<a href={downloadUrl} target="_blank" rel="noopener noreferrer">
 								<Download className="h-4 w-4" strokeWidth={2.5} />
