@@ -164,7 +164,7 @@ export function HeroSection() {
 						</p>
 
 						<div className="relative mb-4 flex w-full flex-col justify-center gap-y-2 sm:flex-row sm:justify-start sm:space-y-0 sm:space-x-4">
-							<DownloadButton />
+							{!isSSOAuth() && <DownloadButton />}
 							<GetStartedButton />
 						</div>
 					</div>

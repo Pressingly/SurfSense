@@ -36,7 +36,7 @@ import { useLocaleContext } from "@/contexts/LocaleContext";
 import { useMediaQuery } from "@/hooks/use-media-query";
 import { usePlatform } from "@/hooks/use-platform";
 import { GITHUB_RELEASES_URL, usePrimaryDownload } from "@/lib/desktop-download-utils";
-import { APP_VERSION } from "@/lib/env-config";
+import { APP_VERSION, isSSOAuth } from "@/lib/env-config";
 import { trackDesktopDownloadClicked } from "@/lib/posthog/events";
 import { getUserAvatarColor, getUserInitials } from "@/lib/user-avatar";
 import { cn } from "@/lib/utils";
@@ -146,7 +146,7 @@ export function SidebarUserProfile({
 	const displayName = user.name || user.email.split("@")[0];
 	const downloadUrl = primary?.url ?? GITHUB_RELEASES_URL;
 	const downloadLabel = t("download_for_os", { os });
-	const showDownloadCta = !isDesktop && isDesktopViewport;
+	const showDownloadCta = !isDesktop && isDesktopViewport && !isSSOAuth();
 
 	const handleLanguageChange = (newLocale: "en" | "es" | "pt" | "hi" | "zh") => {
 		setLocale(newLocale);
