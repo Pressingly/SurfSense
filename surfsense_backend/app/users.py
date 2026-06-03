@@ -239,26 +239,33 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
             # SearchSpace.litellm_auto_provisioned_at. Committed separately so a
             # personal-path commit failure cannot suppress the org write (and
             # vice versa). Reuses the access token already read above.
-            await ensure_org_litellm_keys_for_admin(
-                session=session,
-                user=user,
-                access_token=access_token,
-                cfg=config,
-            )
-            try:
-                await session.commit()
-            except Exception:
-                logger.exception(
-                    "on_after_login: post-org-provisioning commit failed for user %s",
-                    user.id,
+            #
+            # Guarded on a present mPass token: org provisioning mints an Askii
+            # key from it and is a no-op without it (the wrapper early-returns),
+            # so skip the call AND its otherwise-empty commit on non-mPass
+            # logins (fastapi-users JWT, Google OAuth, dev-direct) that still
+            # reach this hook on every authenticated request.
+            if access_token is not None:
+                await ensure_org_litellm_keys_for_admin(
+                    session=session,
+                    user=user,
+                    access_token=access_token,
+                    cfg=config,
                 )
                 try:
-                    await session.rollback()
+                    await session.commit()
                 except Exception:
                     logger.exception(
-                        "on_after_login: rollback after failed org commit also failed for user %s",
+                        "on_after_login: post-org-provisioning commit failed for user %s",
                         user.id,
                     )
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        logger.exception(
+                            "on_after_login: rollback after failed org commit also failed for user %s",
+                            user.id,
+                        )
 
     async def _update_last_login_throttled(self, user: User) -> None:
         """Update ``user.last_login`` at most once per throttle window.

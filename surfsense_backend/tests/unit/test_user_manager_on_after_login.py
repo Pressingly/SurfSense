@@ -240,6 +240,41 @@ async def test_on_after_login_fires_org_provisioning_when_user_active() -> None:
     )
 
 
+async def test_on_after_login_skips_org_step_when_no_mpass_token() -> None:
+    """Non-mPass login (no access token) → the org provisioning step and its
+    commit are skipped entirely; only the personal step commits.
+
+    Org provisioning mints an Askii key from the mPass token and cannot run
+    without it — guarding the call avoids an otherwise-empty commit on a hook
+    that fires on every authenticated request (JWT/OAuth/dev-direct flows)."""
+    user = _FakeUser(is_active=True)
+    request = _make_request()
+    user_db = _make_user_db_with_session()
+    manager = UserManager(user_db)
+
+    with (
+        patch("app.users.read_mpass_access_token", return_value=None),
+        patch(
+            "app.users.ensure_personal_litellm_keys_for_user",
+            new=AsyncMock(),
+        ),
+        patch(
+            "app.users.ensure_org_litellm_keys_for_admin",
+            new=AsyncMock(),
+        ) as org_wrapper,
+        patch.object(
+            manager,
+            "_update_last_login_throttled",
+            new=AsyncMock(),
+        ),
+    ):
+        await manager.on_after_login(user, request=request)
+
+    org_wrapper.assert_not_called()
+    # Org step (and its commit) skipped — only the personal commit ran.
+    assert user_db.session.commit.await_count == 1
+
+
 async def test_on_after_login_skips_provisioning_when_request_is_none() -> None:
     """fastapi-users flows that omit ``request`` (rare but legal per the
     superclass signature) must not raise — the wrapper needs a request to
