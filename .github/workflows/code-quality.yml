@@ -238,6 +238,10 @@ jobs:
             extension:
               - 'surfsense_browser_extension/**'
 
+      - name: Install native build dependencies
+        if: steps.frontend-changes.outputs.web == 'true'
+        run: sudo apt-get install -y libreadline-dev
+
       - name: Install dependencies for web
         if: steps.frontend-changes.outputs.web == 'true'
         working-directory: surfsense_web
