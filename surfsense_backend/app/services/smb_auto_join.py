@@ -19,6 +19,44 @@ from app.db import (
 logger = logging.getLogger(__name__)
 
 
+def _smb_workspace_slug() -> str:
+    """The configured shared SMB/Organization workspace name, or "".
+
+    Priority: ``SMB_DEFAULT_WORKSPACE_NAME`` then ``SMB_NAME``. Stripped;
+    empty when neither is set (callers treat that as "no shared space").
+    """
+    slug = (
+        getattr(config, "SMB_DEFAULT_WORKSPACE_NAME", None)
+        or getattr(config, "SMB_NAME", "")
+        or ""
+    )
+    return slug.strip() if isinstance(slug, str) else ""
+
+
+async def find_smb_search_space(session) -> SearchSpace | None:
+    """Return the shared SMB/Organization ``SearchSpace`` by name, or None.
+
+    Matches the space whose ``name`` equals :func:`_smb_workspace_slug`,
+    skipping ``"[DELETING] "`` soft-delete tombstones and preferring the
+    oldest by id. Returns None when no name is configured or no space
+    matches. Uses the caller's ``session`` so it can run inside an existing
+    request-scoped transaction (e.g. the login hook) as well as the
+    standalone session opened by :func:`auto_join_smb_search_space`.
+    """
+    slug = _smb_workspace_slug()
+    if not slug:
+        return None
+
+    not_deleting = ~SearchSpace.name.startswith("[DELETING] ")
+    result = await session.execute(
+        select(SearchSpace)
+        .where(SearchSpace.name == slug, not_deleting)
+        .order_by(SearchSpace.id.asc())
+        .limit(1)
+    )
+    return result.scalars().first()
+
+
 async def auto_join_smb_search_space(user_id: uuid.UUID) -> None:
     """
     ``_auto_join_workspace``: match the search space whose
@@ -28,25 +66,12 @@ async def auto_join_smb_search_space(user_id: uuid.UUID) -> None:
     Uses the default invite role (Editor) when absent. Idempotent.
     Safe when auth uses Bearer JWT only: runs from ``current_active_user`` as well.
     """
-    smb_slug = (
-        getattr(config, "SMB_DEFAULT_WORKSPACE_NAME", None)
-        or getattr(config, "SMB_NAME", "")
-        or ""
-    )
-    if isinstance(smb_slug, str):
-        smb_slug = smb_slug.strip()
+    smb_slug = _smb_workspace_slug()
     if not smb_slug:
         return
 
     async with async_session_maker() as session:
-        not_deleting = ~SearchSpace.name.startswith("[DELETING] ")
-        space_result = await session.execute(
-            select(SearchSpace)
-            .where(SearchSpace.name == smb_slug, not_deleting)
-            .order_by(SearchSpace.id.asc())
-            .limit(1)
-        )
-        space = space_result.scalars().first()
+        space = await find_smb_search_space(session)
         if space is None:
             logger.debug(
                 "SMB auto-join: no search space named %r — skipping",
