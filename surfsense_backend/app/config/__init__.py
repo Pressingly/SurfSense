@@ -690,6 +690,10 @@ class Config:
         os.getenv("SMB_DEFAULT_WORKSPACE_NAME") or os.getenv("SMB_NAME") or ""
     ).strip()
 
+    # Corporate tenant ID for cross-tenant isolation. When set, the proxy-auth
+    # middleware rejects access tokens whose custom:corporate_id does not match.
+    SMB_CORPORATE_ID = (os.getenv("SMB_CORPORATE_ID") or "").strip()
+
     # Google OAuth
     GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
     GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
