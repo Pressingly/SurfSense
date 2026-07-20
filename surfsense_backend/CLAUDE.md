@@ -19,7 +19,7 @@ down_revision: str | None = "<previous revision — fork or upstream>"
 
 1. Find the latest revision in `alembic/versions/` (either upstream integer or
    prior `moneta_*` — whichever is more recent).
-2. Pick the next available `moneta_NNN`. Current next: `moneta_002`.
+2. Pick the next available `moneta_NNN`. Current next: `moneta_003`.
 3. Name the file `moneta_NNN_<short_description>.py`.
 4. Set `revision = "moneta_NNN"`, `down_revision = "<latest revision found in step 1>"`.
 

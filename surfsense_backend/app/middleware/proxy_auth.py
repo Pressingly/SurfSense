@@ -2,13 +2,14 @@ import logging
 import secrets
 import unicodedata
 
+import jwt
 from fastapi_users.db import SQLAlchemyUserDatabase
 from fastapi_users.password import PasswordHelper  # singleton below
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 from app.config import config
 from app.db import User, async_session_maker
@@ -31,6 +32,29 @@ def _coerce_bypass_paths(setting) -> list[str]:
     if isinstance(setting, str):
         return [p.strip() for p in setting.split(",") if p.strip()]
     return list(setting)
+
+
+def _check_corporate_id(request) -> bool:
+    """Verify that the caller's access token belongs to this deployment's tenant.
+
+    When ``SMB_CORPORATE_ID`` is configured, only corporate tokens whose
+    ``custom:corporate_id`` claim matches the expected value are allowed.
+    Individual (non-corporate) tokens are rejected.  When the setting is
+    empty the check is skipped entirely for backward compatibility.
+    """
+    expected = getattr(config, "SMB_CORPORATE_ID", "")
+    if not expected:
+        return True
+    access_token = request.headers.get("x-auth-request-access-token")
+    if not access_token:
+        return False
+    try:
+        claims = jwt.decode(access_token, options={"verify_signature": False})
+    except Exception:
+        return False
+    if claims.get("custom:is_corporate") != "true":
+        return False
+    return claims.get("custom:corporate_id") == expected
 
 
 def _is_bypass_path(path: str, bypass_paths: list[str]) -> bool:
@@ -97,6 +121,9 @@ class ProxyAuthMiddleware(BaseHTTPMiddleware):
                 "ProxyAuth: x-auth-request-email missing on %s", request.url.path
             )
             return await call_next(request)
+
+        if not _check_corporate_id(request):
+            return JSONResponse(status_code=403, content={"error": "access_denied"})
 
         user = await self._resolve_user(_normalise_email(raw_email), request)
 

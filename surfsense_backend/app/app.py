@@ -43,6 +43,7 @@ from app.routes.auth_routes import router as auth_router
 from app.schemas import UserCreate, UserRead, UserUpdate
 from app.tasks.surfsense_docs_indexer import seed_surfsense_docs
 from app.users import (
+    SECRET,
     auth_backend,
     current_active_user,
     fastapi_users,
@@ -819,6 +820,7 @@ if config.AUTH_TYPE not in ("GOOGLE", "SSO"):
         tags=["auth"],
     )
 
+
 # Register /users/me BEFORE fastapi_users.get_users_router so our routes take
 # precedence (FastAPI first-match wins). fastapi-users' internal /users/me only
 # validates JWT — it does not check request.state.proxy_user set by the proxy
@@ -842,6 +844,8 @@ async def update_current_user_me(
     # JWT-loaded one. user_manager.get() returns the session-attached instance.
     db_user = await user_manager.get(user.id)
     return await user_manager.update(user_update, db_user, safe=True, request=request)
+
+
 app.include_router(
     fastapi_users.get_users_router(UserRead, UserUpdate),
     prefix="/users",
