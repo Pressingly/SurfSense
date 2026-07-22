@@ -1,8 +1,9 @@
 """Authentication routes for refresh token management."""
 
 import logging
+from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 
@@ -145,3 +146,73 @@ async def logout_all_devices(user: User = Depends(current_active_user)):
     await revoke_all_user_tokens(user.id)
     logger.info(f"User {user.id} logged out from all devices")
     return LogoutAllResponse()
+
+
+@router.get("/portal-logout")
+async def portal_logout(request: Request):
+    """
+    Cross-origin redirect-chain entry-point for the foss-server-bundle
+    portal's "Log out of all apps" flow.
+
+    Reuses SurfSense's existing logout primitive (`revoke_all_user_tokens`)
+    so the same DB-revocation path runs as `/auth/jwt/logout-all`. The
+    user is resolved from the oauth2-proxy ForwardAuth headers via
+    `ProxyAuthMiddleware`, which populates `request.state.proxy_user`.
+
+    Flow:
+      Browser hits docs.../portal-logout?next=<next-app>
+        → ForwardAuth validates oauth2-proxy session
+        → ProxyAuthMiddleware sets request.state.proxy_user
+        → this handler revokes ALL refresh tokens for that user
+        → clears the short-lived surfsense_sso_* cookies (defensive)
+        → 302 to ?next= (validated against PLATFORM_DOMAIN)
+
+    CSRF-exempt by design (FastAPI doesn't gate GETs; no token shared
+    cross-origin with the portal). Residual force-logout risk is low —
+    only the user's own refresh tokens are revoked, and re-auth via
+    ForwardAuth is automatic on the next visit.
+
+    ?next= host MUST equal PLATFORM_DOMAIN or be a subdomain. Suffix
+    match enforces a dot boundary so foss.arbisoft.com.evil is rejected.
+    """
+    user = getattr(request.state, "proxy_user", None)
+    if user is not None:
+        try:
+            await revoke_all_user_tokens(user.id)
+            logger.info(
+                f"User {user.id} logged out via portal-logout chain "
+                f"(all refresh tokens revoked)"
+            )
+        except Exception:
+            logger.exception("portal-logout: revoke_all_user_tokens failed; continuing")
+
+    next_url = (request.query_params.get("next") or "").strip()
+    if next_url and _is_allowed_next(next_url):
+        response = RedirectResponse(next_url, status_code=status.HTTP_302_FOUND)
+    else:
+        response = Response(status_code=status.HTTP_200_OK)
+
+    # Defensive: the short-lived (60s) cookies should already be gone,
+    # but expire them explicitly in case the page was reloaded inside
+    # the 60s window.
+    response.delete_cookie("surfsense_sso_token", path="/")
+    response.delete_cookie("surfsense_sso_refresh_token", path="/")
+    return response
+
+
+def _is_allowed_next(url: str) -> bool:
+    # Suffix match enforces a dot boundary so foss.arbisoft.com.evil
+    # does NOT match the foss.arbisoft.com PLATFORM_DOMAIN.
+    platform_domain = (config.PLATFORM_DOMAIN or "").lower().lstrip(".")
+    if not platform_domain:
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    return host == platform_domain or host.endswith("." + platform_domain)
